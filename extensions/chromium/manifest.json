@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "ScreenUse Browser Collector",
+  "version": "0.1.0",
+  "description": "Collects Chromium tab metadata for ScreenUse. Reads URL/title/tab group metadata only, never page body.",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:51247/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ScreenUse"
+  }
+}
