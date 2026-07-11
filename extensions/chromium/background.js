@@ -1,35 +1,132 @@
 const ENDPOINT = 'http://127.0.0.1:51247/integrations/browser/tabs';
+const HEARTBEAT_ALARM = 'screenuse-active-tab-heartbeat';
+const DEBOUNCE_MS = 650;
 
-async function collectTabs() {
-  const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] });
-  const groups = chrome.tabGroups ? await chrome.tabGroups.query({}) : [];
-  const groupMap = new Map(groups.map(group => [group.id, group]));
-  const payload = {
-    source: 'chromium-extension',
-    capturedAt: new Date().toISOString(),
-    windows: windows.map(win => ({
-      id: win.id,
-      focused: win.focused,
-      tabs: (win.tabs || []).map(tab => ({
-        id: tab.id,
-        active: tab.active,
-        highlighted: tab.highlighted,
-        title: tab.title,
-        url: tab.url,
-        group: tab.groupId && tab.groupId > -1 ? groupMap.get(tab.groupId)?.title || `group:${tab.groupId}` : null,
-      })),
-    })),
-  };
+let debounceTimer;
+let lastSignature = '';
+let lastSentAt = 0;
+
+function browserName() {
+  const userAgent = navigator.userAgent;
+  if (userAgent.includes('Edg/')) return 'Microsoft Edge';
+  if (userAgent.includes('OPR/')) return 'Opera';
+  if (userAgent.includes('Vivaldi/')) return 'Vivaldi';
+  if (userAgent.includes('Brave')) return 'Brave';
+  return 'Chromium';
+}
+
+function compactUrl(rawUrl) {
+  if (!rawUrl) return null;
   try {
-    await fetch(ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-    await chrome.storage.local.set({ lastSync: payload.capturedAt, lastError: '' });
-  } catch (error) {
-    await chrome.storage.local.set({ lastError: String(error) });
+    const url = new URL(rawUrl);
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return String(rawUrl).slice(0, 1200);
   }
 }
 
-chrome.alarms.create('screenuse-sync-tabs', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === 'screenuse-sync-tabs') collectTabs(); });
-chrome.tabs.onActivated.addListener(() => collectTabs());
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => { if (changeInfo.title || changeInfo.url || changeInfo.status === 'complete') collectTabs(); });
-collectTabs();
+async function readActiveContext() {
+  const currentWindow = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+  if (!currentWindow?.focused || currentWindow.id == null) return null;
+  const tabs = await chrome.tabs.query({ active: true, windowId: currentWindow.id });
+  const tab = tabs[0];
+  if (!tab || tab.id == null) return null;
+
+  const url = compactUrl(tab.url);
+  return {
+    source: 'chromium-extension',
+    capturedAt: new Date().toISOString(),
+    eventId: `${currentWindow.id}:${tab.id}:${url || tab.title || ''}`,
+    browser: browserName(),
+    windowId: currentWindow.id,
+    tabId: tab.id,
+    title: tab.title || null,
+    url,
+    audible: Boolean(tab.audible),
+  };
+}
+
+async function syncActiveContext(reason = 'event', force = false) {
+  try {
+    const payload = await readActiveContext();
+    if (!payload) return { ok: false, inactive: true };
+
+    payload.reason = reason;
+    const signature = `${payload.eventId}|${payload.title || ''}|${payload.audible}`;
+    const now = Date.now();
+    if (!force && signature === lastSignature && now - lastSentAt < 55_000) {
+      return { ok: true, skipped: true };
+    }
+
+    const response = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`ScreenUse 返回 ${response.status}`);
+
+    lastSignature = signature;
+    lastSentAt = now;
+    await chrome.storage.local.set({
+      lastSync: payload.capturedAt,
+      lastError: '',
+      lastTitle: payload.title || '',
+      lastUrl: payload.url || '',
+    });
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await chrome.storage.local.set({ lastError: message });
+    return { ok: false, error: message };
+  }
+}
+
+function scheduleSync(reason, force = false) {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    void syncActiveContext(reason, force);
+  }, DEBOUNCE_MS);
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
+  scheduleSync('installed', true);
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
+  scheduleSync('startup', true);
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT_ALARM) void syncActiveContext('heartbeat', true);
+});
+
+chrome.tabs.onActivated.addListener(() => scheduleSync('tab-activated', true));
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (tab.active && (changeInfo.title || changeInfo.url || changeInfo.audible !== undefined || changeInfo.status === 'complete')) {
+    scheduleSync('tab-updated');
+  }
+});
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) scheduleSync('window-focused', true);
+});
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'screenuse-sync-now') {
+    void syncActiveContext('manual', true).then(sendResponse);
+    return true;
+  }
+  if (message?.type === 'screenuse-status') {
+    void chrome.storage.local
+      .get(['lastSync', 'lastError', 'lastTitle', 'lastUrl'])
+      .then((status) => sendResponse(status));
+    return true;
+  }
+  return false;
+});
+
+chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
+scheduleSync('service-worker-start', true);
