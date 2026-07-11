@@ -1,8 +1,8 @@
 use crate::models::RawActivityEvent;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
-use std::sync::{OnceLock, SystemTime};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 const CONTEXT_TTL: Duration = Duration::from_secs(120);
 
