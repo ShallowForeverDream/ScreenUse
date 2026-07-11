@@ -1,0 +1,74 @@
+name: ScreenUse CI
+
+on:
+  push:
+    branches:
+      - main
+      - codex/metadata-first-v1
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenuse-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Windows build and tests
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check frontend
+        run: pnpm check
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Chromium extension scripts
+        shell: pwsh
+        run: |
+          node --check extensions/chromium/background.js
+          node --check extensions/chromium/popup.js
+          Get-Content extensions/chromium/manifest.json | ConvertFrom-Json | Out-Null
+
+      - name: Build VS Code extension
+        shell: pwsh
+        run: |
+          pnpm --dir extensions/vscode install --no-frozen-lockfile
+          pnpm --dir extensions/vscode compile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Check Tauri backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml
