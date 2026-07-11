@@ -1,0 +1,555 @@
++    debounce = setTimeout(() => void sendActivity(eventKind, force), 500);
++  };
++
++  context.subscriptions.push(
++    vscode.commands.registerCommand('screenuse.syncNow', () => schedule('manual', true)),
++    vscode.window.onDidChangeActiveTextEditor(() => schedule('active-editor')),
++    vscode.workspace.onDidChangeWorkspaceFolders(() => schedule('workspace')),
++    vscode.window.onDidOpenTerminal(() => schedule('terminal')),
++    vscode.window.onDidCloseTerminal(() => schedule('terminal')),
++    vscode.debug.onDidStartDebugSession(() => schedule('debug-start')),
++    vscode.debug.onDidTerminateDebugSession(() => schedule('debug-stop')),
++  );
++
++  heartbeat = setInterval(() => schedule('heartbeat'), HEARTBEAT_MS);
++  schedule('activate', true);
++}
++
++export function deactivate() {
++  if (heartbeat) clearInterval(heartbeat);
++  if (debounce) clearTimeout(debounce);
++}
++
++async function sendActivity(eventKind: string, force = false) {
++  const editor = vscode.window.activeTextEditor;
++  const workspace = (vscode.workspace.workspaceFolders || []).slice(0, 3).map((folder) => ({
++    name: folder.name,
++    path: folder.uri.fsPath,
++  }));
++  const gitBranch = await detectGitBranch(workspace[0]?.path);
++  const payload = {
++    source: 'vscode-context',
++    capturedAt: new Date().toISOString(),
++    eventKind,
++    workspace,
++    activeFile:
++      editor?.document.uri.scheme === 'file'
++        ? editor.document.uri.fsPath
++        : editor?.document.uri.toString(),
++    languageId: editor?.document.languageId,
++    gitBranch,
++    terminalCount: vscode.window.terminals.length,
++    debugActive: vscode.debug.activeDebugSession?.name || null,
++  };
++  const fingerprint = JSON.stringify([
++    workspace,
++    payload.activeFile,
++    payload.languageId,
++    payload.gitBranch,
++    payload.terminalCount,
++    payload.debugActive,
++  ]);
++  if (!force && fingerprint === lastFingerprint && Date.now() - lastSentAt < HEARTBEAT_MS) {
++    return;
++  }
++
++  try {
++    const response = await fetch(ENDPOINT, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify(payload),
++    });
++    if (response.ok) {
++      lastFingerprint = fingerprint;
++      lastSentAt = Date.now();
++    }
++  } catch {
++    // ScreenUse may not be running; never interrupt the editor.
++  }
++}
++
++async function detectGitBranch(workspacePath?: string): Promise<string | null> {
++  if (!workspacePath) return null;
++  const git = vscode.extensions.getExtension('vscode.git')?.exports;
++  const api = git?.getAPI?.(1);
++  const repo =
++    api?.repositories?.find((candidate: any) => candidate.rootUri?.fsPath === workspacePath) ||
++    api?.repositories?.[0];
++  return repo?.state?.HEAD?.name || null;
++}
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..e54aebf
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,31 @@
++{
++  "name": "screenuse",
++  "private": true,
++  "version": "0.2.0",
++  "type": "module",
++  "scripts": {
++    "dev": "vite --host 127.0.0.1 --port 1420",
++    "build": "tsc && vite build",
++    "preview": "vite preview --host 127.0.0.1",
++    "tauri": "tauri",
++    "tauri:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri-dev.ps1",
++    "tauri:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri-build.ps1",
++    "check": "tsc --noEmit",
++    "cargo:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cargo-check.ps1"
++  },
++  "dependencies": {
++    "@tauri-apps/api": "^2.2.0",
++    "@vitejs/plugin-react": "^4.3.4",
++    "vite": "^6.0.7",
++    "typescript": "^5.7.2",
++    "react": "^19.0.0",
++    "react-dom": "^19.0.0",
++    "lucide-react": "^0.468.0",
++    "recharts": "^2.15.0"
++  },
++  "devDependencies": {
++    "@tauri-apps/cli": "^2.2.6",
++    "@types/react": "^19.0.1",
++    "@types/react-dom": "^19.0.2"
++  }
++}
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+new file mode 100644
+index 0000000..c470ea5
+--- /dev/null
++++ b/src-tauri/Cargo.toml
+@@ -0,0 +1,35 @@
++[package]
++name = "screenuse"
++version = "0.2.0"
++description = "Lightweight metadata-first personal activity time tracker"
++authors = ["ScreenUse"]
++edition = "2021"
++rust-version = "1.77"
++
++[build-dependencies]
++tauri-build = { version = "2.0", features = [] }
++
++[dependencies]
++tauri = { version = "2.2", features = ["tray-icon", "image-ico", "image-png"] }
++tauri-plugin-opener = "2.2"
++anyhow = "1.0"
++chrono = { version = "0.4", features = ["serde"] }
++directories = "5.0"
++keyring = { version = "3.6", features = ["windows-native"] }
++parking_lot = "0.12"
++reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
++rusqlite = { version = "0.32", features = ["bundled"] }
++serde = { version = "1.0", features = ["derive"] }
++serde_json = "1.0"
++tiny_http = "0.12"
++tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
++uuid = { version = "1.11", features = ["v4", "serde"] }
++
++[target.'cfg(windows)'.dependencies]
++windows = { version = "0.58", features = [
++  "Win32_Foundation",
++  "Win32_System_Threading",
++  "Win32_UI_WindowsAndMessaging",
++  "Win32_UI_Input_KeyboardAndMouse",
++  "Win32_System_SystemInformation"
++] }
+diff --git a/src-tauri/src/ai.rs b/src-tauri/src/ai.rs
+new file mode 100644
+index 0000000..2ff6875
+--- /dev/null
++++ b/src-tauri/src/ai.rs
+@@ -0,0 +1,111 @@
++use crate::models::{AppSettings, EvidenceItem, RawActivityEvent};
++use anyhow::{anyhow, Result};
++use reqwest::Client;
++use serde::{Deserialize, Serialize};
++use serde_json::json;
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct AiAttributionResult {
++    pub project_name: String,
++    pub task_title: String,
++    pub category: String,
++    pub summary: String,
++    pub confidence: f32,
++    pub evidence: Vec<EvidenceItem>,
++}
++
++pub struct OpenAiCompatibleClient {
++    client: Client,
++    base_url: String,
++    model: String,
++    api_key: String,
++}
++
++impl OpenAiCompatibleClient {
++    pub fn new(settings: &AppSettings, api_key: String) -> Self {
++        Self {
++            client: Client::new(),
++            base_url: settings.ai_base_url.trim_end_matches('/').to_string(),
++            model: settings.ai_model.clone(),
++            api_key,
++        }
++    }
++
++    pub async fn analyze_metadata_block(
++        &self,
++        events: &[RawActivityEvent],
++    ) -> Result<AiAttributionResult> {
++        if events.is_empty() {
++            return Err(anyhow!("no events to analyze"));
++        }
++        let compact_events = events
++            .iter()
++            .rev()
++            .take(120)
++            .rev()
++            .map(|event| {
++                json!({
++                    "time": &event.timestamp,
++                    "app": &event.app,
++                    "title": &event.window_title,
++                    "url": &event.url,
++                    "file": &event.file_path,
++                    "workspace": &event.workspace,
++                    "idle": event.input_stats.idle_seconds,
++                })
++            })
++            .collect::<Vec<_>>();
++        let body = json!({
++            "model": &self.model,
++            "messages": [
++                {
++                    "role": "system",
++                    "content": "你是个人电脑时间归因器。只输出 JSON：projectName、taskTitle、category、summary、confidence、evidence。category 只能是 学习、写作、开发、沟通、娱乐、杂务、离开；confidence 为 0-1；evidence 每项包含 kind、label、value、weight。只依据元数据，不推断网页或文件正文。"
++                },
++                {
++                    "role": "user",
++                    "content": serde_json::to_string(&compact_events)?
++                }
++            ],
++            "temperature": 0.1,
++            "max_tokens": 650,
++            "response_format": {"type": "json_object"}
++        });
++        let response = self
++            .client
++            .post(format!("{}/chat/completions", self.base_url))
++            .bearer_auth(&self.api_key)
++            .json(&body)
++            .send()
++            .await?;
++        if !response.status().is_success() {
++            return Err(anyhow!(
++                "AI request failed: {} - {}",
++                response.status(),
++                response.text().await.unwrap_or_default()
++            ));
++        }
++        let value: serde_json::Value = response.json().await?;
++        let content = value["choices"][0]["message"]["content"]
++            .as_str()
++            .ok_or_else(|| anyhow!("missing content"))?;
++        let mut parsed: AiAttributionResult = serde_json::from_str(content).or_else(|_| {
++            extract_json_object(content)
++                .and_then(|json| serde_json::from_str(&json).map_err(anyhow::Error::from))
++        })?;
++        parsed.confidence = parsed.confidence.clamp(0.0, 1.0);
++        parsed.evidence.truncate(12);
++        Ok(parsed)
++    }
++}
++
++fn extract_json_object(input: &str) -> Result<String> {
++    let start = input
++        .find('{')
++        .ok_or_else(|| anyhow!("AI response does not contain JSON object"))?;
++    let end = input
++        .rfind('}')
++        .ok_or_else(|| anyhow!("AI response JSON object is incomplete"))?;
++    Ok(input[start..=end].to_string())
++}
+diff --git a/src-tauri/src/analysis_worker.rs b/src-tauri/src/analysis_worker.rs
+new file mode 100644
+index 0000000..3785a2f
+--- /dev/null
++++ b/src-tauri/src/analysis_worker.rs
+@@ -0,0 +1,187 @@
++use crate::ai::{AiAttributionResult, OpenAiCompatibleClient};
++use crate::db::AppDb;
++use crate::models::{AppSettings, EvidenceItem, RawActivityEvent};
++use crate::secrets;
++use anyhow::{anyhow, Result};
++use std::sync::Arc;
++use tokio::time::{sleep, Duration};
++
++pub fn start_analysis_worker(db: Arc<AppDb>) {
++    tauri::async_runtime::spawn(async move {
++        loop {
++            let settings = db.get_settings().unwrap_or_default();
++            if settings.ai_enabled && settings.analysis_timing != "manual" {
++                if let Err(error) = run_once(db.clone()).await {
++                    eprintln!("ScreenUse analysis worker error: {error}");
++                }
++            }
++            sleep(Duration::from_secs(60)).await;
++        }
++    });
++}
++
++pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
++    let settings = db.get_settings()?;
++    if !settings.ai_enabled {
++        return Ok(false);
++    }
++
++    let job = match db.claim_next_analysis_job()? {
++        Some(job) => job,
++        None => {
++            if !db.prepare_metadata_analysis_job()? {
++                return Ok(false);
++            }
++            db.claim_next_analysis_job()?
++                .ok_or_else(|| anyhow!("metadata analysis job disappeared"))?
++        }
++    };
++
++    let events = db.list_raw_events_between(
++        &job.metadata_range.started_at,
++        &job.metadata_range.ended_at,
++    )?;
++    if events.is_empty() {
++        db.mark_analysis_job_status(
++            &job.id,
++            "failed",
++            None,
++            Some("分析时间段没有元数据".into()),
++        )?;
++        return Ok(true);
++    }
++
++    match maybe_ai(&settings, &events).await {
++        Ok(result) => {
++            persist_result(&db, &job, &events, result)?;
++            if !job.chunk_ids.is_empty() {
++                db.set_media_chunks_status(&job.chunk_ids, "analyzed", true)?;
++            }
++        }
++        Err(error) => {
++            let retry_count = job.retry_count + 1;
++            if retry_count < 2 {
++                db.mark_analysis_job_status(
++                    &job.id,
++                    "pending",
++                    Some(retry_count),
++                    Some(error.to_string()),
++                )?;
++            } else {
++                db.mark_analysis_job_status(
++                    &job.id,
++                    "failed",
++                    Some(retry_count),
++                    Some(error.to_string()),
++                )?;
++                if !job.chunk_ids.is_empty() {
++                    db.set_media_chunks_status(&job.chunk_ids, "failed", false)?;
++                }
++            }
++        }
++    }
++    let _ = db.cleanup_media_cache();
++    Ok(true)
++}
++
++async fn maybe_ai(
++    settings: &AppSettings,
++    events: &[RawActivityEvent],
++) -> Result<AiAttributionResult> {
++    if !settings.ai_enabled {
++        return Err(anyhow!("AI analysis is disabled"));
++    }
++    let secret_name = settings.ai_secret_ref.as_deref().unwrap_or("").trim();
++    if secret_name.is_empty() {
++        return Err(anyhow!("未配置 AI 凭据"));
++    }
++    let api_key = secrets::read_secret(secret_name)?;
++    if api_key.trim().is_empty() {
++        return Err(anyhow!("AI 凭据为空"));
++    }
++    OpenAiCompatibleClient::new(settings, api_key)
++        .analyze_metadata_block(events)
++        .await
++}
++
++fn persist_result(
++    db: &AppDb,
++    job: &crate::models::AnalysisJob,
++    events: &[RawActivityEvent],
++    result: AiAttributionResult,
++) -> Result<()> {
++    let project_id = if result.category == "离开" {
++        None
++    } else {
++        Some(db.upsert_project_by_name(
++            &result.project_name,
++            &result.category,
++            "ai-analysis",
++        )?)
++    };
++    let task_id = match project_id.as_deref() {
++        Some(project_id) if result.category != "离开" => Some(db.upsert_task_by_title(
++            project_id,
++            &result.task_title,
++            "ai-analysis",
++        )?),
++        _ => None,
++    };
++    let mut evidence = result.evidence;
++    evidence.extend(metadata_evidence(events));
++    db.materialize_attribution_session(
++        &job.metadata_range,
++        project_id,
++        task_id,
++        result.category,
++        result.summary,
++        result.confidence,
++        evidence,
++        "ai-analysis",
++    )?;
++    db.mark_analysis_job_status(&job.id, "completed", None, None)?;
++    Ok(())
++}
++
++fn metadata_evidence(events: &[RawActivityEvent]) -> Vec<EvidenceItem> {
++    let mut evidence = Vec::new();
++    for (kind, label, value, weight) in [
++        (
++            "workspace",
++            "工作区",
++            events.iter().rev().find_map(|event| event.workspace.clone()),
++            0.9,
++        ),
++        (
++            "url",
++            "网页",
++            events.iter().rev().find_map(|event| event.url.clone()),
++            0.84,
++        ),
++        (
++            "file",
++            "文件",
++            events.iter().rev().find_map(|event| event.file_path.clone()),
++            0.8,
++        ),
++        (
++            "window",
++            "窗口",
++            events
++                .iter()
++                .rev()
++                .find_map(|event| event.window_title.clone()),
++            0.7,
++        ),
++    ] {
++        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
++            evidence.push(EvidenceItem {
++                kind: kind.into(),
++                label: label.into(),
++                value: value.chars().take(240).collect(),
++                weight,
++            });
++        }
++    }
++    evidence
++}
+diff --git a/src-tauri/src/collectors.rs b/src-tauri/src/collectors.rs
+new file mode 100644
+index 0000000..b468054
+--- /dev/null
++++ b/src-tauri/src/collectors.rs
+@@ -0,0 +1,298 @@
++use crate::db::{now, AppDb};
++use crate::models::{InputStats, RawActivityEvent};
++use anyhow::{anyhow, Result};
++use parking_lot::Mutex;
++use serde_json::json;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::Arc;
++use tokio::time::{sleep, Duration, Instant};
++use uuid::Uuid;
++
++pub trait CollectorAdapter {
++    fn start(&self, db: Arc<AppDb>) -> Result<()>;
++    fn stop(&self) -> Result<()>;
++    fn health(&self) -> CollectorHealth;
++    fn emit(&self, db: &AppDb, event: RawActivityEvent) -> Result<()>;
++}
++
++#[derive(Debug, Clone, serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct CollectorHealth {
++    pub running: bool,
++    pub last_event_at: Option<String>,
++    pub last_error: Option<String>,
++}
++
++pub struct DesktopCollector {
++    running: AtomicBool,
++    generation: AtomicU64,
++    last_event_at: Mutex<Option<String>>,
++    last_error: Mutex<Option<String>>,
++}
++
++impl DesktopCollector {
++    pub fn new() -> Self {
++        Self {
++            running: AtomicBool::new(false),
++            generation: AtomicU64::new(0),
++            last_event_at: Mutex::new(None),
++            last_error: Mutex::new(None),
++        }
++    }
++
++    fn set_error(&self, error: impl ToString) {
++        *self.last_error.lock() = Some(error.to_string());
++    }
++
++    fn clear_error(&self) {
++        *self.last_error.lock() = None;
++    }
++
++    fn is_generation_active(&self, generation: u64) -> bool {
++        self.running.load(Ordering::SeqCst)
++            && self.generation.load(Ordering::SeqCst) == generation
++    }
++}
++
++impl CollectorAdapter for Arc<DesktopCollector> {
++    fn start(&self, db: Arc<AppDb>) -> Result<()> {
++        if self.running.swap(true, Ordering::SeqCst) {
++            return Ok(());
++        }
++        self.clear_error();
++        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
++        let collector = self.clone();
++
++        tauri::async_runtime::spawn(async move {
++            let mut previous: Option<(String, RawActivityEvent)> = None;
++            let mut last_persisted: Option<Instant> = None;
++
++            while collector.is_generation_active(generation) {
++                let settings = db.get_settings().unwrap_or_default();
++                let interval = Duration::from_secs(
++                    settings.tracking_interval_seconds.clamp(1, 30) as u64,
++                );
++                let heartbeat = Duration::from_secs(
++                    settings.heartbeat_seconds.clamp(15, 600) as u64,
++                );
++
++                match capture_foreground_event() {
++                    Ok(event) => {
++                        *collector.last_event_at.lock() = Some(event.timestamp.clone());
++                        let fingerprint =
