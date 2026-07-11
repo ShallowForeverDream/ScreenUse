@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "离开"];
 
@@ -187,43 +188,101 @@ pub struct QueueHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub language: String,
+
+    // Metadata-first runtime settings.
+    pub poll_interval_seconds: u32,
+    pub heartbeat_seconds: u32,
+    pub raw_event_retention_days: u32,
+    pub idle_threshold_seconds: u32,
+    pub auto_maintenance: bool,
+    pub auto_start: bool,
+    pub quick_pause_enabled: bool,
+
+    // AI is optional and disabled by default. "manual" analyzes one uncertain
+    // completed session when explicitly requested; "auto" also processes queued jobs.
+    pub ai_mode: String,
+    pub min_ai_session_minutes: u32,
+    pub ai_base_url: String,
+    pub ai_model: String,
+    pub ai_secret_ref: Option<String>,
+
+    pub backup_dir: Option<String>,
+    pub ddl_manager_db_path: String,
+
+    // v0.1 compatibility fields. They remain deserializable so existing settings
+    // migrate cleanly, but the runtime normalizes them to metadata-only values.
     pub capture_scope: String,
     pub fps: f32,
     pub chunk_minutes: u32,
     pub analysis_timing: String,
-    pub ai_base_url: String,
-    pub ai_model: String,
-    pub ai_secret_ref: Option<String>,
     pub temp_storage_limit_gb: u32,
-    pub idle_threshold_seconds: u32,
-    pub backup_dir: Option<String>,
-    pub ddl_manager_db_path: String,
-    pub auto_start: bool,
-    pub quick_pause_enabled: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".into());
         Self {
             language: "zh-CN".into(),
-            capture_scope: "all-displays".into(),
-            fps: 1.0,
-            chunk_minutes: 5,
-            analysis_timing: "near-realtime".into(),
-            ai_base_url: "https://api.openai.com/v1".into(),
-            ai_model: "gpt-4o-mini".into(),
-            ai_secret_ref: None,
-            temp_storage_limit_gb: 20,
+            poll_interval_seconds: 2,
+            heartbeat_seconds: 30,
+            raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
-            backup_dir: None,
-            ddl_manager_db_path: format!(r"{}\.ddl-manager\app.db", home),
+            auto_maintenance: true,
             auto_start: true,
             quick_pause_enabled: true,
+            ai_mode: "off".into(),
+            min_ai_session_minutes: 10,
+            ai_base_url: "https://api.openai.com/v1".into(),
+            ai_model: "".into(),
+            ai_secret_ref: None,
+            backup_dir: None,
+            ddl_manager_db_path: PathBuf::from(home)
+                .join(".ddl-manager")
+                .join("app.db")
+                .display()
+                .to_string(),
+            capture_scope: "metadata-only".into(),
+            fps: 0.0,
+            chunk_minutes: 0,
+            analysis_timing: "local-only".into(),
+            temp_storage_limit_gb: 1,
         }
+    }
+}
+
+impl AppSettings {
+    pub fn normalized(mut self) -> Self {
+        self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 15);
+        self.heartbeat_seconds = self
+            .heartbeat_seconds
+            .clamp(10, 300)
+            .max(self.poll_interval_seconds.saturating_mul(2));
+        self.raw_event_retention_days = self.raw_event_retention_days.clamp(7, 3650);
+        self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
+        self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(1, 240);
+        self.ai_mode = match self.ai_mode.as_str() {
+            "manual" => "manual",
+            "auto" => "auto",
+            _ => "off",
+        }
+        .into();
+
+        self.capture_scope = "metadata-only".into();
+        self.fps = 0.0;
+        self.chunk_minutes = 0;
+        self.analysis_timing = if self.ai_mode == "off" {
+            "local-only"
+        } else {
+            "local-first"
+        }
+        .into();
+        self.temp_storage_limit_gb = 1;
+        self
     }
 }
 
