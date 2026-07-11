@@ -1,0 +1,655 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..335ee7b
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,46 @@
++name: CI
++
++on:
++  push:
++  pull_request:
++
++permissions:
++  contents: read
++
++jobs:
++  frontend:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: pnpm/action-setup@v4
++        with:
++          version: 9
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: pnpm
++      - run: pnpm install --frozen-lockfile
++      - run: pnpm check
++      - run: pnpm build
++      - name: Check Chromium extension syntax
++        run: |
++          node --check extensions/chromium/background.js
++          node --check extensions/chromium/popup.js
++      - name: Compile VS Code extension
++        working-directory: extensions/vscode
++        run: |
++          pnpm install --frozen-lockfile=false
++          pnpm compile
++
++  rust-windows:
++    runs-on: windows-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: src-tauri
++      - name: Check Rust backend
++        run: cargo check --manifest-path src-tauri/Cargo.toml
++      - name: Run Rust tests
++        run: cargo test --manifest-path src-tauri/Cargo.toml
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+new file mode 100644
+index 0000000..437d47d
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,27 @@
++# Changelog
++
++## 0.2.0 — Lightweight personal tracker
++
++### Changed
++
++- Replaced continuous screenshot/media collection with metadata-only tracking.
++- Added 2-second observation with 60-second sparse heartbeat persistence.
++- Browser and VS Code integrations now enrich desktop events instead of creating duplicate sessions.
++- Added local weighted classification and project/task name matching.
++- User corrections now create field-specific learned rules automatically.
++- AI is disabled by default and only analyzes low-confidence metadata on demand.
++- Rebuilt the UI around today, review, projects, trends, storage and retention.
++
++### Added
++
++- Project and task creation.
++- 14-day daily trend and 30-day project/category summaries.
++- Database and event-count storage health.
++- Raw-event retention setting and six-hour maintenance worker.
++- Windows CI for Rust checks/tests and frontend CI for TypeScript/build.
++
++### Migration
++
++- Removes demo seed rows.
++- Purges 0.1 screenshot cache and legacy media jobs.
++- Keeps real sessions, projects, tasks, rules, plans and exports.
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..3de950e
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,125 @@
++# ScreenUse
++
++ScreenUse 是一个 Windows 优先、元数据优先的个人电脑使用时间分类器。它在后台观察当前前台应用和窗口标题，把连续活动合并为自然工作会话，再用本地规则归入项目、任务和分类。
++
++当前版本的默认目标只有四个：
++
++1. **无感**：每 2 秒检查一次前台上下文，但相同上下文每 60 秒最多写入一次心跳。
++2. **便宜**：默认完全本地分类，不需要 API；AI 仅作为手动开启的低置信补充。
++3. **小占用**：不截图、不录屏；工作会话长期保留，细粒度心跳默认保留 30 天。
++4. **越用越准**：确认或纠正会话时，自动从工作区、域名、路径、窗口或应用生成本地规则。
++
++## 默认数据流
++
++```text
++Windows 前台窗口 + 空闲时间
++             │
++             ├── 2 秒观察上下文变化
++             ├── 60 秒稀疏心跳
++             ▼
++        raw_events（30 天）
++             │
++      本地规则与关键词评分
++             ▼
++       work_sessions（长期）
++             │
++   今日 / 待纠正 / 项目 / 趋势
++```
++
++Chromium 和 VS Code 扩展只提供当前上下文，不单独生成计时会话，因此不会和桌面采集重复计算。
++
++## 已实现
++
++- Tauri 2 + Rust + React 19 桌面应用。
++- Windows 前台窗口、进程名和系统空闲时间采集。
++- 上下文变化检测与 heartbeat 合并；不按采样频率逐条写盘。
++- 本地 SQLite，WAL + 自动 checkpoint + 定期 optimize。
++- 开发、学习、写作、沟通、娱乐、杂务、离开七类本地归因。
++- 用户规则优先、内置关键词评分、项目/任务名称匹配。
++- 会话确认、内联纠正、拆分、合并。
++- 从人工纠正自动学习域名、工作区、路径、窗口或应用规则。
++- 今日有效时长按区间去重，避免重叠会话重复计时。
++- 近 14 天节律、近 30 天项目和分类分布。
++- 项目和任务管理。
++- CSV、Excel 可打开的 `.xls`、Markdown 导出。
++- SQLite 备份、原始事件保留期和手动维护。
++- Chromium 活动标签页扩展：只在浏览器位于前台时发送一个标签页，URL 去掉查询参数和片段。
++- VS Code 上下文扩展：只在工作区、活动文件、终端或调试上下文变化时发送，5 分钟心跳去重。
++- DDL-Manager 只读导入和 ICS 导入。
++- 可选 OpenAI-compatible 元数据分析：默认关闭，仅处理低置信会话，不发送截图或文件正文。
++
++## 运行
++
++需要 Node.js、pnpm、Rust 和 Windows WebView2。
++
++```powershell
++pnpm install
++pnpm check
++pnpm tauri:dev
++```
++
++生产构建：
++
++```powershell
++pnpm build
++pnpm cargo:check
++pnpm tauri:build
++```
++
++只预览前端：
++
++```powershell
++pnpm dev
++```
++
++## 推荐个人配置
++
++默认值已经针对个人长期运行做过收敛：
++
++| 设置 | 默认值 | 作用 |
++|---|---:|---|
++| 前台观察间隔 | 2 秒 | 快速发现切换，但不等于写盘频率 |
++| 相同上下文心跳 | 60 秒 | 控制 SQLite 写入和原始事件数量 |
++| 空闲阈值 | 180 秒 | 超过后归为“离开” |
++| 原始心跳保留 | 30 天 | 过期后自动删除，聚合会话仍保留 |
++| AI | 关闭 | 不产生 API 成本 |
++| 截图 | 永久关闭 | 旧版本缓存会在维护时清理 |
++
++一般个人使用时，长期数据主要是短文本和 SQLite 索引；30 天原始事件通常是几十 MB 量级，具体取决于每天使用时长、窗口标题和 URL 长度。
++
++## Chromium 扩展
++
++1. 打开 Chrome、Edge 或其他 Chromium 浏览器的扩展管理页。
++2. 开启开发者模式。
++3. 加载 `extensions/chromium`。
++4. 保持 ScreenUse 运行。
++
++扩展只发送当前获得焦点的活动标签页，不读取网页正文，也不枚举所有窗口和标签页。
++
++## VS Code 扩展
++
++```powershell
++cd extensions/vscode
++pnpm install
++pnpm compile
++```
++
++在 Extension Host 中加载该目录。扩展发送工作区路径、活动文件路径、语言、Git 分支、终端数和调试状态，不读取文件正文。
++
++## 从 0.1 升级
++
++- 数据库自动迁移。
++- 旧版示例 `seed` 会话、任务和项目会被移除。
++- 旧版屏幕帧、媒体表和非元数据分析任务会由维护任务清理。
++- 旧设置 JSON 仍可读取；截图开关会被强制关闭。
++- 已确认的真实工作会话不会被维护任务删除。
++
++## 设计说明
++
++- [架构](docs/ARCHITECTURE.md)
++- [方案取舍与竞品参考](docs/DESIGN_DECISIONS.md)
++- [更新记录](CHANGELOG.md)
++
++## 当前平台范围
++
++桌面前台窗口采集目前只实现 Windows。非 Windows 平台不会写入模拟数据；浏览器和 VS Code 上下文接口仍可运行，但完整计时需要后续增加对应原生 collector。
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+new file mode 100644
+index 0000000..8ea2a5a
+--- /dev/null
++++ b/docs/ARCHITECTURE.md
+@@ -0,0 +1,90 @@
++# ScreenUse Architecture
++
++## 数据流
++
++```mermaid
++flowchart LR
++  W[Windows foreground + idle] --> F[Context fingerprint]
++  B[Focused Chromium tab] --> H[Local HTTP 127.0.0.1:51247]
++  V[VS Code context] --> H
++  H --> R[raw_events context cache]
++  F --> E[Enrich with recent browser/editor context]
++  R --> E
++  E --> P[Sparse heartbeat persistence]
++  P --> C[Local classifier]
++  C --> S[work_sessions]
++  U[User correction] --> L[Learned field-specific rule]
++  L --> C
++  S --> UI[Today / Review / Projects / Trends]
++  D[DDL-Manager / ICS] --> I[plan_items]
++  I --> UI
++  S --> X[CSV / XLS / Markdown / Backup]
++```
++
++## 计时语义
++
++- Collector 每 `trackingIntervalSeconds` 观察一次前台窗口。
++- 上下文指纹由 `app + normalized window title + active/idle` 构成。
++- 指纹变化时，先用当前时间关闭旧上下文，再创建新上下文。
++- 指纹不变时，只有超过 `heartbeatSeconds` 才写入下一条心跳。
++- `work_sessions` 对相同归因、相邻且间隔小于心跳容差的事件续写 `ended_at`。
++- Chromium/VS Code 事件只写入 `raw_events`，由下一个桌面事件融合，不直接生成会话。
++
++这使 UI 的计时来源只有一条主链路，避免桌面、浏览器和编辑器各记一份。
++
++## 本地归因顺序
++
++1. 空闲阈值：直接归为“离开”。
++2. 用户学习规则：按优先级匹配 `workspace/domain/path/title/app/keyword`。
++3. 内置本地评分：根据应用、标题、URL、文件和工作区中的稳定关键词给各分类打分。
++4. 项目/任务匹配：对同分类项目名和任务名做 token/substring 评分。
++5. 无明显信号：归为“杂务”，低置信，进入待纠正列表。
++
++人工确认后的会话设置 `user_confirmed=1`，后续自动分析不能覆盖。
++
++## 本地学习
++
++纠正会话时，从证据中依次选择最具体的稳定特征：
++
++```text
++workspace > domain > file/path > window title > app > summary fallback
++```
++
++生成的规则包含纠正后的项目、任务、分类和稳定摘要。相同 matcher + target 的规则会去重。
++
++## 存储层
++
++SQLite 主要表：
++
++- `raw_events`：稀疏心跳和扩展上下文，默认 30 天。
++- `work_sessions`：长期聚合结果。
++- `projects` / `tasks`：个人事务词典。
++- `attribution_rules`：手工或自动学习规则。
++- `plan_items`：DDL/ICS 上下文。
++- `analysis_jobs`：仅可选元数据 AI。
++- `media_chunks`：仅兼容 0.1 数据，0.2 不再创建，维护时清理。
++
++数据库使用 WAL、`synchronous=NORMAL`、小型自动 checkpoint、4 MB journal limit 和每 6 小时维护。维护会：
++
++- 删除超过保留期的 `raw_events`。
++- 删除过期或旧媒体分析任务。
++- 清空 0.1 遗留截图缓存。
++- 合并连续相同会话。
++- 执行 checkpoint、optimize 和增量 vacuum。
++
++## 可选 AI
++
++默认 `aiEnabled=false`。启用后：
++
++- 只选择未确认、非离开、置信度低于 0.9、持续至少 30 秒的本地会话。
++- 只发送该时间段内的应用、标题、URL、文件、工作区和空闲元数据。
++- 不发送截图、网页正文或文件正文。
++- 失败最多重试一次；失败不会用低质量降级结果覆盖现有本地分类。
++
++## 线程和服务
++
++- Tauri 主线程：命令、窗口、托盘。
++- Collector async task：前台观察和稀疏心跳。
++- Local HTTP thread：浏览器/编辑器上下文入口。
++- Maintenance async task：启动后运行，之后每 6 小时一次。
++- AI async task：只有显式启用且模式非 `manual` 时低频轮询。
+diff --git a/docs/DESIGN_DECISIONS.md b/docs/DESIGN_DECISIONS.md
+new file mode 100644
+index 0000000..72d4321
+--- /dev/null
++++ b/docs/DESIGN_DECISIONS.md
+@@ -0,0 +1,74 @@
++# 方案取舍与竞品参考
++
++ScreenUse 0.2 不是把所有时间追踪方案叠在一起，而是针对“一个人长期在自己的电脑上运行”选择最低成本的组合。
++
++## 参考方案
++
++| 方案 | 值得借鉴 | ScreenUse 的取舍 |
++|---|---|---|
++| ActivityWatch | watcher/event/heartbeat 模型、本地优先、相邻事件合并 | 采用稀疏 heartbeat；减少服务和 bucket 概念，直接生成个人工作会话 |
++| Tockler | 前台窗口 + 空闲时间足以完成基础时间线 | 采用同样的低成本主信号，并增加项目/任务本地学习 |
++| RescueTime | 应用/网站分类、目标和低干扰体验 | 采用规则化分类思路；不依赖云端账户或订阅 |
++| WakaTime | 编辑器插件能提供 workspace/file/project 上下文 | VS Code 仅提供上下文，不独立计时，避免和桌面数据重复 |
++| Timely / Memory | 自动时间线和人工确认工作流 | 采用“自动先做、只复核低置信项”的交互 |
++| screenpipe / Dayflow 类截图方案 | 图像能补足窗口标题不足的问题 | 默认个人时间分类不值得持续截图、OCR、模型费用和缓存体积，因此 0.2 移除截图管线 |
++
++## 为什么不持续截图
++
++0.1 的 BMP 帧即使降低分辨率，仍会产生数量级更大的磁盘写入；而原实现的 AI 请求实际只读取元数据，没有把图像内容作为多模态输入。继续保留该路径会造成：
++
++- 无实际分类收益的存储开销；
++- 持续 GDI 抓屏和文件创建；
++- 媒体队列、失败重试、清理状态的额外复杂度；
++- 诱导用户认为“截图越多越准确”。
++
++0.2 将截图永久关闭并清理遗留缓存。遇到本地规则无法确定的活动时，按需 AI 只分析同一时间段的元数据。
++
++## 为什么观察 2 秒但 60 秒写盘
++
++两个频率解决不同问题：
++
++- 观察频率决定切换发现延迟。
++- heartbeat 决定持久化频率和数据量。
++
++按 2 秒逐条写盘会把“准确发现切换”和“高频保存”错误绑定。ScreenUse 在内存中比较指纹，只有切换或 heartbeat 到期才写 SQLite，兼顾分钟级统计准确性和长期运行成本。
++
++## 为什么扩展不单独计时
++
++浏览器、VS Code 和桌面窗口都在描述同一段墙钟时间。分别 materialize 会造成：
++
++- 同一分钟出现多个重叠会话；
++- 总时长超过真实时间；
++- 用户需要理解复杂的优先级或去重算法。
++
++0.2 把扩展视为 enrichment source：扩展先写最近上下文，桌面前台事件到达时再融合 URL、workspace、file 和 branch。唯一主时钟仍是桌面 collector。
++
++## 为什么优先本地学习而不是默认 AI
++
++个人电脑使用高度重复：同一项目目录、同一域名、同一文档标题会反复出现。一次纠正形成稳定规则后，后续分类成本接近零，而且结果可解释。
++
++AI 更适合处理剩余低置信长尾，而不适合作为每分钟必经路径。默认关闭意味着：
++
++- 零 API 成本；
++- 离线可用；
++- 无网络延迟；
++- 不会因为模型或 API 变化影响基础计时。
++
++## 数据保留策略
++
++- `work_sessions` 是最终账本，长期保留。
++- `raw_events` 只用于短期纠错、AI 上下文和诊断，默认 30 天。
++- 每天约数百到一千条短文本心跳，通常远小于截图方案。
++- 保留期可设为 1–365 天。
++- 维护任务不删除用户确认会话。
++
++## UI 原则
++
++主界面只回答四个问题：
++
++1. 今天有效使用了多久？
++2. 时间花在哪些事务上？
++3. 哪几项需要纠正？
++4. 数据占了多少空间？
++
++AI 队列、媒体缓存和内部状态不再占据主界面。高级能力放到设置页，并保持默认关闭。
+diff --git a/extensions/chromium/background.js b/extensions/chromium/background.js
+new file mode 100644
+index 0000000..6c44e91
+--- /dev/null
++++ b/extensions/chromium/background.js
+@@ -0,0 +1,119 @@
++const ENDPOINT = 'http://127.0.0.1:51247/integrations/browser/tabs';
++const ALARM = 'screenuse-active-tab-heartbeat';
++const HEARTBEAT_MS = 55_000;
++let debounceTimer;
++
++function browserName() {
++  const ua = navigator.userAgent;
++  if (ua.includes('Edg/')) return 'Microsoft Edge';
++  if (ua.includes('OPR/')) return 'Opera';
++  if (ua.includes('Vivaldi/')) return 'Vivaldi';
++  if (ua.includes('Firefox/')) return 'Firefox';
++  return 'Chromium';
++}
++
++function compactUrl(raw) {
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    url.hash = '';
++    url.search = '';
++    return `${url.origin}${url.pathname}`.slice(0, 1024);
++  } catch {
++    return String(raw).slice(0, 1024);
++  }
++}
++
++async function activeFocusedTab() {
++  const window = await chrome.windows.getLastFocused({ populate: false });
++  if (!window?.focused || window.id == null) return null;
++  const tabs = await chrome.tabs.query({ active: true, windowId: window.id });
++  const tab = tabs[0];
++  if (!tab) return null;
++  return { window, tab };
++}
++
++async function syncActiveTab({ force = false } = {}) {
++  try {
++    const context = await activeFocusedTab();
++    if (!context) return { sent: false, reason: 'browser-not-focused' };
++    const { window, tab } = context;
++    const payload = {
++      source: 'chromium-active-tab',
++      browser: browserName(),
++      capturedAt: new Date().toISOString(),
++      tab: {
++        id: tab.id,
++        windowId: window.id,
++        title: (tab.title || '').slice(0, 512),
++        url: compactUrl(tab.url),
++        audible: Boolean(tab.audible),
++        incognito: Boolean(tab.incognito),
++      },
++    };
++    const fingerprint = JSON.stringify([
++      payload.tab.windowId,
++      payload.tab.id,
++      payload.tab.title,
++      payload.tab.url,
++      payload.tab.audible,
++    ]);
++    const previous = await chrome.storage.local.get(['lastFingerprint', 'lastSentAt']);
++    const recentlySent = Date.now() - Number(previous.lastSentAt || 0) < HEARTBEAT_MS;
++    if (!force && previous.lastFingerprint === fingerprint && recentlySent) {
++      return { sent: false, reason: 'unchanged' };
++    }
++
++    const response = await fetch(ENDPOINT, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify(payload),
++    });
++    if (!response.ok) throw new Error(`ScreenUse HTTP ${response.status}`);
++    await chrome.storage.local.set({
++      lastFingerprint: fingerprint,
++      lastSentAt: Date.now(),
++      lastSync: payload.capturedAt,
++      lastTitle: payload.tab.title,
++      lastError: '',
++    });
++    return { sent: true };
++  } catch (error) {
++    await chrome.storage.local.set({ lastError: String(error) });
++    return { sent: false, reason: String(error) };
++  }
++}
++
++function scheduleSync(force = false) {
++  clearTimeout(debounceTimer);
++  debounceTimer = setTimeout(() => void syncActiveTab({ force }), 500);
++}
++
++chrome.runtime.onInstalled.addListener(() => {
++  chrome.alarms.create(ALARM, { periodInMinutes: 1 });
++  scheduleSync(true);
++});
++chrome.runtime.onStartup.addListener(() => {
++  chrome.alarms.create(ALARM, { periodInMinutes: 1 });
++  scheduleSync(true);
++});
++chrome.alarms.create(ALARM, { periodInMinutes: 1 });
++chrome.alarms.onAlarm.addListener((alarm) => {
++  if (alarm.name === ALARM) void syncActiveTab();
++});
++chrome.tabs.onActivated.addListener(() => scheduleSync(true));
++chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
++  if (tab.active && (changeInfo.title || changeInfo.url || changeInfo.status === 'complete')) {
++    scheduleSync();
++  }
++});
++chrome.windows.onFocusChanged.addListener((windowId) => {
++  if (windowId !== chrome.windows.WINDOW_ID_NONE) scheduleSync(true);
++});
++chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
++  if (message?.type !== 'screenuse-sync-now') return false;
++  void syncActiveTab({ force: true }).then(sendResponse);
++  return true;
++});
++
++scheduleSync(true);
+diff --git a/extensions/chromium/manifest.json b/extensions/chromium/manifest.json
+new file mode 100644
+index 0000000..e198d91
+--- /dev/null
++++ b/extensions/chromium/manifest.json
+@@ -0,0 +1,22 @@
++{
++  "manifest_version": 3,
++  "name": "ScreenUse Active Tab Context",
++  "version": "0.2.0",
++  "description": "Sends only the focused active tab title and compact URL to the local ScreenUse app.",
++  "permissions": [
++    "tabs",
++    "storage",
++    "alarms"
++  ],
++  "host_permissions": [
++    "http://127.0.0.1:51247/*"
++  ],
++  "background": {
++    "service_worker": "background.js",
++    "type": "module"
++  },
++  "action": {
++    "default_popup": "popup.html",
++    "default_title": "ScreenUse"
++  }
++}
+diff --git a/extensions/chromium/popup.html b/extensions/chromium/popup.html
+new file mode 100644
+index 0000000..36aad26
+--- /dev/null
++++ b/extensions/chromium/popup.html
+@@ -0,0 +1,20 @@
++<!doctype html>
++<html lang="zh-CN">
++<head>
++  <meta charset="utf-8">
++  <style>
++    body { width: 280px; margin: 0; padding: 16px; color: #e2e8f0; background: #0f172a; font: 13px/1.55 system-ui, "Microsoft YaHei"; }
++    h3 { margin: 0 0 8px; }
++    p { color: #94a3b8; }
++    button { width: 100%; padding: 9px 12px; border: 1px solid #334155; border-radius: 10px; color: #e2e8f0; background: #172033; cursor: pointer; }
++    #state { display: block; margin-top: 12px; color: #a5b4fc; word-break: break-word; }
++  </style>
++</head>
++<body>
++  <h3>ScreenUse 活动标签页</h3>
++  <p>仅在浏览器位于前台时发送当前标签页的标题与去除查询参数后的 URL；不会遍历其他窗口或标签页。</p>
++  <button id="sync">立即同步当前标签页</button>
++  <small id="state">读取状态…</small>
++  <script src="popup.js"></script>
++</body>
++</html>
+diff --git a/extensions/chromium/popup.js b/extensions/chromium/popup.js
+new file mode 100644
+index 0000000..485bf08
+--- /dev/null
++++ b/extensions/chromium/popup.js
+@@ -0,0 +1,19 @@
++const state = document.getElementById('state');
++
++async function renderState(prefix = '') {
++  const data = await chrome.storage.local.get(['lastSync', 'lastTitle', 'lastError']);
++  const detail = data.lastError
++    ? `连接失败：${data.lastError}`
++    : data.lastSync
++      ? `上次同步：${new Date(data.lastSync).toLocaleString()}\n${data.lastTitle || ''}`
++      : '尚未同步；请确认 ScreenUse 正在运行。';
++  state.textContent = `${prefix}${detail}`;
++}
++
++document.getElementById('sync').addEventListener('click', async () => {
++  state.textContent = '正在同步…';
++  const result = await chrome.runtime.sendMessage({ type: 'screenuse-sync-now' });
++  await renderState(result?.sent ? '已同步。' : '未发送。');
++});
++
++void renderState();
+diff --git a/extensions/vscode/package.json b/extensions/vscode/package.json
+new file mode 100644
+index 0000000..95fd181
+--- /dev/null
++++ b/extensions/vscode/package.json
+@@ -0,0 +1,35 @@
++{
++  "name": "screenuse-vscode-collector",
++  "displayName": "ScreenUse VS Code Context",
++  "description": "Sends deduplicated workspace, active file and Git branch metadata to local ScreenUse.",
++  "version": "0.2.0",
++  "publisher": "screenuse",
++  "engines": {
++    "vscode": "^1.92.0"
++  },
++  "categories": [
++    "Other"
++  ],
++  "activationEvents": [
++    "onStartupFinished",
++    "onCommand:screenuse.syncNow"
++  ],
++  "main": "./dist/extension.js",
++  "contributes": {
++    "commands": [
++      {
++        "command": "screenuse.syncNow",
++        "title": "ScreenUse: Sync Context Now"
++      }
++    ]
++  },
++  "scripts": {
++    "compile": "tsc -p ./",
++    "watch": "tsc -watch -p ./"
++  },
++  "devDependencies": {
++    "@types/vscode": "^1.92.0",
++    "@types/node": "^22.0.0",
++    "typescript": "^5.7.2"
++  }
++}
+diff --git a/extensions/vscode/src/extension.ts b/extensions/vscode/src/extension.ts
+new file mode 100644
+index 0000000..eb28fcd
+--- /dev/null
++++ b/extensions/vscode/src/extension.ts
+@@ -0,0 +1,91 @@
++import * as vscode from 'vscode';
++
++const ENDPOINT = 'http://127.0.0.1:51247/integrations/vscode/activity';
++const HEARTBEAT_MS = 5 * 60_000;
++let heartbeat: NodeJS.Timeout | undefined;
++let debounce: NodeJS.Timeout | undefined;
++let lastFingerprint = '';
++let lastSentAt = 0;
++
++export function activate(context: vscode.ExtensionContext) {
++  const schedule = (eventKind: string, force = false) => {
++    if (debounce) clearTimeout(debounce);
