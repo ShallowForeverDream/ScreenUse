@@ -1,0 +1,495 @@
++                            event_fingerprint(&event, settings.idle_threshold_seconds);
++                        let context_changed = previous
++                            .as_ref()
++                            .map(|(old, _)| old != &fingerprint)
++                            .unwrap_or(true);
++                        let heartbeat_due = last_persisted
++                            .map(|instant| instant.elapsed() >= heartbeat)
++                            .unwrap_or(true);
++
++                        if context_changed {
++                            if let Some((_, previous_event)) = previous.as_ref() {
++                                let mut closing_event = previous_event.clone();
++                                closing_event.id = Uuid::new_v4().to_string();
++                                closing_event.timestamp = event.timestamp.clone();
++                                if let Err(error) = collector.emit(&db, closing_event) {
++                                    collector.set_error(error);
++                                }
++                            }
++                        }
++
++                        if context_changed || heartbeat_due {
++                            if let Err(error) = collector.emit(&db, event.clone()) {
++                                collector.set_error(error);
++                            } else {
++                                last_persisted = Some(Instant::now());
++                            }
++                        }
++                        previous = Some((fingerprint, event));
++                    }
++                    Err(error) => collector.set_error(error),
++                }
++                sleep(interval).await;
++            }
++
++            // A stale task must not close a session after a rapid stop/start cycle.
++            if !collector.running.load(Ordering::SeqCst) {
++                if let Some((_, mut closing_event)) = previous {
++                    closing_event.id = Uuid::new_v4().to_string();
++                    closing_event.timestamp = now();
++                    let _ = collector.emit(&db, closing_event);
++                }
++            }
++        });
++        Ok(())
++    }
++
++    fn stop(&self) -> Result<()> {
++        self.running.store(false, Ordering::SeqCst);
++        self.generation.fetch_add(1, Ordering::SeqCst);
++        Ok(())
++    }
++
++    fn health(&self) -> CollectorHealth {
++        CollectorHealth {
++            running: self.running.load(Ordering::SeqCst),
++            last_event_at: self.last_event_at.lock().clone(),
++            last_error: self.last_error.lock().clone(),
++        }
++    }
++
++    fn emit(&self, db: &AppDb, event: RawActivityEvent) -> Result<()> {
++        db.ingest_raw_event(event)
++    }
++}
++
++fn event_fingerprint(event: &RawActivityEvent, idle_threshold_seconds: u32) -> String {
++    let idle = event.input_stats.idle_seconds >= idle_threshold_seconds as u64;
++    [
++        event.app.as_deref().unwrap_or_default(),
++        event.window_title.as_deref().unwrap_or_default(),
++        if idle { "idle" } else { "active" },
++    ]
++    .into_iter()
++    .map(normalize_fingerprint_part)
++    .collect::<Vec<_>>()
++    .join("|")
++}
++
++fn normalize_fingerprint_part(value: &str) -> String {
++    value
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" ")
++        .trim()
++        .to_lowercase()
++}
++
++#[cfg(windows)]
++unsafe fn process_image_path(pid: u32) -> Result<String> {
++    use windows::core::PWSTR;
++    use windows::Win32::Foundation::{CloseHandle, BOOL};
++    use windows::Win32::System::Threading::{
++        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
++        PROCESS_QUERY_LIMITED_INFORMATION,
++    };
++
++    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), pid)?;
++    let mut buffer = vec![0u16; 32_768];
++    let mut size = buffer.len() as u32;
++    let result = QueryFullProcessImageNameW(
++        handle,
++        PROCESS_NAME_FORMAT(0),
++        PWSTR(buffer.as_mut_ptr()),
++        &mut size,
++    );
++    let _ = CloseHandle(handle);
++    result?;
++    Ok(String::from_utf16_lossy(&buffer[..size as usize]))
++}
++
++#[cfg(windows)]
++fn capture_foreground_event() -> Result<RawActivityEvent> {
++    use std::path::PathBuf;
++    use windows::Win32::System::SystemInformation::GetTickCount;
++    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
++    use windows::Win32::UI::WindowsAndMessaging::{
++        GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
++        GetWindowThreadProcessId,
++    };
++
++    unsafe {
++        let window = GetForegroundWindow();
++        let length = GetWindowTextLengthW(window).max(0) as usize;
++        let mut buffer = vec![0u16; length + 1];
++        let copied = if buffer.is_empty() {
++            0
++        } else {
++            GetWindowTextW(window, &mut buffer)
++        };
++        let title = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
++        let mut pid = 0u32;
++        let _ = GetWindowThreadProcessId(window, Some(&mut pid));
++        let executable = process_image_path(pid).ok();
++        let app_name = executable
++            .as_ref()
++            .and_then(|path| {
++                PathBuf::from(path)
++                    .file_name()
++                    .map(|name| name.to_string_lossy().to_string())
++            })
++            .unwrap_or_else(|| format!("pid:{pid}"));
++
++        let mut last_input = LASTINPUTINFO {
++            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
++            dwTime: 0,
++        };
++        let idle_seconds = if GetLastInputInfo(&mut last_input).as_bool() {
++            let tick = GetTickCount();
++            tick.saturating_sub(last_input.dwTime) as u64 / 1000
++        } else {
++            0
++        };
++
++        Ok(RawActivityEvent {
++            id: Uuid::new_v4().to_string(),
++            source: "windows-foreground".into(),
++            timestamp: now(),
++            app: Some(app_name),
++            window_title: Some(title),
++            url: None,
++            file_path: None,
++            workspace: None,
++            input_stats: InputStats {
++                idle_seconds,
++                ..Default::default()
++            },
++            metadata: json!({ "pid": pid, "platform": "windows" }),
++        })
++    }
++}
++
++#[cfg(not(windows))]
++fn capture_foreground_event() -> Result<RawActivityEvent> {
++    Err(anyhow!(
++        "当前版本的桌面前台窗口采集仅实现 Windows；不会写入模拟占位活动"
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn event(title: &str, idle_seconds: u64) -> RawActivityEvent {
++        RawActivityEvent {
++            id: "test".into(),
++            source: "test".into(),
++            timestamp: "2026-01-01T00:00:00Z".into(),
++            app: Some("Code.exe".into()),
++            window_title: Some(title.into()),
++            url: None,
++            file_path: None,
++            workspace: None,
++            input_stats: InputStats {
++                idle_seconds,
++                ..Default::default()
++            },
++            metadata: json!({}),
++        }
++    }
++
++    #[test]
++    fn fingerprint_ignores_whitespace_and_case() {
++        assert_eq!(
++            event_fingerprint(&event("ScreenUse   - CODE", 0), 180),
++            event_fingerprint(&event("screenuse - code", 30), 180)
++        );
++    }
++
++    #[test]
++    fn fingerprint_changes_when_idle_threshold_is_crossed() {
++        assert_ne!(
++            event_fingerprint(&event("ScreenUse", 179), 180),
++            event_fingerprint(&event("ScreenUse", 180), 180)
++        );
++    }
++}
+diff --git a/src-tauri/src/db.rs b/src-tauri/src/db.rs
+new file mode 100644
+index 0000000..a502ee3
+--- /dev/null
++++ b/src-tauri/src/db.rs
+@@ -0,0 +1,2159 @@
++use crate::models::*;
++use anyhow::{Context, Result};
++use chrono::{DateTime, Duration, SecondsFormat, Utc};
++use directories::ProjectDirs;
++use parking_lot::Mutex;
++use rusqlite::{params, Connection, OptionalExtension};
++use serde::de::DeserializeOwned;
++use serde_json::json;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::time::Duration as StdDuration;
++use uuid::Uuid;
++
++pub struct AppDb {
++    conn: Mutex<Connection>,
++    db_path: PathBuf,
++    data_dir: PathBuf,
++}
++
++impl AppDb {
++    pub fn open() -> Result<Self> {
++        let dirs = ProjectDirs::from("com", "ShallowDream", "ScreenUse")
++            .context("cannot locate platform data dir")?;
++        let data_dir = dirs.data_dir().to_path_buf();
++        fs::create_dir_all(&data_dir)?;
++        fs::create_dir_all(data_dir.join("media-cache"))?;
++        fs::create_dir_all(data_dir.join("exports"))?;
++        fs::create_dir_all(data_dir.join("backups"))?;
++
++        let db_path = data_dir.join("screenuse.db");
++        let conn = Connection::open(&db_path)?;
++        conn.busy_timeout(StdDuration::from_secs(5))?;
++        conn.pragma_update(None, "foreign_keys", "ON")?;
++        conn.pragma_update(None, "journal_mode", "WAL")?;
++        conn.pragma_update(None, "synchronous", "NORMAL")?;
++        conn.pragma_update(None, "temp_store", "MEMORY")?;
++        conn.pragma_update(None, "wal_autocheckpoint", 256)?;
++        conn.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
++
++        let db = Self {
++            conn: Mutex::new(conn),
++            db_path,
++            data_dir,
++        };
++        db.migrate()?;
++        Ok(db)
++    }
++
++    pub fn data_dir(&self) -> &Path {
++        &self.data_dir
++    }
++
++    pub fn database_path(&self) -> &Path {
++        &self.db_path
++    }
++
++    pub fn media_cache_dir(&self) -> PathBuf {
++        self.data_dir.join("media-cache")
++    }
++
++    fn migrate(&self) -> Result<()> {
++        let conn = self.conn.lock();
++        conn.execute_batch(
++            r#"
++            CREATE TABLE IF NOT EXISTS settings (
++              key TEXT PRIMARY KEY,
++              value TEXT NOT NULL,
++              updated_at TEXT NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS projects (
++              id TEXT PRIMARY KEY,
++              name TEXT NOT NULL,
++              category TEXT NOT NULL,
++              source TEXT NOT NULL,
++              color TEXT NOT NULL,
++              description TEXT,
++              created_at TEXT NOT NULL,
++              updated_at TEXT NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS tasks (
++              id TEXT PRIMARY KEY,
++              project_id TEXT NOT NULL,
++              title TEXT NOT NULL,
++              status TEXT NOT NULL,
++              source TEXT NOT NULL,
++              planned_due_at TEXT,
++              created_at TEXT NOT NULL,
++              updated_at TEXT NOT NULL,
++              FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
++            );
++            CREATE TABLE IF NOT EXISTS work_sessions (
++              id TEXT PRIMARY KEY,
++              started_at TEXT NOT NULL,
++              ended_at TEXT NOT NULL,
++              project_id TEXT,
++              task_id TEXT,
++              category TEXT NOT NULL,
++              summary TEXT NOT NULL,
++              confidence REAL NOT NULL,
++              evidence_json TEXT NOT NULL,
++              user_confirmed INTEGER NOT NULL DEFAULT 0,
++              source TEXT NOT NULL,
++              updated_at TEXT NOT NULL,
++              FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
++              FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
++            );
++            CREATE TABLE IF NOT EXISTS activities (
++              id TEXT PRIMARY KEY,
++              session_id TEXT NOT NULL,
++              source TEXT NOT NULL,
++              title TEXT NOT NULL,
++              summary TEXT NOT NULL,
++              started_at TEXT NOT NULL,
++              ended_at TEXT NOT NULL,
++              evidence_json TEXT NOT NULL,
++              FOREIGN KEY(session_id) REFERENCES work_sessions(id) ON DELETE CASCADE
++            );
++            CREATE TABLE IF NOT EXISTS raw_events (
++              id TEXT PRIMARY KEY,
++              source TEXT NOT NULL,
++              timestamp TEXT NOT NULL,
++              app TEXT,
++              window_title TEXT,
++              url TEXT,
++              file_path TEXT,
++              workspace TEXT,
++              input_stats_json TEXT NOT NULL,
++              metadata_json TEXT NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS media_chunks (
++              id TEXT PRIMARY KEY,
++              display_id TEXT NOT NULL,
++              started_at TEXT NOT NULL,
++              ended_at TEXT,
++              path TEXT NOT NULL,
++              fps REAL NOT NULL,
++              status TEXT NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS analysis_jobs (
++              id TEXT PRIMARY KEY,
++              chunk_ids_json TEXT NOT NULL,
++              started_at TEXT NOT NULL,
++              ended_at TEXT NOT NULL,
++              mode TEXT NOT NULL,
++              retry_count INTEGER NOT NULL,
++              status TEXT NOT NULL,
++              error TEXT
++            );
++            CREATE TABLE IF NOT EXISTS attribution_rules (
++              id TEXT PRIMARY KEY,
++              name TEXT NOT NULL,
++              priority INTEGER NOT NULL,
++              matcher_json TEXT NOT NULL,
++              project_id TEXT,
++              task_id TEXT,
++              category TEXT NOT NULL,
++              created_from_correction INTEGER NOT NULL DEFAULT 0,
++              enabled INTEGER NOT NULL DEFAULT 1
++            );
++            CREATE TABLE IF NOT EXISTS plan_items (
++              id TEXT PRIMARY KEY,
++              source TEXT NOT NULL,
++              title TEXT NOT NULL,
++              note TEXT,
++              start_at TEXT,
++              due_at TEXT,
++              status TEXT NOT NULL,
++              tags_json TEXT NOT NULL,
++              matched_session_ids_json TEXT NOT NULL,
++              updated_at TEXT NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS export_records (
++              id TEXT PRIMARY KEY,
++              format TEXT NOT NULL,
++              path TEXT NOT NULL,
++              created_at TEXT NOT NULL
++            );
++            CREATE INDEX IF NOT EXISTS idx_work_sessions_time
++              ON work_sessions(started_at, ended_at);
++            CREATE INDEX IF NOT EXISTS idx_work_sessions_review
++              ON work_sessions(user_confirmed, confidence, started_at);
++            CREATE INDEX IF NOT EXISTS idx_raw_events_time
++              ON raw_events(timestamp);
++            CREATE INDEX IF NOT EXISTS idx_raw_events_source_time
++              ON raw_events(source, timestamp DESC);
++            CREATE INDEX IF NOT EXISTS idx_jobs_status
++              ON analysis_jobs(status, started_at);
++            CREATE INDEX IF NOT EXISTS idx_rules_priority
++              ON attribution_rules(enabled, priority DESC);
++
++            DELETE FROM work_sessions WHERE source='seed';
++            DELETE FROM tasks WHERE source='seed';
++            DELETE FROM projects WHERE source='seed';
++            "#,
++        )?;
++        Ok(())
++    }
++
++    pub fn get_settings(&self) -> Result<AppSettings> {
++        let conn = self.conn.lock();
++        let raw: Option<String> = conn
++            .query_row(
++                "SELECT value FROM settings WHERE key='app_settings'",
++                [],
++                |row| row.get(0),
++            )
++            .optional()?;
++        Ok(raw
++            .and_then(|value| serde_json::from_str::<AppSettings>(&value).ok())
++            .unwrap_or_default()
++            .normalized())
++    }
++
++    pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
++        let settings = settings.clone().normalized();
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT INTO settings(key,value,updated_at) VALUES('app_settings',?1,?2)\
++             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
++            params![serde_json::to_string(&settings)?, now()],
++        )?;
++        Ok(())
++    }
++
++    pub fn dashboard(&self, collector_running: bool) -> Result<DashboardData> {
++        Ok(DashboardData {
++            settings: self.get_settings()?,
++            sessions: self.list_sessions(500)?,
++            projects: self.list_projects()?,
++            tasks: self.list_tasks()?,
++            plan_items: self.list_plan_items(100)?,
++            trends: self.project_task_trends()?,
++            categories: self.category_trends()?,
++            daily: self.daily_trends()?,
++            queue: self.queue_health()?,
++            storage: self.storage_health()?,
++            collector_running,
++        })
++    }
++
++    pub fn list_projects(&self) -> Result<Vec<Project>> {
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            "SELECT id,name,category,source,color,description,created_at,updated_at\
++             FROM projects ORDER BY updated_at DESC,name ASC",
++        )?;
++        let rows = stmt.query_map([], |row| {
++            Ok(Project {
++                id: row.get(0)?,
++                name: row.get(1)?,
++                category: row.get(2)?,
++                source: row.get(3)?,
++                color: row.get(4)?,
++                description: row.get(5)?,
++                created_at: row.get(6)?,
++                updated_at: row.get(7)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn list_tasks(&self) -> Result<Vec<Task>> {
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            "SELECT id,project_id,title,status,source,planned_due_at,created_at,updated_at\
++             FROM tasks ORDER BY updated_at DESC,title ASC",
++        )?;
++        let rows = stmt.query_map([], |row| {
++            Ok(Task {
++                id: row.get(0)?,
++                project_id: row.get(1)?,
++                title: row.get(2)?,
++                status: row.get(3)?,
