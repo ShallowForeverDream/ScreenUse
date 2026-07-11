@@ -17,58 +17,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Windows build and tests
+  frontend:
+    name: Frontend type-check and build
     runs-on: windows-latest
-    timeout-minutes: 35
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
         with:
           version: 10
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Type-check frontend
-        run: pnpm check
-
-      - name: Build frontend
-        run: pnpm build
-
-      - name: Check Chromium extension scripts
+  extensions:
+    name: Browser and VS Code extensions
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check Chromium extension
         shell: pwsh
         run: |
           node --check extensions/chromium/background.js
           node --check extensions/chromium/popup.js
           Get-Content extensions/chromium/manifest.json | ConvertFrom-Json | Out-Null
+      - name: Install VS Code extension dependencies
+        run: pnpm --dir extensions/vscode install --no-frozen-lockfile
+      - name: Compile VS Code extension
+        run: pnpm --dir extensions/vscode compile
 
-      - name: Build VS Code extension
-        shell: pwsh
-        run: |
-          pnpm --dir extensions/vscode install --no-frozen-lockfile
-          pnpm --dir extensions/vscode compile
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+  rust:
+    name: Rust tests and Tauri backend check
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
-
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml
