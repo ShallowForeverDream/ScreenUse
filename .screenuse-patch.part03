@@ -1,0 +1,466 @@
++                source: row.get(4)?,
++                planned_due_at: row.get(5)?,
++                created_at: row.get(6)?,
++                updated_at: row.get(7)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn create_project(
++        &self,
++        name: &str,
++        category: &str,
++        description: Option<String>,
++    ) -> Result<Project> {
++        let name = clean_name(name, "未命名项目");
++        let category = normalize_category(category);
++        let id = Uuid::new_v4().to_string();
++        let timestamp = now();
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT INTO projects(id,name,category,source,color,description,created_at,updated_at)\
++             VALUES(?1,?2,?3,'manual',?4,?5,?6,?6)",
++            params![
++                id,
++                name,
++                category,
++                color_for_category(&category),
++                description.map(|value| clean_name(&value, "")),
++                timestamp
++            ],
++        )?;
++        drop(conn);
++        self.get_project(&id)?.context("created project missing")
++    }
++
++    pub fn create_task(&self, project_id: &str, title: &str) -> Result<Task> {
++        let title = clean_name(title, "未命名任务");
++        let id = Uuid::new_v4().to_string();
++        let timestamp = now();
++        let conn = self.conn.lock();
++        let project_exists: bool = conn.query_row(
++            "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
++            params![project_id],
++            |row| row.get(0),
++        )?;
++        anyhow::ensure!(project_exists, "project not found");
++        conn.execute(
++            "INSERT INTO tasks(id,project_id,title,status,source,planned_due_at,created_at,updated_at)\
++             VALUES(?1,?2,?3,'active','manual',NULL,?4,?4)",
++            params![id, project_id, title, timestamp],
++        )?;
++        drop(conn);
++        self.get_task(&id)?.context("created task missing")
++    }
++
++    fn get_project(&self, id: &str) -> Result<Option<Project>> {
++        let conn = self.conn.lock();
++        conn.query_row(
++            "SELECT id,name,category,source,color,description,created_at,updated_at FROM projects WHERE id=?1",
++            params![id],
++            |row| {
++                Ok(Project {
++                    id: row.get(0)?,
++                    name: row.get(1)?,
++                    category: row.get(2)?,
++                    source: row.get(3)?,
++                    color: row.get(4)?,
++                    description: row.get(5)?,
++                    created_at: row.get(6)?,
++                    updated_at: row.get(7)?,
++                })
++            },
++        )
++        .optional()
++        .map_err(Into::into)
++    }
++
++    fn get_task(&self, id: &str) -> Result<Option<Task>> {
++        let conn = self.conn.lock();
++        conn.query_row(
++            "SELECT id,project_id,title,status,source,planned_due_at,created_at,updated_at FROM tasks WHERE id=?1",
++            params![id],
++            |row| {
++                Ok(Task {
++                    id: row.get(0)?,
++                    project_id: row.get(1)?,
++                    title: row.get(2)?,
++                    status: row.get(3)?,
++                    source: row.get(4)?,
++                    planned_due_at: row.get(5)?,
++                    created_at: row.get(6)?,
++                    updated_at: row.get(7)?,
++                })
++            },
++        )
++        .optional()
++        .map_err(Into::into)
++    }
++
++    pub fn list_sessions(&self, limit: i64) -> Result<Vec<WorkSession>> {
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            r#"
++            SELECT ws.id,ws.started_at,ws.ended_at,ws.project_id,p.name,ws.task_id,t.title,
++                   ws.category,ws.summary,ws.confidence,ws.evidence_json,
++                   ws.user_confirmed,ws.source
++            FROM work_sessions ws
++            LEFT JOIN projects p ON p.id=ws.project_id
++            LEFT JOIN tasks t ON t.id=ws.task_id
++            ORDER BY ws.started_at DESC
++            LIMIT ?1
++            "#,
++        )?;
++        let rows = stmt.query_map(params![limit.max(1)], map_session_row)?;
++        collect_rows(rows)
++    }
++
++    pub fn get_session(&self, id: &str) -> Result<Option<WorkSession>> {
++        let conn = self.conn.lock();
++        conn.query_row(
++            r#"
++            SELECT ws.id,ws.started_at,ws.ended_at,ws.project_id,p.name,ws.task_id,t.title,
++                   ws.category,ws.summary,ws.confidence,ws.evidence_json,
++                   ws.user_confirmed,ws.source
++            FROM work_sessions ws
++            LEFT JOIN projects p ON p.id=ws.project_id
++            LEFT JOIN tasks t ON t.id=ws.task_id
++            WHERE ws.id=?1
++            "#,
++            params![id],
++            map_session_row,
++        )
++        .optional()
++        .map_err(Into::into)
++    }
++
++    pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
++        let current = self.get_session(id)?.context("session not found")?;
++        let replace_project = patch.replace_project_id.unwrap_or(false);
++        let replace_task = patch.replace_task_id.unwrap_or(false);
++        let mut project_id = if replace_project {
++            patch.project_id
++        } else {
++            patch.project_id.or(current.project_id)
++        };
++        let task_id = if replace_task {
++            patch.task_id
++        } else {
++            patch.task_id.or(current.task_id)
++        };
++        if let Some(task_id) = task_id.as_deref() {
++            if let Some(task) = self.get_task(task_id)? {
++                project_id = Some(task.project_id);
++            }
++        }
++        let summary = clean_name(
++            patch.summary.as_deref().unwrap_or(&current.summary),
++            &current.summary,
++        );
++        let category = normalize_category(
++            patch
++                .category
++                .as_deref()
++                .unwrap_or(&current.category),
++        );
++        let confidence = patch.confidence.unwrap_or(current.confidence).clamp(0.0, 1.0);
++        let confirmed = patch.user_confirmed.unwrap_or(true);
++        let conn = self.conn.lock();
++        conn.execute(
++            "UPDATE work_sessions SET project_id=?1,task_id=?2,summary=?3,category=?4,\
++             confidence=?5,user_confirmed=?6,updated_at=?7 WHERE id=?8",
++            params![
++                project_id,
++                task_id,
++                summary,
++                category,
++                confidence,
++                if confirmed { 1 } else { 0 },
++                now(),
++                id
++            ],
++        )?;
++        drop(conn);
++        self.get_session(id)?
++            .context("session disappeared after update")
++    }
++
++    pub fn merge_sessions(&self, ids: &[String], summary: Option<String>) -> Result<WorkSession> {
++        anyhow::ensure!(ids.len() >= 2, "at least two session ids are required");
++        let mut sessions = Vec::new();
++        for id in ids {
++            if let Some(session) = self.get_session(id)? {
++                sessions.push(session);
++            }
++        }
++        anyhow::ensure!(sessions.len() >= 2, "not enough valid sessions");
++        sessions.sort_by(|left, right| left.started_at.cmp(&right.started_at));
++        let first = sessions.first().cloned().context("missing first session")?;
++        let started_at = sessions
++            .iter()
++            .map(|session| session.started_at.as_str())
++            .min()
++            .unwrap_or(&first.started_at)
++            .to_string();
++        let ended_at = sessions
++            .iter()
++            .map(|session| session.ended_at.as_str())
++            .max()
++            .unwrap_or(&first.ended_at)
++            .to_string();
++        let confidence = sessions
++            .iter()
++            .map(|session| session.confidence)
++            .sum::<f32>()
++            / sessions.len() as f32;
++        let evidence = sessions
++            .iter()
++            .flat_map(|session| session.evidence.clone())
++            .take(24)
++            .collect::<Vec<_>>();
++        let summary = summary
++            .map(|value| clean_name(&value, &first.summary))
++            .unwrap_or_else(|| {
++                sessions
++                    .iter()
++                    .map(|session| session.summary.as_str())
++                    .collect::<Vec<_>>()
++                    .join(" / ")
++            });
++        let new_id = Uuid::new_v4().to_string();
++        let mut conn = self.conn.lock();
++        let transaction = conn.transaction()?;
++        transaction.execute(
++            "INSERT INTO work_sessions(id,started_at,ended_at,project_id,task_id,category,summary,\
++             confidence,evidence_json,user_confirmed,source,updated_at)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-merge',?10)",
++            params![
++                new_id,
++                started_at,
++                ended_at,
++                first.project_id,
++                first.task_id,
++                first.category,
++                summary,
++                confidence,
++                serde_json::to_string(&evidence)?,
++                now()
++            ],
++        )?;
++        for id in ids {
++            transaction.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
++        }
++        transaction.commit()?;
++        drop(conn);
++        self.get_session(&new_id)?.context("merged session missing")
++    }
++
++    pub fn split_session(&self, id: &str, split_at: &str) -> Result<Vec<WorkSession>> {
++        let session = self.get_session(id)?.context("session not found")?;
++        anyhow::ensure!(
++            split_at > session.started_at.as_str() && split_at < session.ended_at.as_str(),
++            "split_at must be inside session range"
++        );
++        DateTime::parse_from_rfc3339(split_at).context("split_at must be RFC3339")?;
++        let first_id = Uuid::new_v4().to_string();
++        let second_id = Uuid::new_v4().to_string();
++        let evidence_json = serde_json::to_string(&session.evidence)?;
++        let mut conn = self.conn.lock();
++        let transaction = conn.transaction()?;
++        transaction.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
++        transaction.execute(
++            "INSERT INTO work_sessions(id,started_at,ended_at,project_id,task_id,category,summary,\
++             confidence,evidence_json,user_confirmed,source,updated_at)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
++            params![
++                first_id,
++                session.started_at,
++                split_at,
++                session.project_id,
++                session.task_id,
++                session.category,
++                format!("{}（前半段）", session.summary),
++                session.confidence,
++                evidence_json,
++                now()
++            ],
++        )?;
++        transaction.execute(
++            "INSERT INTO work_sessions(id,started_at,ended_at,project_id,task_id,category,summary,\
++             confidence,evidence_json,user_confirmed,source,updated_at)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
++            params![
++                second_id,
++                split_at,
++                session.ended_at,
++                session.project_id,
++                session.task_id,
++                session.category,
++                format!("{}（后半段）", session.summary),
++                session.confidence,
++                serde_json::to_string(&session.evidence)?,
++                now()
++            ],
++        )?;
++        transaction.commit()?;
++        drop(conn);
++        Ok(vec![
++            self.get_session(&first_id)?.context("first split missing")?,
++            self.get_session(&second_id)?.context("second split missing")?,
++        ])
++    }
++
++    pub fn ingest_raw_event(&self, mut event: RawActivityEvent) -> Result<()> {
++        if event.id.trim().is_empty() {
++            event.id = Uuid::new_v4().to_string();
++        }
++        if is_primary_source(&event.source) {
++            event = self.enrich_primary_event(event)?;
++        }
++        compact_event(&mut event);
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT OR REPLACE INTO raw_events(id,source,timestamp,app,window_title,url,file_path,\
++             workspace,input_stats_json,metadata_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
++            params![
++                event.id,
++                event.source,
++                event.timestamp,
++                event.app,
++                event.window_title,
++                event.url,
++                event.file_path,
++                event.workspace,
++                serde_json::to_string(&event.input_stats)?,
++                event.metadata.to_string()
++            ],
++        )?;
++        drop(conn);
++        if is_primary_source(&event.source) {
++            self.materialize_event_session(&event)?;
++        }
++        Ok(())
++    }
++
++    fn enrich_primary_event(&self, mut event: RawActivityEvent) -> Result<RawActivityEvent> {
++        if !event.metadata.is_object() {
++            event.metadata = json!({});
++        }
++        let app = event.app.as_deref().unwrap_or_default().to_lowercase();
++        if is_browser_app(&app) {
++            if let Some(context) = self.latest_raw_event("browser-extension")? {
++                if event_is_recent(&event.timestamp, &context.timestamp, 180) {
++                    event.url = context.url;
++                    if event
++                        .window_title
++                        .as_deref()
++                        .map(|value| value.trim().is_empty())
++                        .unwrap_or(true)
++                    {
++                        event.window_title = context.window_title;
++                    }
++                    event.metadata["browserContext"] = context.metadata;
++                }
++            }
++        }
++        if is_editor_app(&app) {
++            if let Some(context) = self.latest_raw_event("vscode-extension")? {
++                if event_is_recent(&event.timestamp, &context.timestamp, 300) {
++                    event.file_path = context.file_path;
++                    event.workspace = context.workspace;
++                    event.metadata["editorContext"] = context.metadata;
++                }
++            }
++        }
++        Ok(event)
++    }
++
++    fn latest_raw_event(&self, source: &str) -> Result<Option<RawActivityEvent>> {
++        let conn = self.conn.lock();
++        conn.query_row(
++            r#"
++            SELECT id,source,timestamp,app,window_title,url,file_path,workspace,
++                   input_stats_json,metadata_json
++            FROM raw_events WHERE source=?1 ORDER BY timestamp DESC LIMIT 1
++            "#,
++            params![source],
++            map_raw_event_row,
++        )
++        .optional()
++        .map_err(Into::into)
++    }
++
++    fn materialize_event_session(&self, event: &RawActivityEvent) -> Result<()> {
++        let settings = self.get_settings()?;
++        let is_idle = event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64;
++        let (project_id, task_id, category, summary, confidence) =
++            self.heuristic_attribution(event, is_idle)?;
++        let evidence = evidence_for_event(event);
++        let max_gap = settings.heartbeat_seconds as i64
++            + settings.tracking_interval_seconds as i64 * 3
++            + 10;
++
++        let conn = self.conn.lock();
++        let last: Option<(
++            String,
++            Option<String>,
++            Option<String>,
++            String,
++            String,
++            String,
++        )> = conn
++            .query_row(
++                r#"
++                SELECT id,project_id,task_id,category,summary,ended_at
++                FROM work_sessions
++                WHERE user_confirmed=0 AND source='collector-rule'
++                ORDER BY ended_at DESC LIMIT 1
++                "#,
++                [],
++                |row| {
++                    Ok((
++                        row.get(0)?,
++                        row.get(1)?,
++                        row.get(2)?,
++                        row.get(3)?,
++                        row.get(4)?,
++                        row.get(5)?,
++                    ))
++                },
++            )
++            .optional()?;
++
++        if let Some((id, last_project, last_task, last_category, last_summary, last_end)) = last {
++            let same_attribution = last_project == project_id
++                && last_task == task_id
++                && last_category == category
++                && last_summary == summary;
++            if same_attribution && within_gap_seconds(&last_end, &event.timestamp, max_gap) {
++                conn.execute(
++                    "UPDATE work_sessions SET ended_at=?1,confidence=MAX(confidence,?2),\
++                     evidence_json=?3,updated_at=?4 WHERE id=?5",
++                    params![
++                        event.timestamp,
++                        confidence,
++                        serde_json::to_string(&evidence)?,
++                        now(),
++                        id
++                    ],
++                )?;
++                return Ok(());
++            }
++        }
++
++        conn.execute(
++            "INSERT INTO work_sessions(id,started_at,ended_at,project_id,task_id,category,summary,\
++             confidence,evidence_json,user_confirmed,source,updated_at)\
++             VALUES(?1,?2,?2,?3,?4,?5,?6,?7,?8,0,'collector-rule',?9)",
++            params![
++                Uuid::new_v4().to_string(),
++                event.timestamp,
++                project_id,
++                task_id,
++                category,
++                summary,
++                confidence,
