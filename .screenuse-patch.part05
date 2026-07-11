@@ -1,0 +1,507 @@
++                })
++            })?;
++            collect_rows(rows)?
++        };
++        let mut changed = 0u32;
++        for pair in rows.windows(2) {
++            let left = &pair[0];
++            let right = &pair[1];
++            let same = !left.user_confirmed
++                && !right.user_confirmed
++                && left.source == right.source
++                && left.project_id == right.project_id
++                && left.task_id == right.task_id
++                && left.category == right.category
++                && left.summary == right.summary
++                && within_gap_seconds(&left.ended_at, &right.started_at, 10 * 60);
++            if !same {
++                continue;
++            }
++            let merged_evidence = merge_evidence_blobs(&format!(
++                "{}||{}",
++                left.evidence_json, right.evidence_json
++            ));
++            let updated = conn.execute(
++                "UPDATE work_sessions SET ended_at=?1,confidence=?2,evidence_json=?3,updated_at=?4\
++                 WHERE id=?5 AND EXISTS(SELECT 1 FROM work_sessions WHERE id=?6)",
++                params![
++                    right.ended_at,
++                    left.confidence.max(right.confidence),
++                    serde_json::to_string(&merged_evidence)?,
++                    now(),
++                    left.id,
++                    right.id
++                ],
++            )?;
++            if updated > 0 {
++                conn.execute("DELETE FROM work_sessions WHERE id=?1", params![right.id])?;
++                changed += 1;
++            }
++        }
++        Ok(changed)
++    }
++
++    pub fn retry_failed_jobs(&self) -> Result<u32> {
++        let conn = self.conn.lock();
++        let changed = conn.execute(
++            "UPDATE analysis_jobs SET status='pending',error=NULL WHERE status IN ('failed','downgraded')",
++            [],
++        )?;
++        Ok(changed as u32)
++    }
++
++    pub fn queue_health(&self) -> Result<QueueHealth> {
++        let settings = self.get_settings()?;
++        let conn = self.conn.lock();
++        let count = |status: &str| -> Result<u32> {
++            Ok(conn.query_row(
++                "SELECT COUNT(*) FROM analysis_jobs WHERE status=?1",
++                params![status],
++                |row| row.get::<_, i64>(0),
++            )? as u32)
++        };
++        Ok(QueueHealth {
++            pending: count("pending")?,
++            running: count("running")?,
++            failed: count("failed")?,
++            downgraded: count("downgraded")?,
++            temp_storage_gb: dir_size(self.media_cache_dir()) as f32 / 1_073_741_824.0,
++            temp_storage_limit_gb: settings.temp_storage_limit_gb as f32,
++        })
++    }
++
++    pub fn storage_health(&self) -> Result<StorageHealth> {
++        let conn = self.conn.lock();
++        let raw_event_count = conn.query_row(
++            "SELECT COUNT(*) FROM raw_events",
++            [],
++            |row| row.get::<_, i64>(0),
++        )? as u64;
++        let session_count = conn.query_row(
++            "SELECT COUNT(*) FROM work_sessions",
++            [],
++            |row| row.get::<_, i64>(0),
++        )? as u64;
++        drop(conn);
++        let settings = self.get_settings()?;
++        Ok(StorageHealth {
++            database_mb: database_size(&self.db_path) as f32 / 1_048_576.0,
++            media_cache_mb: dir_size(self.media_cache_dir()) as f32 / 1_048_576.0,
++            raw_event_count,
++            session_count,
++            raw_event_retention_days: settings.raw_event_retention_days,
++        })
++    }
++
++    pub fn list_plan_items(&self, limit: i64) -> Result<Vec<PlanItem>> {
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            "SELECT id,source,title,note,start_at,due_at,status,tags_json,matched_session_ids_json\
++             FROM plan_items ORDER BY COALESCE(due_at,start_at,updated_at) ASC LIMIT ?1",
++        )?;
++        let rows = stmt.query_map(params![limit.max(1)], |row| {
++            let tags: String = row.get(7)?;
++            let matched: String = row.get(8)?;
++            Ok(PlanItem {
++                id: row.get(0)?,
++                source: row.get(1)?,
++                title: row.get(2)?,
++                note: row.get(3)?,
++                start_at: row.get(4)?,
++                due_at: row.get(5)?,
++                status: row.get(6)?,
++                tags: parse_json(&tags),
++                matched_session_ids: parse_json(&matched),
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn upsert_plan_items(&self, items: &[PlanItem]) -> Result<usize> {
++        let conn = self.conn.lock();
++        let mut count = 0usize;
++        for item in items {
++            conn.execute(
++                "INSERT OR REPLACE INTO plan_items(id,source,title,note,start_at,due_at,status,tags_json,\
++                 matched_session_ids_json,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
++                params![
++                    item.id,
++                    item.source,
++                    item.title,
++                    item.note,
++                    item.start_at,
++                    item.due_at,
++                    item.status,
++                    serde_json::to_string(&item.tags)?,
++                    serde_json::to_string(&item.matched_session_ids)?,
++                    now()
++                ],
++            )?;
++            count += 1;
++        }
++        Ok(count)
++    }
++
++    pub fn project_task_trends(&self) -> Result<Vec<TrendPoint>> {
++        let conn = self.conn.lock();
++        let cutoff = fmt(Utc::now() - Duration::days(30));
++        let mut stmt = conn.prepare(
++            r#"
++            SELECT COALESCE(p.name,'未归类') AS label,
++                   ROUND(SUM((julianday(ws.ended_at)-julianday(ws.started_at))*24*60),1) AS minutes,
++                   ws.category
++            FROM work_sessions ws
++            LEFT JOIN projects p ON p.id=ws.project_id
++            WHERE ws.category!='离开' AND ws.started_at>=?1
++            GROUP BY COALESCE(p.name,'未归类'),ws.category
++            HAVING minutes>0
++            ORDER BY minutes DESC LIMIT 12
++            "#,
++        )?;
++        let rows = stmt.query_map(params![cutoff], |row| {
++            Ok(TrendPoint {
++                label: row.get(0)?,
++                value: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
++                group: row.get(2)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn category_trends(&self) -> Result<Vec<TrendPoint>> {
++        let conn = self.conn.lock();
++        let cutoff = fmt(Utc::now() - Duration::days(30));
++        let mut stmt = conn.prepare(
++            r#"
++            SELECT category,
++                   ROUND(SUM((julianday(ended_at)-julianday(started_at))*24*60),1) AS minutes,
++                   category
++            FROM work_sessions
++            WHERE started_at>=?1
++            GROUP BY category
++            HAVING minutes>0
++            ORDER BY minutes DESC
++            "#,
++        )?;
++        let rows = stmt.query_map(params![cutoff], |row| {
++            Ok(TrendPoint {
++                label: row.get(0)?,
++                value: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
++                group: row.get(2)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn daily_trends(&self) -> Result<Vec<TrendPoint>> {
++        let conn = self.conn.lock();
++        let cutoff = fmt(Utc::now() - Duration::days(13));
++        let mut stmt = conn.prepare(
++            r#"
++            SELECT substr(started_at,1,10) AS day,
++                   ROUND(SUM((julianday(ended_at)-julianday(started_at))*24*60),1) AS minutes,
++                   '有效使用'
++            FROM work_sessions
++            WHERE category!='离开' AND started_at>=?1
++            GROUP BY day ORDER BY day ASC
++            "#,
++        )?;
++        let rows = stmt.query_map(params![cutoff], |row| {
++            Ok(TrendPoint {
++                label: row.get(0)?,
++                value: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
++                group: row.get(2)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn export_path(&self, extension: &str) -> PathBuf {
++        self.data_dir.join("exports").join(format!(
++            "screenuse-{}.{}",
++            Utc::now().format("%Y%m%d-%H%M%S"),
++            extension
++        ))
++    }
++
++    pub fn record_export(&self, format: &str, path: &Path) -> Result<()> {
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT INTO export_records(id,format,path,created_at) VALUES(?1,?2,?3,?4)",
++            params![
++                Uuid::new_v4().to_string(),
++                format,
++                path.display().to_string(),
++                now()
++            ],
++        )?;
++        Ok(())
++    }
++
++    pub fn backup_now(&self, target_dir: Option<String>) -> Result<PathBuf> {
++        let dir = target_dir
++            .map(PathBuf::from)
++            .unwrap_or_else(|| self.data_dir.join("backups"));
++        fs::create_dir_all(&dir)?;
++        let target = dir.join(format!(
++            "screenuse-backup-{}.db",
++            Utc::now().format("%Y%m%d-%H%M%S")
++        ));
++        {
++            let conn = self.conn.lock();
++            conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
++        }
++        fs::copy(&self.db_path, &target)?;
++        Ok(target)
++    }
++
++    pub fn cleanup_media_cache(&self) -> Result<u32> {
++        let limit = self.get_settings()?.temp_storage_limit_gb.max(1) as u64 * 1_073_741_824;
++        let mut current_size = dir_size(self.media_cache_dir());
++        if current_size <= limit {
++            return Ok(0);
++        }
++        let conn = self.conn.lock();
++        let rows = {
++            let mut stmt = conn.prepare(
++                "SELECT id,path,status FROM media_chunks\
++                 ORDER BY CASE status WHEN 'analyzed' THEN 0 WHEN 'deleted' THEN 1\
++                 WHEN 'downgraded' THEN 2 ELSE 3 END,started_at ASC",
++            )?;
++            let rows = stmt.query_map([], |row| {
++                Ok((
++                    row.get::<_, String>(0)?,
++                    row.get::<_, String>(1)?,
++                    row.get::<_, String>(2)?,
++                ))
++            })?;
++            collect_rows(rows)?
++        };
++        drop(conn);
++        let mut deleted = 0u32;
++        for (id, path, status) in rows {
++            if current_size <= limit {
++                break;
++            }
++            if matches!(
++                status.as_str(),
++                "recording" | "running" | "pending-analysis" | "pending"
++            ) {
++                continue;
++            }
++            let path = PathBuf::from(path);
++            let before = path_size(&path);
++            if path.is_dir() {
++                let _ = fs::remove_dir_all(&path);
++            } else if path.is_file() {
++                let _ = fs::remove_file(&path);
++            }
++            if before > 0 {
++                current_size = current_size.saturating_sub(before);
++                let conn = self.conn.lock();
++                conn.execute(
++                    "UPDATE media_chunks SET status='deleted' WHERE id=?1",
++                    params![id],
++                )?;
++                deleted += 1;
++            }
++        }
++        Ok(deleted)
++    }
++}
++
++fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkSession> {
++    let evidence_json: String = row.get(10)?;
++    Ok(WorkSession {
++        id: row.get(0)?,
++        started_at: row.get(1)?,
++        ended_at: row.get(2)?,
++        project_id: row.get(3)?,
++        project_name: row.get(4)?,
++        task_id: row.get(5)?,
++        task_title: row.get(6)?,
++        category: row.get(7)?,
++        summary: row.get(8)?,
++        confidence: row.get(9)?,
++        evidence: parse_json(&evidence_json),
++        user_confirmed: row.get::<_, i64>(11)? != 0,
++        source: row.get(12)?,
++    })
++}
++
++fn map_raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawActivityEvent> {
++    let input_stats_json: String = row.get(8)?;
++    let metadata_json: String = row.get(9)?;
++    Ok(RawActivityEvent {
++        id: row.get(0)?,
++        source: row.get(1)?,
++        timestamp: row.get(2)?,
++        app: row.get(3)?,
++        window_title: row.get(4)?,
++        url: row.get(5)?,
++        file_path: row.get(6)?,
++        workspace: row.get(7)?,
++        input_stats: parse_json(&input_stats_json),
++        metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
++    })
++}
++
++fn is_primary_source(source: &str) -> bool {
++    matches!(source, "windows-foreground" | "desktop-foreground")
++}
++
++fn is_browser_app(app: &str) -> bool {
++    [
++        "chrome", "msedge", "chromium", "brave", "vivaldi", "opera", "arc", "firefox",
++    ]
++    .iter()
++    .any(|needle| app.contains(needle))
++}
++
++fn is_editor_app(app: &str) -> bool {
++    [
++        "code.exe",
++        "code - insiders",
++        "cursor",
++        "codium",
++        "devenv",
++        "idea",
++        "pycharm",
++        "webstorm",
++        "rustrover",
++    ]
++    .iter()
++    .any(|needle| app.contains(needle))
++}
++
++fn compact_event(event: &mut RawActivityEvent) {
++    event.source = truncate(&event.source, 80);
++    event.app = event.app.take().map(|value| truncate(&value, 120));
++    event.window_title = event
++        .window_title
++        .take()
++        .map(|value| truncate(&collapse_whitespace(&value), 512));
++    event.url = event.url.take().map(|value| truncate(&value, 1024));
++    event.file_path = event.file_path.take().map(|value| truncate(&value, 512));
++    event.workspace = event.workspace.take().map(|value| truncate(&value, 512));
++    event.input_stats.shortcut_events.truncate(12);
++}
++
++fn evidence_for_event(event: &RawActivityEvent) -> Vec<EvidenceItem> {
++    let mut evidence = Vec::new();
++    let mut push = |kind: &str, label: &str, value: Option<&str>, weight: f32| {
++        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
++            evidence.push(EvidenceItem {
++                kind: kind.into(),
++                label: label.into(),
++                value: truncate(value, 240),
++                weight,
++            });
++        }
++    };
++    push("workspace", "工作区", event.workspace.as_deref(), 0.92);
++    push("url", "网页", event.url.as_deref(), 0.86);
++    push("file", "文件", event.file_path.as_deref(), 0.84);
++    push("window", "窗口", event.window_title.as_deref(), 0.72);
++    push("app", "应用", event.app.as_deref(), 0.55);
++    evidence.truncate(5);
++    evidence
++}
++
++fn event_haystack(event: &RawActivityEvent) -> String {
++    [
++        event.app.as_deref().unwrap_or_default(),
++        event.window_title.as_deref().unwrap_or_default(),
++        event.url.as_deref().unwrap_or_default(),
++        event.file_path.as_deref().unwrap_or_default(),
++        event.workspace.as_deref().unwrap_or_default(),
++    ]
++    .join(" ")
++    .to_lowercase()
++}
++
++fn rule_matches(matcher: &serde_json::Value, event: &RawActivityEvent, hay: &str) -> bool {
++    let contains = |field: &str, value: &str| {
++        matcher
++            .get(field)
++            .and_then(|item| item.as_str())
++            .map(str::trim)
++            .filter(|needle| !needle.is_empty())
++            .map(|needle| value.to_lowercase().contains(&needle.to_lowercase()))
++            .unwrap_or(false)
++    };
++    contains("keyword", hay)
++        || contains("app", event.app.as_deref().unwrap_or_default())
++        || contains("domain", event.url.as_deref().unwrap_or_default())
++        || contains("url", event.url.as_deref().unwrap_or_default())
++        || contains("path", event.file_path.as_deref().unwrap_or_default())
++        || contains("workspace", event.workspace.as_deref().unwrap_or_default())
++        || contains("title", event.window_title.as_deref().unwrap_or_default())
++}
++
++fn classify_locally(event: &RawActivityEvent, hay: &str) -> (String, i32) {
++    let app = event.app.as_deref().unwrap_or_default().to_lowercase();
++    let title = event
++        .window_title
++        .as_deref()
++        .unwrap_or_default()
++        .to_lowercase();
++    let url = event.url.as_deref().unwrap_or_default().to_lowercase();
++
++    let categories: [(&str, &[(&str, i32)]); 6] = [
++        (
++            "开发",
++            &[
++                ("code.exe", 5),
++                ("visual studio", 5),
++                ("cursor", 5),
++                ("codex", 5),
++                ("github", 3),
++                ("gitlab", 3),
++                ("stackoverflow", 3),
++                ("localhost", 3),
++                ("cargo", 4),
++                ("rust", 4),
++                ("python", 3),
++                ("typescript", 3),
++                ("javascript", 3),
++                ("tauri", 4),
++                ("terminal", 3),
++                ("powershell", 3),
++                ("cmd.exe", 3),
++                (".rs", 3),
++                (".tsx", 3),
++                (".ts", 2),
++                (".py", 3),
++                ("debug", 2),
++            ],
++        ),
++        (
++            "写作",
++            &[
++                ("winword", 5),
++                ("word.exe", 5),
++                ("wps", 5),
++                ("obsidian", 4),
++                ("typora", 4),
++                ("notion", 3),
++                ("markdown", 3),
++                ("写作", 4),
++                ("文档", 2),
++                ("草稿", 3),
++                ("论文写作", 5),
++            ],
++        ),
++        (
++            "学习",
++            &[
++                ("acrobat", 4),
++                ("pdf", 3),
++                ("arxiv", 4),
++                ("知网", 4),
++                ("课程", 4),
++                ("教程", 4),
++                ("lecture", 4),
++                ("course", 4),
++                ("documentation", 3),
++                ("docs.", 2),
