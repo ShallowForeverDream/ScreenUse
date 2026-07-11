@@ -55,7 +55,26 @@ jobs:
       - name: Install VS Code extension dependencies
         run: pnpm --dir extensions/vscode install --no-frozen-lockfile
       - name: Compile VS Code extension
-        run: pnpm --dir extensions/vscode compile
+        id: vscode_compile
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cmd /c "pnpm --dir extensions/vscode compile > vscode-compile.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content vscode-compile.log
+          "exit_code=$code" >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Upload VS Code compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-compile-log
+          path: vscode-compile.log
+          retention-days: 1
+      - name: Enforce VS Code compiler result
+        if: steps.vscode_compile.outputs.exit_code != '0'
+        shell: pwsh
+        run: exit 1
 
   rust:
     name: Rust tests and Tauri backend check
