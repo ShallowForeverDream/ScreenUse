@@ -40,9 +40,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -53,13 +50,13 @@ jobs:
           node --check extensions/chromium/popup.js
           Get-Content extensions/chromium/manifest.json | ConvertFrom-Json | Out-Null
       - name: Install VS Code extension dependencies
-        run: pnpm --dir extensions/vscode install --no-frozen-lockfile
+        run: npm install --prefix extensions/vscode --no-audit --no-fund
       - name: Compile VS Code extension
         id: vscode_compile
         continue-on-error: true
         shell: pwsh
         run: |
-          cmd /c "pnpm --dir extensions/vscode compile > vscode-compile.log 2>&1"
+          cmd /c "npm run compile --prefix extensions/vscode > vscode-compile.log 2>&1"
           $code = $LASTEXITCODE
           Get-Content vscode-compile.log
           "exit_code=$code" >> $env:GITHUB_OUTPUT
