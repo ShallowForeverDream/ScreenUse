@@ -15,7 +15,7 @@ pub struct BrowserContext {
     pub tab_id: Option<i64>,
     pub window_id: Option<i64>,
     pub audible: bool,
-    updated_at: Option<SystemTime>,
+    pub(crate) updated_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -28,7 +28,7 @@ pub struct EditorContext {
     pub event_kind: Option<String>,
     pub terminal_count: u32,
     pub debug_active: Option<String>,
-    updated_at: Option<SystemTime>,
+    pub(crate) updated_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Default)]
