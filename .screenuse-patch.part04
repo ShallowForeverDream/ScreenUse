@@ -1,0 +1,499 @@
++                serde_json::to_string(&evidence)?,
++                now()
++            ],
++        )?;
++        Ok(())
++    }
++
++    fn heuristic_attribution(
++        &self,
++        event: &RawActivityEvent,
++        is_idle: bool,
++    ) -> Result<(Option<String>, Option<String>, String, String, f32)> {
++        if is_idle {
++            return Ok((None, None, "离开".into(), "离开 / 空闲".into(), 0.98));
++        }
++        let hay = event_haystack(event);
++        let conn = self.conn.lock();
++        let rules = {
++            let mut stmt = conn.prepare(
++                "SELECT matcher_json,project_id,task_id,category,name\
++                 FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC,created_from_correction DESC",
++            )?;
++            let rows = stmt.query_map([], |row| {
++                Ok((
++                    row.get::<_, String>(0)?,
++                    row.get::<_, Option<String>>(1)?,
++                    row.get::<_, Option<String>>(2)?,
++                    row.get::<_, String>(3)?,
++                    row.get::<_, String>(4)?,
++                ))
++            })?;
++            collect_rows(rows)?
++        };
++        for (matcher_json, project_id, task_id, category, name) in rules {
++            let matcher: serde_json::Value =
++                serde_json::from_str(&matcher_json).unwrap_or_default();
++            if rule_matches(&matcher, event, &hay) {
++                let summary = matcher
++                    .get("summary")
++                    .and_then(|value| value.as_str())
++                    .map(|value| clean_name(value, &name))
++                    .unwrap_or_else(|| format!("规则命中 · {name}"));
++                return Ok((
++                    project_id,
++                    task_id,
++                    normalize_category(&category),
++                    summary,
++                    0.94,
++                ));
++            }
++        }
++
++        let (category, score) = classify_locally(event, &hay);
++        let (project_id, task_id, project_score) =
++            choose_project_and_task(&conn, &category, &hay)?;
++        let summary = summary_for_event(&category, event);
++        let base_confidence: f32 = if score >= 6 {
++            0.84
++        } else if score >= 3 {
++            0.74
++        } else if category == "杂务" {
++            0.42
++        } else {
++            0.62
++        };
++        let confidence = base_confidence + if project_score >= 6 { 0.06 } else { 0.0 };
++        Ok((
++            project_id,
++            task_id,
++            category,
++            summary,
++            confidence.min(0.9),
++        ))
++    }
++
++    pub fn upsert_media_chunk(&self, chunk: &MediaChunk) -> Result<()> {
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT OR REPLACE INTO media_chunks(id,display_id,started_at,ended_at,path,fps,status)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7)",
++            params![
++                chunk.id,
++                chunk.display_id,
++                chunk.started_at,
++                chunk.ended_at,
++                chunk.path,
++                chunk.fps,
++                chunk.status
++            ],
++        )?;
++        Ok(())
++    }
++
++    pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
++        let conn = self.conn.lock();
++        conn.execute(
++            "INSERT OR REPLACE INTO analysis_jobs(id,chunk_ids_json,started_at,ended_at,mode,\
++             retry_count,status,error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
++            params![
++                job.id,
++                serde_json::to_string(&job.chunk_ids)?,
++                job.metadata_range.started_at,
++                job.metadata_range.ended_at,
++                job.mode,
++                job.retry_count,
++                job.status,
++                job.error
++            ],
++        )?;
++        Ok(())
++    }
++
++    pub fn prepare_metadata_analysis_job(&self) -> Result<bool> {
++        let conn = self.conn.lock();
++        let candidate: Option<(String, String)> = conn
++            .query_row(
++                r#"
++                SELECT ws.started_at,ws.ended_at
++                FROM work_sessions ws
++                WHERE ws.user_confirmed=0
++                  AND ws.source='collector-rule'
++                  AND ws.category!='离开'
++                  AND ws.confidence<0.9
++                  AND (julianday(ws.ended_at)-julianday(ws.started_at))*86400>=30
++                  AND NOT EXISTS (
++                    SELECT 1 FROM analysis_jobs job
++                    WHERE job.started_at=ws.started_at AND job.ended_at=ws.ended_at
++                      AND job.status IN ('pending','running','completed')
++                  )
++                ORDER BY ws.ended_at DESC LIMIT 1
++                "#,
++                [],
++                |row| Ok((row.get(0)?, row.get(1)?)),
++            )
++            .optional()?;
++        let Some((started_at, ended_at)) = candidate else {
++            return Ok(false);
++        };
++        conn.execute(
++            "INSERT INTO analysis_jobs(id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error)\
++             VALUES(?1,'[]',?2,?3,'metadata',0,'pending',NULL)",
++            params![Uuid::new_v4().to_string(), started_at, ended_at],
++        )?;
++        Ok(true)
++    }
++
++    pub fn claim_next_analysis_job(&self) -> Result<Option<AnalysisJob>> {
++        let mut conn = self.conn.lock();
++        let transaction = conn.transaction()?;
++        let row: Option<(String, String, String, String, String, u32, Option<String>)> =
++            transaction
++                .query_row(
++                    "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,error\
++                     FROM analysis_jobs WHERE status='pending' ORDER BY started_at ASC LIMIT 1",
++                    [],
++                    |row| {
++                        Ok((
++                            row.get(0)?,
++                            row.get(1)?,
++                            row.get(2)?,
++                            row.get(3)?,
++                            row.get(4)?,
++                            row.get::<_, i64>(5)? as u32,
++                            row.get(6)?,
++                        ))
++                    },
++                )
++                .optional()?;
++        let result = if let Some((id, chunks, start, end, mode, retry_count, error)) = row {
++            let changed = transaction.execute(
++                "UPDATE analysis_jobs SET status='running',error=NULL WHERE id=?1 AND status='pending'",
++                params![id],
++            )?;
++            if changed == 1 {
++                Some(AnalysisJob {
++                    id,
++                    chunk_ids: parse_json(&chunks),
++                    metadata_range: TimeRange {
++                        started_at: start,
++                        ended_at: end,
++                    },
++                    mode,
++                    retry_count,
++                    status: "running".into(),
++                    error,
++                })
++            } else {
++                None
++            }
++        } else {
++            None
++        };
++        transaction.commit()?;
++        Ok(result)
++    }
++
++    pub fn mark_analysis_job_status(
++        &self,
++        id: &str,
++        status: &str,
++        retry_count: Option<u32>,
++        error: Option<String>,
++    ) -> Result<()> {
++        let conn = self.conn.lock();
++        conn.execute(
++            "UPDATE analysis_jobs SET status=?1,retry_count=COALESCE(?2,retry_count),error=?3 WHERE id=?4",
++            params![status, retry_count.map(i64::from), error, id],
++        )?;
++        Ok(())
++    }
++
++    pub fn list_raw_events_between(
++        &self,
++        started_at: &str,
++        ended_at: &str,
++    ) -> Result<Vec<RawActivityEvent>> {
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            r#"
++            SELECT id,source,timestamp,app,window_title,url,file_path,workspace,
++                   input_stats_json,metadata_json
++            FROM raw_events
++            WHERE timestamp>=?1 AND timestamp<=?2
++            ORDER BY timestamp ASC
++            LIMIT 1000
++            "#,
++        )?;
++        let rows = stmt.query_map(params![started_at, ended_at], map_raw_event_row)?;
++        collect_rows(rows)
++    }
++
++    pub fn media_chunks_by_ids(&self, ids: &[String]) -> Result<Vec<MediaChunk>> {
++        if ids.is_empty() {
++            return Ok(vec![]);
++        }
++        let conn = self.conn.lock();
++        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
++        let sql = format!(
++            "SELECT id,display_id,started_at,ended_at,path,fps,status FROM media_chunks WHERE id IN ({placeholders})"
++        );
++        let mut stmt = conn.prepare(&sql)?;
++        let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
++            Ok(MediaChunk {
++                id: row.get(0)?,
++                display_id: row.get(1)?,
++                started_at: row.get(2)?,
++                ended_at: row.get(3)?,
++                path: row.get(4)?,
++                fps: row.get(5)?,
++                status: row.get(6)?,
++            })
++        })?;
++        collect_rows(rows)
++    }
++
++    pub fn set_media_chunks_status(
++        &self,
++        ids: &[String],
++        status: &str,
++        delete_files: bool,
++    ) -> Result<()> {
++        let chunks = self.media_chunks_by_ids(ids)?;
++        if delete_files {
++            for chunk in &chunks {
++                let path = PathBuf::from(&chunk.path);
++                if path.is_dir() {
++                    let _ = fs::remove_dir_all(&path);
++                } else if path.is_file() {
++                    let _ = fs::remove_file(&path);
++                }
++            }
++        }
++        let conn = self.conn.lock();
++        for id in ids {
++            conn.execute(
++                "UPDATE media_chunks SET status=?1 WHERE id=?2",
++                params![status, id],
++            )?;
++        }
++        Ok(())
++    }
++
++    pub fn upsert_project_by_name(
++        &self,
++        name: &str,
++        category: &str,
++        source: &str,
++    ) -> Result<String> {
++        let name = clean_name(name, "自动发现项目");
++        let category = normalize_category(category);
++        let conn = self.conn.lock();
++        if let Some(id) = conn
++            .query_row(
++                "SELECT id FROM projects WHERE name=?1 LIMIT 1",
++                params![name],
++                |row| row.get::<_, String>(0),
++            )
++            .optional()?
++        {
++            conn.execute(
++                "UPDATE projects SET category=?1,updated_at=?2 WHERE id=?3",
++                params![category, now(), id],
++            )?;
++            return Ok(id);
++        }
++        let id = Uuid::new_v4().to_string();
++        let timestamp = now();
++        conn.execute(
++            "INSERT INTO projects(id,name,category,source,color,description,created_at,updated_at)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
++            params![
++                id,
++                name,
++                category,
++                source,
++                color_for_category(&category),
++                format!("ScreenUse 根据本地元数据自动发现：{name}"),
++                timestamp
++            ],
++        )?;
++        Ok(id)
++    }
++
++    pub fn upsert_task_by_title(
++        &self,
++        project_id: &str,
++        title: &str,
++        source: &str,
++    ) -> Result<String> {
++        let title = clean_name(title, "待确认活动");
++        let conn = self.conn.lock();
++        if let Some(id) = conn
++            .query_row(
++                "SELECT id FROM tasks WHERE project_id=?1 AND title=?2 LIMIT 1",
++                params![project_id, title],
++                |row| row.get::<_, String>(0),
++            )
++            .optional()?
++        {
++            conn.execute(
++                "UPDATE tasks SET status='active',updated_at=?1 WHERE id=?2",
++                params![now(), id],
++            )?;
++            return Ok(id);
++        }
++        let id = Uuid::new_v4().to_string();
++        let timestamp = now();
++        conn.execute(
++            "INSERT INTO tasks(id,project_id,title,status,source,planned_due_at,created_at,updated_at)\
++             VALUES(?1,?2,?3,'active',?4,NULL,?5,?5)",
++            params![id, project_id, title, source, timestamp],
++        )?;
++        Ok(id)
++    }
++
++    pub fn materialize_attribution_session(
++        &self,
++        range: &TimeRange,
++        project_id: Option<String>,
++        task_id: Option<String>,
++        category: String,
++        summary: String,
++        confidence: f32,
++        evidence: Vec<EvidenceItem>,
++        source: &str,
++    ) -> Result<WorkSession> {
++        let id = Uuid::new_v4().to_string();
++        let evidence_json = serde_json::to_string(&evidence)?;
++        let conn = self.conn.lock();
++        conn.execute(
++            "DELETE FROM work_sessions WHERE user_confirmed=0\
++             AND source IN ('collector-rule','ai-analysis','rule-downgrade')\
++             AND ended_at>=?1 AND started_at<=?2",
++            params![range.started_at, range.ended_at],
++        )?;
++        conn.execute(
++            "INSERT INTO work_sessions(id,started_at,ended_at,project_id,task_id,category,summary,\
++             confidence,evidence_json,user_confirmed,source,updated_at)\
++             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11)",
++            params![
++                id,
++                range.started_at,
++                range.ended_at,
++                project_id,
++                task_id,
++                normalize_category(&category),
++                clean_name(&summary, "自动归因活动"),
++                confidence.clamp(0.0, 1.0),
++                evidence_json,
++                source,
++                now()
++            ],
++        )?;
++        conn.execute(
++            "INSERT INTO activities(id,session_id,source,title,summary,started_at,ended_at,evidence_json)\
++             VALUES(?1,?2,?3,'自动归因活动',?4,?5,?6,?7)",
++            params![
++                Uuid::new_v4().to_string(),
++                id,
++                source,
++                summary,
++                range.started_at,
++                range.ended_at,
++                serde_json::to_string(&evidence)?
++            ],
++        )?;
++        drop(conn);
++        self.match_plan_items_for_session(&id)?;
++        self.get_session(&id)?.context("inserted session missing")
++    }
++
++    fn match_plan_items_for_session(&self, session_id: &str) -> Result<()> {
++        let Some(session) = self.get_session(session_id)? else {
++            return Ok(());
++        };
++        let hay = format!(
++            "{} {} {} {}",
++            session.summary,
++            session.category,
++            session.project_name.unwrap_or_default(),
++            session.task_title.unwrap_or_default()
++        )
++        .to_lowercase();
++        let conn = self.conn.lock();
++        let mut stmt = conn.prepare(
++            "SELECT id,title,note,matched_session_ids_json FROM plan_items",
++        )?;
++        let rows = stmt.query_map([], |row| {
++            Ok((
++                row.get::<_, String>(0)?,
++                row.get::<_, String>(1)?,
++                row.get::<_, Option<String>>(2)?,
++                row.get::<_, String>(3)?,
++            ))
++        })?;
++        let mut updates = Vec::new();
++        for row in rows {
++            let (id, title, note, matched_json) = row?;
++            let needle = format!("{} {}", title, note.unwrap_or_default()).to_lowercase();
++            let matches = !needle.trim().is_empty()
++                && (hay.contains(needle.trim())
++                    || text_tokens(&needle)
++                        .into_iter()
++                        .any(|token| token.chars().count() >= 3 && hay.contains(&token)));
++            if matches {
++                let mut matched: Vec<String> = parse_json(&matched_json);
++                if !matched.iter().any(|value| value == session_id) {
++                    matched.push(session_id.to_string());
++                    updates.push((id, serde_json::to_string(&matched)?));
++                }
++            }
++        }
++        drop(stmt);
++        for (id, matched_json) in updates {
++            conn.execute(
++                "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
++                params![matched_json, now(), id],
++            )?;
++        }
++        Ok(())
++    }
++
++    pub fn compact_sessions(&self) -> Result<u32> {
++        #[derive(Clone)]
++        struct Row {
++            id: String,
++            started_at: String,
++            ended_at: String,
++            project_id: Option<String>,
++            task_id: Option<String>,
++            category: String,
++            summary: String,
++            confidence: f32,
++            evidence_json: String,
++            user_confirmed: bool,
++            source: String,
++        }
++        let conn = self.conn.lock();
++        let rows = {
++            let mut stmt = conn.prepare(
++                r#"
++                SELECT id,started_at,ended_at,project_id,task_id,category,summary,
++                       confidence,evidence_json,user_confirmed,source
++                FROM work_sessions ORDER BY started_at ASC
++                "#,
++            )?;
++            let rows = stmt.query_map([], |row| {
++                Ok(Row {
++                    id: row.get(0)?,
++                    started_at: row.get(1)?,
++                    ended_at: row.get(2)?,
++                    project_id: row.get(3)?,
++                    task_id: row.get(4)?,
++                    category: row.get(5)?,
++                    summary: row.get(6)?,
++                    confidence: row.get(7)?,
++                    evidence_json: row.get(8)?,
++                    user_confirmed: row.get::<_, i64>(9)? != 0,
++                    source: row.get(10)?,
