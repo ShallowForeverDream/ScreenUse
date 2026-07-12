@@ -21,6 +21,8 @@ import {
   HardDrive,
   LayoutDashboard,
   Merge,
+  Monitor,
+  Moon,
   Pause,
   Pencil,
   Play,
@@ -29,6 +31,7 @@ import {
   Settings,
   Sparkles,
   SplitSquareHorizontal,
+  Sun,
   Tags,
   TimerReset,
   WandSparkles,
@@ -40,6 +43,7 @@ import type {
   DashboardData,
   Project,
   Task,
+  ThemeMode,
   WorkSession,
 } from './types';
 
@@ -63,6 +67,38 @@ const categoryColors: Record<string, string> = {
   离开: '#94a3b8',
 };
 
+const THEME_STORAGE_KEY = 'screenuse-theme';
+
+function normalizeTheme(value: unknown): ThemeMode {
+  return value === 'light' || value === 'dark' ? value : 'system';
+}
+
+function readStoredTheme(): ThemeMode {
+  try {
+    return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    return 'system';
+  }
+}
+
+function applyTheme(mode: ThemeMode) {
+  const resolved =
+    mode === 'system'
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light'
+      : mode;
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved;
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, mode);
+  } catch {
+    // A disabled WebView storage backend should not prevent theme switching.
+  }
+}
+
+applyTheme(readStoredTheme());
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [data, setData] = useState<DashboardData | null>(null);
@@ -72,6 +108,7 @@ export default function App() {
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [editing, setEditing] = useState<WorkSession | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
 
   const load = useCallback(async () => {
     try {
@@ -99,6 +136,20 @@ export default function App() {
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [load]);
+
+  useEffect(() => {
+    applyTheme(themeMode);
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const syncSystemTheme = () => {
+      if (themeMode === 'system') applyTheme('system');
+    };
+    media.addEventListener('change', syncSystemTheme);
+    return () => media.removeEventListener('change', syncSystemTheme);
+  }, [themeMode]);
+
+  useEffect(() => {
+    if (data) setThemeMode(normalizeTheme(data.settings.theme));
+  }, [data?.settings.theme]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -237,7 +288,6 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <div className="page-heading">
-            <span className="eyebrow">METADATA-FIRST</span>
             <h1>{currentTab.label}</h1>
             <p>{pageDescription(activeTab)}</p>
           </div>
@@ -344,7 +394,7 @@ export default function App() {
           />
         )}
         {activeTab === 'settings' && (
-          <SettingsView data={data} runAction={runAction} />
+          <SettingsView data={data} runAction={runAction} onThemeChange={setThemeMode} />
         )}
       </main>
 
@@ -864,7 +914,15 @@ function ProjectsView({
   );
 }
 
-function SettingsView({ data, runAction }: { data: DashboardData; runAction: ActionRunner }) {
+function SettingsView({
+  data,
+  runAction,
+  onThemeChange,
+}: {
+  data: DashboardData;
+  runAction: ActionRunner;
+  onThemeChange: (theme: ThemeMode) => void;
+}) {
   const [settings, setSettings] = useState<AppSettings>(data.settings);
   const [secret, setSecret] = useState('');
 
@@ -872,6 +930,11 @@ function SettingsView({ data, runAction }: { data: DashboardData; runAction: Act
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setSettings((current) => ({ ...current, [key]: value }));
+  };
+
+  const updateTheme = (theme: ThemeMode) => {
+    update('theme', theme);
+    onThemeChange(theme);
   };
 
   const saveAll = async () => {
@@ -888,6 +951,36 @@ function SettingsView({ data, runAction }: { data: DashboardData; runAction: Act
 
   return (
     <div className="settings-grid">
+      <section className="panel settings-panel appearance-panel">
+        <PanelTitle
+          title="外观"
+          subtitle="主题会立即预览；保存后在下次启动时继续使用。"
+        />
+        <div className="theme-selector" role="radiogroup" aria-label="界面主题">
+          {([
+            { value: 'system', label: '跟随系统', detail: '自动适应 Windows', icon: Monitor },
+            { value: 'light', label: '浅色', detail: '明亮、清晰', icon: Sun },
+            { value: 'dark', label: '深色', detail: '弱光环境', icon: Moon },
+          ] as const).map(({ value, label, detail, icon: Icon }) => (
+            <button
+              className={settings.theme === value ? 'active' : ''}
+              key={value}
+              onClick={() => updateTheme(value)}
+              role="radio"
+              aria-checked={settings.theme === value}
+              type="button"
+            >
+              <Icon size={18} />
+              <span>
+                <strong>{label}</strong>
+                <small>{detail}</small>
+              </span>
+              {settings.theme === value && <Check size={16} />}
+            </button>
+          ))}
+        </div>
+      </section>
+
       <section className="panel settings-panel">
         <PanelTitle
           title="自动记录"

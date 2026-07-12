@@ -179,6 +179,7 @@ pub struct QueueHealth {
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub language: String,
+    pub theme: String,
 
     // Metadata-first runtime settings.
     pub poll_interval_seconds: u32,
@@ -217,6 +218,7 @@ impl Default for AppSettings {
             .unwrap_or_else(|_| ".".into());
         Self {
             language: "zh-CN".into(),
+            theme: "system".into(),
             poll_interval_seconds: 2,
             heartbeat_seconds: 30,
             raw_event_retention_days: 30,
@@ -247,6 +249,12 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn normalized(mut self) -> Self {
+        self.theme = match self.theme.as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            _ => "system",
+        }
+        .into();
         self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 15);
         self.heartbeat_seconds = self
             .heartbeat_seconds
@@ -299,4 +307,23 @@ pub struct SessionPatch {
     pub category: Option<String>,
     pub confidence: Option<f32>,
     pub user_confirmed: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn theme_defaults_and_normalizes_for_existing_settings() {
+        let existing: AppSettings = serde_json::from_str("{}").expect("deserialize defaults");
+        assert_eq!(existing.theme, "system");
+
+        let mut invalid = AppSettings::default();
+        invalid.theme = "unknown".into();
+        assert_eq!(invalid.normalized().theme, "system");
+
+        let mut dark = AppSettings::default();
+        dark.theme = "dark".into();
+        assert_eq!(dark.normalized().theme, "dark");
+    }
 }

@@ -1,5 +1,6 @@
 export type Category = '学习' | '写作' | '开发' | '沟通' | '娱乐' | '杂务' | '离开' | string;
 export type AiMode = 'off' | 'manual' | 'auto' | string;
+export type ThemeMode = 'system' | 'light' | 'dark';
 
 export interface InputStats {
   idleSeconds: number;
@@ -95,6 +96,7 @@ export interface QueueHealth {
 
 export interface AppSettings {
   language: string;
+  theme: ThemeMode;
   pollIntervalSeconds: number;
   heartbeatSeconds: number;
   rawEventRetentionDays: number;
