@@ -14,6 +14,7 @@ export const fallbackDashboard: DashboardData = {
     idleThresholdSeconds: 180,
     autoMaintenance: true,
     autoStart: true,
+    launchAtLogin: false,
     quickPauseEnabled: true,
     aiMode: 'off',
     minAiSessionMinutes: 10,

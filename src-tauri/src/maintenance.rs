@@ -81,7 +81,7 @@ pub fn checkpoint(db: &AppDb) -> Result<()> {
 }
 
 fn remove_directory_children(path: &Path) -> Result<u32> {
-    fs::create_dir_all(path)?;
+    if !path.exists() { return Ok(0); }
     let mut removed = 0;
     for entry in fs::read_dir(path)? {
         let entry = entry?;

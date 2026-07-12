@@ -101,6 +101,7 @@ export interface AppSettings {
   idleThresholdSeconds: number;
   autoMaintenance: boolean;
   autoStart: boolean;
+  launchAtLogin: boolean;
   quickPauseEnabled: boolean;
   aiMode: AiMode;
   minAiSessionMinutes: number;

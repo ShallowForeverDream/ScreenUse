@@ -45,18 +45,6 @@ pub struct RawActivityEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MediaChunk {
-    pub id: String,
-    pub display_id: String,
-    pub started_at: String,
-    pub ended_at: Option<String>,
-    pub path: String,
-    pub fps: f32,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AnalysisJob {
     pub id: String,
     pub chunk_ids: Vec<String>,
@@ -199,6 +187,7 @@ pub struct AppSettings {
     pub idle_threshold_seconds: u32,
     pub auto_maintenance: bool,
     pub auto_start: bool,
+    pub launch_at_login: bool,
     pub quick_pause_enabled: bool,
 
     // AI is optional and disabled by default. "manual" analyzes one uncertain
@@ -234,6 +223,7 @@ impl Default for AppSettings {
             idle_threshold_seconds: 180,
             auto_maintenance: true,
             auto_start: true,
+            launch_at_login: false,
             quick_pause_enabled: true,
             ai_mode: "off".into(),
             min_ai_session_minutes: 10,

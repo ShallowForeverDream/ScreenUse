@@ -36,6 +36,7 @@ struct ActiveContext {
     id: String,
     signature: String,
     event: RawActivityEvent,
+    last_observed_at: Instant,
 }
 
 impl DesktopCollector {
@@ -96,6 +97,18 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                 };
                 context_store::enrich_event(&mut event);
                 sanitize_event(&mut event);
+                let observation_gap = active.as_ref().is_some_and(|current| {
+                    is_unexpected_observation_gap(current.last_observed_at.elapsed(), settings.poll_interval_seconds)
+                });
+                if observation_gap {
+                    if let Some(previous) = active.take() {
+                        let ended_at = previous.event.timestamp.clone();
+                        if let Err(error) = close_context_at(&collector, &db, previous, ended_at) {
+                            collector.set_error(error);
+                        }
+                    }
+                    last_emit_at = None;
+                }
                 let signature = context_signature(&event, settings.idle_threshold_seconds);
                 let context_changed = active
                     .as_ref()
@@ -103,7 +116,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
 
                 if context_changed {
                     if let Some(previous) = active.take() {
-                        if let Err(error) = close_context(&collector, &db, previous) {
+                        if let Err(error) = close_context_at(&collector, &db, previous, event.timestamp.clone()) {
                             collector.set_error(error);
                         }
                     }
@@ -122,6 +135,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                                 id: event.id.clone(),
                                 signature,
                                 event,
+                                last_observed_at: Instant::now(),
                             });
                         }
                         Err(error) => collector.set_error(error),
@@ -129,6 +143,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                 } else if let Some(current) = active.as_mut() {
                     event.id = current.id.clone();
                     current.event = event.clone();
+                    current.last_observed_at = Instant::now();
                     let heartbeat_due = last_emit_at
                         .map(|last| last.elapsed() >= Duration::from_secs(settings.heartbeat_seconds as u64))
                         .unwrap_or(true);
@@ -180,14 +195,23 @@ impl CollectorAdapter for Arc<DesktopCollector> {
 }
 
 fn close_context(collector: &DesktopCollector, db: &AppDb, previous: ActiveContext) -> Result<()> {
+    close_context_at(collector, db, previous, now())
+}
+
+fn close_context_at(collector: &DesktopCollector, db: &AppDb, previous: ActiveContext, ended_at: String) -> Result<()> {
     let mut event = previous.event;
     event.id = previous.id;
-    event.timestamp = now();
+    event.timestamp = ended_at;
     mark_metadata(&mut event, "contextEnd", serde_json::Value::Bool(true));
     classification::ingest_event(db, &event)?;
     classification::finalize_context(db, &event)?;
     *collector.last_event_at.lock() = Some(event.timestamp);
     Ok(())
+}
+
+fn is_unexpected_observation_gap(elapsed: Duration, poll_interval_seconds: u32) -> bool {
+    let expected = u64::from(poll_interval_seconds.max(10));
+    elapsed > Duration::from_secs(expected.saturating_mul(4).max(60))
 }
 
 fn context_signature(event: &RawActivityEvent, idle_threshold_seconds: u32) -> String {
@@ -336,5 +360,13 @@ mod tests {
         let first = context_signature(&event, 180);
         event.app = Some("two.exe".into());
         assert_eq!(first, context_signature(&event, 180));
+    }
+
+    #[test]
+    fn detects_suspend_sized_observation_gaps() {
+        assert!(!is_unexpected_observation_gap(Duration::from_secs(12), 2));
+        assert!(!is_unexpected_observation_gap(Duration::from_secs(60), 15));
+        assert!(is_unexpected_observation_gap(Duration::from_secs(61), 2));
+        assert!(is_unexpected_observation_gap(Duration::from_secs(61), 15));
     }
 }

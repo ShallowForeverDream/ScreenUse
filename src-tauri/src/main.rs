@@ -1,5 +1,6 @@
 mod ai;
 mod analysis_worker;
+mod autostart;
 mod classification;
 mod collectors;
 mod context_store;
@@ -118,10 +119,12 @@ fn cleanup_media_cache(state: State<AppState>) -> Result<u32, String> {
 
 #[tauri::command]
 fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), String> {
-    state
-        .db
-        .save_settings(&settings.normalized())
-        .map_err(map_err)
+    let settings = settings.normalized();
+    let previous = state.db.get_settings().map_err(map_err)?.normalized();
+    if previous.launch_at_login != settings.launch_at_login {
+        autostart::set_launch_at_login(settings.launch_at_login).map_err(map_err)?;
+    }
+    state.db.save_settings(&settings).map_err(map_err)
 }
 
 #[tauri::command]
@@ -277,6 +280,12 @@ fn main() {
         .setup(|app| {
             let db = Arc::new(AppDb::open().map_err(tauri::Error::Anyhow)?);
             maintenance::initialize(&db).map_err(tauri::Error::Anyhow)?;
+            let settings = db.get_settings().unwrap_or_default().normalized();
+            if settings.launch_at_login {
+                if let Err(error) = autostart::set_launch_at_login(true) {
+                    eprintln!("ScreenUse login startup refresh error: {error}");
+                }
+            }
 
             let collector = Arc::new(DesktopCollector::new());
             integration_server::start_local_ingest_server().map_err(tauri::Error::Anyhow)?;
@@ -284,10 +293,15 @@ fn main() {
             maintenance::start_worker(db.clone());
             setup_tray(app, db.clone(), collector.clone())?;
 
-            if db.get_settings().unwrap_or_default().normalized().auto_start {
+            if settings.auto_start {
                 collector
                     .start(db.clone())
                     .map_err(tauri::Error::Anyhow)?;
+            }
+            if autostart::background_launch_requested() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
             }
             app.manage(AppState { db, collector });
             Ok(())

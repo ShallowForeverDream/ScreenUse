@@ -915,6 +915,12 @@ function SettingsView({ data, runAction }: { data: DashboardData; runAction: Act
           </Field>
         </div>
         <Toggle
+          checked={settings.launchAtLogin}
+          onChange={(value) => update('launchAtLogin', value)}
+          title="登录 Windows 后静默启动"
+          detail="从登录启动项进入时只显示托盘，不弹出主窗口。"
+        />
+        <Toggle
           checked={settings.autoStart}
           onChange={(value) => update('autoStart', value)}
           title="启动 ScreenUse 后自动记录"
