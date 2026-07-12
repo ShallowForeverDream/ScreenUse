@@ -8,7 +8,7 @@ export const fallbackDashboard: DashboardData = {
   collectorRunning: true,
   settings: {
     language: 'zh-CN',
-    theme: 'system',
+    theme: 'light',
     pollIntervalSeconds: 2,
     heartbeatSeconds: 30,
     rawEventRetentionDays: 30,

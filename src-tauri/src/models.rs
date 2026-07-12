@@ -218,7 +218,7 @@ impl Default for AppSettings {
             .unwrap_or_else(|_| ".".into());
         Self {
             language: "zh-CN".into(),
-            theme: "system".into(),
+            theme: "light".into(),
             poll_interval_seconds: 2,
             heartbeat_seconds: 30,
             raw_event_retention_days: 30,
@@ -252,7 +252,8 @@ impl AppSettings {
         self.theme = match self.theme.as_str() {
             "light" => "light",
             "dark" => "dark",
-            _ => "system",
+            "system" => "system",
+            _ => "light",
         }
         .into();
         self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 15);
@@ -316,11 +317,11 @@ mod tests {
     #[test]
     fn theme_defaults_and_normalizes_for_existing_settings() {
         let existing: AppSettings = serde_json::from_str("{}").expect("deserialize defaults");
-        assert_eq!(existing.theme, "system");
+        assert_eq!(existing.theme, "light");
 
         let mut invalid = AppSettings::default();
         invalid.theme = "unknown".into();
-        assert_eq!(invalid.normalized().theme, "system");
+        assert_eq!(invalid.normalized().theme, "light");
 
         let mut dark = AppSettings::default();
         dark.theme = "dark".into();

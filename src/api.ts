@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings, AttributionRule, DashboardData, SessionPatch, WorkSession } from './types';
+import type { AppSettings, AttributionRule, DashboardData, Project, SessionPatch, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -17,6 +17,21 @@ export const api = {
   startCollector: () => call<void>('start_collector'),
   stopCollector: () => call<void>('stop_collector'),
   updateSession: (id: string, patch: SessionPatch) => call<WorkSession>('update_session', { id, patch }),
+  createProject: (name: string, category: string) =>
+    call<Project>('create_project', { name, category }, {
+      id: `preview-${Date.now()}`,
+      name,
+      category,
+      source: 'manual',
+      color: '#a78bfa',
+      description: '在修正归类时手动创建',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }),
+  deleteProject: async (id: string) => {
+    if (!isTauri()) return;
+    await call<void>('delete_project', { id });
+  },
   mergeSessions: (ids: string[], summary?: string) => call<WorkSession>('merge_sessions', { ids, summary }),
   splitSession: (id: string, splitAt: string) => call<WorkSession[]>('split_session', { id, splitAt }),
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),

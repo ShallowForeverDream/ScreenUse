@@ -1,5 +1,5 @@
 use crate::models::*;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
@@ -227,6 +227,83 @@ impl AppDb {
         collect_rows(rows)
     }
 
+    pub fn create_project(&self, name: &str, category: &str) -> Result<Project> {
+        let name = name.trim().replace(['\r', '\n', '\t'], " ");
+        if name.is_empty() {
+            bail!("项目名称不能为空");
+        }
+        let name: String = name.chars().take(80).collect();
+        let category = category.trim();
+        if !DEFAULT_CATEGORIES.contains(&category) {
+            bail!("不支持的项目分类：{category}");
+        }
+
+        let conn = self.conn.lock();
+        let duplicate = conn
+            .query_row(
+                "SELECT 1 FROM projects WHERE name=?1 LIMIT 1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            bail!("同名项目已存在，请直接选择它");
+        }
+
+        let timestamp = now();
+        let project = Project {
+            id: Uuid::new_v4().to_string(),
+            name,
+            category: category.to_string(),
+            source: "manual".into(),
+            color: color_for_category(category).into(),
+            description: Some("在修正归类时手动创建".into()),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
+        conn.execute(
+            "INSERT INTO projects VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                project.id,
+                project.name,
+                project.category,
+                project.source,
+                project.color,
+                project.description,
+                project.created_at,
+                project.updated_at,
+            ],
+        )?;
+        Ok(project)
+    }
+
+    pub fn delete_project(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE id=?1 LIMIT 1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            bail!("项目不存在或已经删除");
+        }
+
+        tx.execute(
+            "DELETE FROM attribution_rules
+             WHERE project_id=?1
+                OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id,project_id,title,status,source,planned_due_at,created_at,updated_at FROM tasks ORDER BY updated_at DESC")?;
@@ -259,8 +336,18 @@ impl AppDb {
 
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
+        let project_changed = patch
+            .project_id
+            .as_deref()
+            .is_some_and(|project_id| current.project_id.as_deref() != Some(project_id));
         let project_id = patch.project_id.or(current.project_id);
-        let task_id = patch.task_id.or(current.task_id);
+        let task_id = if patch.task_id.is_some() {
+            patch.task_id
+        } else if project_changed {
+            None
+        } else {
+            current.task_id
+        };
         let summary = patch.summary.unwrap_or(current.summary);
         let category = patch.category.unwrap_or(current.category);
         let confidence = patch.confidence.unwrap_or(current.confidence);
@@ -817,6 +904,38 @@ mod tests {
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let dashboard = db.dashboard(false).expect("load dashboard");
         assert!(!dashboard.projects.is_empty());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn deleting_a_project_unassigns_its_sessions_and_tasks() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-project-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("误归类项目", "开发").expect("create project");
+        let task_id = db
+            .upsert_task_by_title(&project.id, "临时任务", "manual")
+            .expect("create task");
+        let session_id = db.list_sessions(1).expect("list sessions")[0].id.clone();
+        db.update_session(
+            &session_id,
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(task_id),
+                category: None,
+                confidence: None,
+                user_confirmed: None,
+            },
+        )
+        .expect("assign session");
+
+        db.delete_project(&project.id).expect("delete project");
+        let session = db.get_session(&session_id).expect("load session").expect("session remains");
+        assert!(session.project_id.is_none());
+        assert!(session.task_id.is_none());
+        assert!(!db.list_projects().expect("list projects").iter().any(|item| item.id == project.id));
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

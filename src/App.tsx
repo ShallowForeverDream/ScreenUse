@@ -26,6 +26,7 @@ import {
   Pause,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -34,6 +35,7 @@ import {
   Sun,
   Tags,
   TimerReset,
+  Trash2,
   WandSparkles,
   X,
 } from 'lucide-react';
@@ -70,14 +72,14 @@ const categoryColors: Record<string, string> = {
 const THEME_STORAGE_KEY = 'screenuse-theme';
 
 function normalizeTheme(value: unknown): ThemeMode {
-  return value === 'light' || value === 'dark' ? value : 'system';
+  return value === 'system' || value === 'light' || value === 'dark' ? value : 'light';
 }
 
 function readStoredTheme(): ThemeMode {
   try {
     return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
   } catch {
-    return 'system';
+    return 'light';
   }
 }
 
@@ -1261,7 +1263,53 @@ function EditSessionModal({
   const [category, setCategory] = useState(session.category);
   const [projectId, setProjectId] = useState(session.projectId || '');
   const [taskId, setTaskId] = useState(session.taskId || '');
+  const [projectOptions, setProjectOptions] = useState(projects);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [projectBusy, setProjectBusy] = useState(false);
   const availableTasks = tasks.filter((task) => task.projectId === projectId);
+
+  useEffect(() => setProjectOptions(projects), [projects]);
+
+  const createProject = async () => {
+    const name = newProjectName.trim();
+    if (!name || projectBusy) return;
+    setProjectBusy(true);
+    try {
+      const created = (await runAction(
+        () => api.createProject(name, category),
+        `项目“${name}”已创建`,
+      )) as Project;
+      setProjectOptions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      setProjectId(created.id);
+      setTaskId('');
+      setNewProjectName('');
+      setCreatingProject(false);
+    } catch {
+      // runAction already reports the error in the app toast.
+    } finally {
+      setProjectBusy(false);
+    }
+  };
+
+  const deleteSelectedProject = async () => {
+    const project = projectOptions.find((item) => item.id === projectId);
+    if (!project || projectBusy) return;
+    if (!window.confirm(`删除项目“${project.name}”？\n\n相关任务会一并删除，历史会话会保留但取消项目归属。`)) {
+      return;
+    }
+    setProjectBusy(true);
+    try {
+      await runAction(() => api.deleteProject(project.id), `项目“${project.name}”已删除`);
+      setProjectOptions((current) => current.filter((item) => item.id !== project.id));
+      setProjectId('');
+      setTaskId('');
+    } catch {
+      // runAction already reports the error in the app toast.
+    } finally {
+      setProjectBusy(false);
+    }
+  };
 
   const split = async () => {
     const splitAt = window.prompt(
@@ -1280,7 +1328,6 @@ function EditSessionModal({
       <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head">
           <div>
-            <span className="eyebrow">CORRECT & LEARN</span>
             <h2>修正会话</h2>
             <p>
               {formatDateTime(session.startedAt)} · {formatDuration(minutesBetween(session.startedAt, session.endedAt))}
@@ -1301,18 +1348,61 @@ function EditSessionModal({
             </select>
           </Field>
           <Field label="项目">
-            <select
-              value={projectId}
-              onChange={(event) => {
-                setProjectId(event.target.value);
-                setTaskId('');
-              }}
-            >
-              <option value="" disabled>选择项目</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.name}</option>
-              ))}
-            </select>
+            <div className="project-picker">
+              <select
+                value={projectId}
+                onChange={(event) => {
+                  setProjectId(event.target.value);
+                  setTaskId('');
+                }}
+              >
+                <option value="">未归类 / 暂不指定</option>
+                {projectOptions.map((project) => (
+                  <option key={project.id} value={project.id}>{project.name}</option>
+                ))}
+              </select>
+              <div className="project-picker-actions">
+                <button
+                  onClick={() => setCreatingProject((current) => !current)}
+                  type="button"
+                  aria-expanded={creatingProject}
+                >
+                  <Plus size={15} />新建项目
+                </button>
+                <button
+                  className="danger-button"
+                  disabled={!projectId || projectBusy}
+                  onClick={() => void deleteSelectedProject()}
+                  type="button"
+                >
+                  <Trash2 size={15} />删除所选
+                </button>
+              </div>
+              {creatingProject && (
+                <div className="inline-project-create">
+                  <input
+                    value={newProjectName}
+                    onChange={(event) => setNewProjectName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void createProject();
+                      }
+                    }}
+                    placeholder="输入项目名称"
+                    autoFocus
+                  />
+                  <button
+                    className="primary"
+                    disabled={!newProjectName.trim() || projectBusy}
+                    onClick={() => void createProject()}
+                    type="button"
+                  >
+                    <Check size={15} />创建并选择
+                  </button>
+                </div>
+              )}
+            </div>
           </Field>
           <Field label="任务">
             <select value={taskId} onChange={(event) => setTaskId(event.target.value)}>
@@ -1361,8 +1451,8 @@ function EditSessionModal({
             onClick={() =>
               void onSave(session, {
                 summary: summary.trim() || session.summary,
-                projectId: projectId || session.projectId || null,
-                taskId: taskId || session.taskId || null,
+                projectId: projectId || null,
+                taskId: taskId || null,
                 category,
                 confidence: Math.max(0.96, session.confidence),
                 userConfirmed: true,

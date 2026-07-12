@@ -63,6 +63,20 @@ fn update_session(
 }
 
 #[tauri::command]
+fn create_project(
+    state: State<AppState>,
+    name: String,
+    category: String,
+) -> Result<models::Project, String> {
+    state.db.create_project(&name, &category).map_err(map_err)
+}
+
+#[tauri::command]
+fn delete_project(state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_project(&id).map_err(map_err)
+}
+
+#[tauri::command]
 fn merge_sessions(
     state: State<AppState>,
     ids: Vec<String>,
@@ -312,6 +326,8 @@ fn main() {
             stop_collector,
             collector_health,
             update_session,
+            create_project,
+            delete_project,
             merge_sessions,
             split_session,
             retry_failed_jobs,
