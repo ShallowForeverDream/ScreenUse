@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 
 use std::fs;
@@ -325,13 +325,7 @@ impl AppDb {
             ORDER BY ws.started_at DESC
             LIMIT ?1
         "#)?;
-        let rows = stmt.query_map(params![limit], |r| {
-            let evidence_json: String = r.get(10)?;
-            Ok(WorkSession {
-                id: r.get(0)?, started_at: r.get(1)?, ended_at: r.get(2)?, project_id: r.get(3)?, project_name: r.get(4)?, task_id: r.get(5)?, task_title: r.get(6)?,
-                category: r.get(7)?, summary: r.get(8)?, confidence: r.get(9)?, evidence: parse_json(&evidence_json), user_confirmed: r.get::<_, i64>(11)? != 0, source: r.get(12)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit], map_work_session)?;
         collect_rows(rows)
     }
 
@@ -363,8 +357,21 @@ impl AppDb {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<WorkSession>> {
-        let sessions = self.list_sessions(500)?;
-        Ok(sessions.into_iter().find(|s| s.id == id))
+        let conn = self.conn.lock();
+        conn.query_row(
+            r#"
+                SELECT ws.id, ws.started_at, ws.ended_at, ws.project_id, p.name, ws.task_id, t.title,
+                       ws.category, ws.summary, ws.confidence, ws.evidence_json, ws.user_confirmed, ws.source
+                FROM work_sessions ws
+                LEFT JOIN projects p ON p.id = ws.project_id
+                LEFT JOIN tasks t ON t.id = ws.task_id
+                WHERE ws.id = ?1
+            "#,
+            params![id],
+            map_work_session,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn mark_session_awaiting_confirmation(&self, id: &str) -> Result<()> {
@@ -417,13 +424,33 @@ impl AppDb {
 
     pub fn ingest_raw_event(&self, mut event: RawActivityEvent) -> Result<()> {
         if event.id.is_empty() { event.id = Uuid::new_v4().to_string(); }
+        self.store_raw_event(&event)?;
+        self.materialize_event_session(&event)?;
+        Ok(())
+    }
+
+    pub fn heartbeat_raw_event(&self, event: &RawActivityEvent, session_id: &str) -> Result<()> {
+        let input_stats = serde_json::to_string(&event.input_stats)?;
+        let metadata = event.metadata.to_string();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO raw_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![event.id, event.source, event.timestamp, event.app, event.window_title, event.url, event.file_path, event.workspace, input_stats, metadata],
+        )?;
+        let changed = conn.execute(
+            "UPDATE work_sessions SET ended_at=?1, updated_at=?2 WHERE id=?3",
+            params![event.timestamp, now(), session_id],
+        )?;
+        anyhow::ensure!(changed == 1, "active session disappeared during heartbeat");
+        Ok(())
+    }
+
+    fn store_raw_event(&self, event: &RawActivityEvent) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO raw_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![event.id, event.source, event.timestamp, event.app, event.window_title, event.url, event.file_path, event.workspace, serde_json::to_string(&event.input_stats)?, event.metadata.to_string()],
         )?;
-        drop(conn);
-        self.materialize_event_session(&event)?;
         Ok(())
     }
 
@@ -885,6 +912,25 @@ fn within_gap(left_end: &str, right_start: &str, max_minutes: i64) -> bool {
     }
 }
 
+fn map_work_session(row: &Row<'_>) -> rusqlite::Result<WorkSession> {
+    let evidence_json: String = row.get(10)?;
+    Ok(WorkSession {
+        id: row.get(0)?,
+        started_at: row.get(1)?,
+        ended_at: row.get(2)?,
+        project_id: row.get(3)?,
+        project_name: row.get(4)?,
+        task_id: row.get(5)?,
+        task_title: row.get(6)?,
+        category: row.get(7)?,
+        summary: row.get(8)?,
+        confidence: row.get(9)?,
+        evidence: parse_json(&evidence_json),
+        user_confirmed: row.get::<_, i64>(11)? != 0,
+        source: row.get(12)?,
+    })
+}
+
 fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for row in rows { out.push(row?); }
@@ -1025,6 +1071,39 @@ mod tests {
         })
         .expect("start second context");
         assert_eq!(db.list_sessions(500).expect("final sessions").len(), initial_count + 2);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn fast_heartbeat_extends_the_known_session_without_reclassification() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-fast-heartbeat-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::seconds(2);
+        let mut event = RawActivityEvent {
+            id: "fast-stream".into(),
+            source: "test-observer".into(),
+            timestamp: fmt(base),
+            app: Some("Code.exe".into()),
+            window_title: Some("ScreenUse - Visual Studio Code".into()),
+            url: None,
+            file_path: Some("src/App.tsx".into()),
+            workspace: Some("ScreenUse".into()),
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({"contextStart": true}),
+        };
+        db.ingest_raw_event(event.clone()).expect("start context");
+        let session = db.list_sessions(1).expect("load active session")[0].clone();
+
+        event.timestamp = fmt(base + Duration::seconds(10));
+        event.metadata = serde_json::json!({"heartbeat": true});
+        db.heartbeat_raw_event(&event, &session.id).expect("extend known session");
+
+        let extended = db.get_session(&session.id).expect("load session").expect("session exists");
+        assert_eq!(extended.started_at, fmt(base));
+        assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
+        assert_eq!(extended.summary, session.summary);
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

@@ -42,8 +42,12 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     Ok(Some(updated))
 }
 
-pub fn finalize_context(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkSession>> {
-    let Some(session) = db.list_sessions(1)?.into_iter().next() else {
+pub fn finalize_context(
+    db: &AppDb,
+    event: &RawActivityEvent,
+    session_id: &str,
+) -> Result<Option<WorkSession>> {
+    let Some(session) = db.get_session(session_id)? else {
         return Ok(None);
     };
     if session.user_confirmed {

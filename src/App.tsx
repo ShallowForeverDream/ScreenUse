@@ -243,6 +243,8 @@ export default function App() {
               <button
                 key={tab.id}
                 className={activeTab === tab.id ? 'active' : ''}
+                aria-current={activeTab === tab.id ? 'page' : undefined}
+                aria-label={tab.label}
                 onClick={() => setActiveTab(tab.id)}
                 type="button"
               >
@@ -269,19 +271,22 @@ export default function App() {
             <span>{data.settings.aiMode === 'off' ? '本地分类' : '本地优先'}</span>
           </div>
           <div className="collector-actions">
-            <button
-              className="primary"
-              onClick={() => void runAction(api.startCollector, '自动记录已启动')}
-              type="button"
-            >
-              <Play size={14} />启动
-            </button>
-            <button
-              onClick={() => void runAction(api.stopCollector, '自动记录已暂停')}
-              type="button"
-            >
-              <Pause size={14} />暂停
-            </button>
+            {data.collectorRunning ? (
+              <button
+                onClick={() => void runAction(api.stopCollector, '自动记录已暂停')}
+                type="button"
+              >
+                <Pause size={14} />暂停记录
+              </button>
+            ) : (
+              <button
+                className="primary"
+                onClick={() => void runAction(api.startCollector, '自动记录已启动')}
+                type="button"
+              >
+                <Play size={14} />开始记录
+              </button>
+            )}
           </div>
         </div>
         <div className="sidebar-foot">v0.2 · 数据仅存本机 SQLite</div>
@@ -320,7 +325,7 @@ export default function App() {
                 type="button"
                 title="合并被短暂切换打断的同类活动"
               >
-                <RefreshCw size={16} />整理
+                <RefreshCw size={16} />整理会话
               </button>
               <button
                 onClick={() =>
@@ -329,7 +334,7 @@ export default function App() {
                 type="button"
                 title="清理过期原始事件并压缩数据库"
               >
-                <Database size={16} />优化
+                <Database size={16} />清理存储
               </button>
             </div>
           </div>
@@ -393,6 +398,7 @@ export default function App() {
             tasks={data.tasks}
             sessions={daySessions}
             selectedDate={selectedDate}
+            runAction={runAction}
           />
         )}
         {activeTab === 'settings' && (
@@ -739,6 +745,16 @@ function TimelineView({
               selected={selected.has(session.id)}
               onToggle={() => toggle(session.id)}
               onEdit={() => onEdit(session)}
+              onConfirm={() =>
+                void runAction(
+                  () =>
+                    api.updateSession(session.id, {
+                      confidence: Math.max(0.96, session.confidence),
+                      userConfirmed: true,
+                    }),
+                  '分类已确认',
+                )
+              }
             />
           ))}
           {!filtered.length && (
@@ -753,20 +769,13 @@ function TimelineView({
       <aside className="timeline-aside">
         <section className="panel guidance-card">
           <Sparkles size={24} />
-          <h2>越用越省事</h2>
-          <p>同一活动每 10 秒只延长当前时间块；稳定切换后才结束上一块并等待确认。</p>
+          <h2>只处理不确定项</h2>
+          <p>分类正确就点“确认”；有误再点“修正”。系统会继续从修正结果学习。</p>
           <div className="guidance-steps">
-            <span><b>1</b> 确认切换后生成的时间块</span>
-            <span><b>2</b> 从正确记录学习规则</span>
-            <span><b>3</b> 日常只看结果</span>
+            <span><b>1</b> 快速确认正确分类</span>
+            <span><b>2</b> 修正项目或新建项目</span>
+            <span><b>3</b> 以后自动归类</span>
           </div>
-        </section>
-        <section className="panel source-card">
-          <PanelTitle title="采集信号" subtitle="不会读取网页正文或代码内容。" />
-          <div className="source-row"><span>Windows 前台窗口</span><Check size={16} /></div>
-          <div className="source-row"><span>活动浏览器标签页</span><Check size={16} /></div>
-          <div className="source-row"><span>VS Code 工作区/文件名</span><Check size={16} /></div>
-          <div className="source-row muted"><span>截图或录屏</span><X size={16} /></div>
         </section>
       </aside>
     </div>
@@ -778,11 +787,13 @@ function SessionRow({
   selected,
   onToggle,
   onEdit,
+  onConfirm,
 }: {
   session: WorkSession;
   selected: boolean;
   onToggle: () => void;
   onEdit: () => void;
+  onConfirm: () => void;
 }) {
   const minutes = minutesBetween(session.startedAt, session.endedAt);
   const evidence = session.evidence.slice(0, 3);
@@ -834,9 +845,16 @@ function SessionRow({
           {Math.round(session.confidence * 100)}%
         </span>
       </div>
-      <button className="edit-button" onClick={onEdit} type="button">
-        <Pencil size={15} />修正
-      </button>
+      <div className="session-actions">
+        {needsReview(session) && (
+          <button className="confirm-button" onClick={onConfirm} type="button">
+            <Check size={15} />确认
+          </button>
+        )}
+        <button className="edit-button" onClick={onEdit} type="button">
+          <Pencil size={15} />修正
+        </button>
+      </div>
     </article>
   );
 }
@@ -846,23 +864,74 @@ function ProjectsView({
   tasks,
   sessions,
   selectedDate,
+  runAction,
 }: {
   projects: Project[];
   tasks: Task[];
   sessions: WorkSession[];
   selectedDate: string;
+  runAction: ActionRunner;
 }) {
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState('');
+  const [category, setCategory] = useState('开发');
+  const [busyProjectId, setBusyProjectId] = useState('');
   const rows = projectBreakdown(sessions, selectedDate);
   const minutesByProject = new Map(rows.map((row) => [row.id, row.minutes]));
   const tasksByProject = groupBy(tasks, (task) => task.projectId);
 
+  const createProject = async () => {
+    const projectName = name.trim();
+    if (!projectName) return;
+    await runAction(() => api.createProject(projectName, category), `项目“${projectName}”已创建`);
+    setName('');
+    setCreating(false);
+  };
+
+  const deleteProject = async (project: Project) => {
+    if (!window.confirm(`删除项目“${project.name}”？\n\n相关任务会一并删除，历史会话仍保留但会取消项目归属。`)) return;
+    setBusyProjectId(project.id);
+    try {
+      await runAction(() => api.deleteProject(project.id), `项目“${project.name}”已删除`);
+    } finally {
+      setBusyProjectId('');
+    }
+  };
+
   return (
     <div className="projects-layout">
-      <section className="panel span-2">
+      <section className="panel">
         <PanelTitle
           title="项目账本"
           subtitle="工作区名称、网址和你纠正过的规则会自动把活动归入这些项目。"
+          action={(
+            <button className="primary" onClick={() => setCreating((current) => !current)} type="button" aria-expanded={creating}>
+              <Plus size={15} />新建项目
+            </button>
+          )}
         />
+        {creating && (
+          <div className="project-create-row">
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  void createProject();
+                }
+              }}
+              placeholder="项目名称"
+              autoFocus
+            />
+            <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="项目分类">
+              {categories.filter((item) => item !== '离开').map((item) => <option key={item}>{item}</option>)}
+            </select>
+            <button className="primary" disabled={!name.trim()} onClick={() => void createProject()} type="button">
+              <Check size={15} />创建
+            </button>
+          </div>
+        )}
         <div className="project-grid">
           {projects.map((project) => {
             const minutes = minutesByProject.get(project.id) || 0;
@@ -874,7 +943,19 @@ function ProjectsView({
               >
                 <div className="project-card-head">
                   <span>{project.category}</span>
-                  <b>{formatDuration(minutes)}</b>
+                  <div>
+                    <b>{formatDuration(minutes)}</b>
+                    <button
+                      className="project-delete"
+                      disabled={busyProjectId === project.id}
+                      onClick={() => void deleteProject(project)}
+                      type="button"
+                      aria-label={`删除项目 ${project.name}`}
+                      title="删除项目"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
                 <h2>{project.name}</h2>
                 <p>{project.description || '根据活动元数据自动维护。'}</p>
@@ -1262,6 +1343,14 @@ function EditSessionModal({
 
   useEffect(() => setProjectOptions(projects), [projects]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
   const createProject = async () => {
     const name = newProjectName.trim();
     if (!name || projectBusy) return;
@@ -1316,10 +1405,16 @@ function EditSessionModal({
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose} role="presentation">
-      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+      <section
+        className="modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="edit-session-title"
+      >
         <div className="modal-head">
           <div>
-            <h2>修正会话</h2>
+            <h2 id="edit-session-title">修正会话</h2>
             <p>
               {formatDateTime(session.startedAt)} · {formatDuration(minutesBetween(session.startedAt, session.endedAt))}
             </p>

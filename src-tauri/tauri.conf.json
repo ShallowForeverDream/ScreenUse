@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "ScreenUse",
-        "width": 1380,
-        "height": 900,
-        "minWidth": 940,
-        "minHeight": 680,
+        "width": 1180,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 600,
         "resizable": true,
         "fullscreen": false
       }

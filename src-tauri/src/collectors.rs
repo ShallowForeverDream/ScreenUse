@@ -2,7 +2,7 @@ use crate::classification;
 use crate::context_store;
 use crate::db::{now, AppDb};
 use crate::models::{InputStats, RawActivityEvent};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,7 @@ pub struct DesktopCollector {
 #[derive(Debug, Clone)]
 struct ActiveContext {
     id: String,
+    session_id: String,
     signature: String,
     event: RawActivityEvent,
     last_observed_at: Instant,
@@ -248,12 +249,14 @@ fn open_context(
         event.timestamp = now();
     }
     mark_metadata(&mut event, "contextStart", serde_json::Value::Bool(true));
-    classification::ingest_event(db, &event)?;
+    let session = classification::ingest_event(db, &event)?
+        .context("collector context did not create a work session")?;
     collector.clear_error();
     *collector.last_event_at.lock() = Some(event.timestamp.clone());
     let observed_at = Instant::now();
     Ok(ActiveContext {
         id: event.id.clone(),
+        session_id: session.id,
         signature,
         event,
         last_observed_at: observed_at,
@@ -269,7 +272,7 @@ fn heartbeat_context(
 ) -> Result<()> {
     event.id = current.id.clone();
     mark_metadata(&mut event, "heartbeat", serde_json::Value::Bool(true));
-    classification::ingest_event(db, &event)?;
+    db.heartbeat_raw_event(&event, &current.session_id)?;
     collector.clear_error();
     *collector.last_event_at.lock() = Some(event.timestamp.clone());
     current.event = event;
@@ -287,8 +290,8 @@ fn close_context_at(collector: &DesktopCollector, db: &AppDb, previous: ActiveCo
     event.id = previous.id;
     event.timestamp = ended_at;
     mark_metadata(&mut event, "contextEnd", serde_json::Value::Bool(true));
-    classification::ingest_event(db, &event)?;
-    classification::finalize_context(db, &event)?;
+    db.heartbeat_raw_event(&event, &previous.session_id)?;
+    classification::finalize_context(db, &event, &previous.session_id)?;
     *collector.last_event_at.lock() = Some(event.timestamp);
     Ok(())
 }
