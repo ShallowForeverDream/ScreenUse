@@ -44,7 +44,7 @@ Extension context expires after 120 seconds. A stale tab or editor cannot be att
 
 ## 3. Stable IDs and coalesced heartbeats
 
-A naive 2-second sampler creates 43,200 events during a 24-hour day. ScreenUse does not persist samples that way.
+A naive sampler creates a new row on every observation. ScreenUse observes every 10 seconds by default but does not persist samples that way.
 
 For each uninterrupted context, the collector generates one UUID. The UUID remains the same for:
 
@@ -52,7 +52,7 @@ For each uninterrupted context, the collector generates one UUID. The UUID remai
 - periodic heartbeat;
 - context end.
 
-`raw_events.id` is the primary key and the database uses `INSERT OR REPLACE`. A heartbeat updates one row instead of appending another. New rows are normally created only when app/title/URL/file/workspace or active/idle state changes.
+`raw_events.id` is the primary key and the database uses `INSERT OR REPLACE`. Each 10-second update replaces one row and extends one session instead of appending another. A new row and time block are created only after app/title/URL/file/workspace or active/idle state produces a stable context change.
 
 This follows the event/heartbeat idea used by ActivityWatch, adapted to ScreenUse's existing SQLite schema.
 
@@ -61,17 +61,18 @@ This follows the event/heartbeat idea used by ActivityWatch, adapted to ScreenUs
 ```text
 poll foreground metadata
         │
-        ├── same signature and heartbeat not due ── no database write
-        │
-        ├── same signature and heartbeat due ───── replace event by stable ID
+        ├── same signature ──────────────────────── replace event by stable ID and extend one block
         │
         └── signature changed
-                ├── write final heartbeat for old context
-                ├── finalize local classification and readable summary
-                └── create new stable context ID
+                ├── first observation ───────────── keep as pending; do not split
+                ├── returns immediately ─────────── discard pending change and continue old block
+                └── second consecutive observation
+                        ├── close old block at the first observed switch time
+                        ├── finalize classification and mark it awaiting confirmation
+                        └── create one new stable context ID
 ```
 
-The active session keeps a generic summary while heartbeats extend it. A readable summary is assigned only when the context closes. This prevents a summary change from accidentally breaking the database's session-merging condition during the same activity.
+The active session uses the current window, host, workspace or file as its readable summary. Repeated observations with the same context signature extend that session in place. A one-observation loading or waiting state is folded into the surrounding activity, while a real switch such as paper reading → literature search → PDF reading becomes separate blocks awaiting confirmation.
 
 ## 5. Classification pipeline
 

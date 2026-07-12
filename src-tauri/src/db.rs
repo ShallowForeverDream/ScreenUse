@@ -1,3 +1,4 @@
+use crate::classification;
 use crate::models::*;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -206,7 +207,7 @@ impl AppDb {
 
     pub fn dashboard(&self, collector_running: bool) -> Result<DashboardData> {
         Ok(DashboardData {
-            settings: self.get_settings()?,
+            settings: self.get_settings()?.normalized(),
             sessions: self.list_sessions(80)?,
             projects: self.list_projects()?,
             tasks: self.list_tasks()?,
@@ -366,6 +367,17 @@ impl AppDb {
         Ok(sessions.into_iter().find(|s| s.id == id))
     }
 
+    pub fn mark_session_awaiting_confirmation(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE work_sessions
+             SET source='context-complete', updated_at=?1
+             WHERE id=?2 AND user_confirmed=0",
+            params![now(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn merge_sessions(&self, ids: &[String], summary: Option<String>) -> Result<WorkSession> {
         anyhow::ensure!(!ids.is_empty(), "no session ids provided");
         let conn = self.conn.lock();
@@ -451,7 +463,7 @@ impl AppDb {
             let mapped = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?;
             collect_rows(mapped)?
         };
-        for (matcher_json, project_id, task_id, category, name) in rules {
+        for (matcher_json, project_id, task_id, category, _name) in rules {
             let matcher: serde_json::Value = serde_json::from_str(&matcher_json).unwrap_or_default();
             let keyword = matcher.get("keyword").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
             let app = matcher.get("app").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
@@ -460,24 +472,38 @@ impl AppDb {
                 || (!app.is_empty() && event.app.as_deref().unwrap_or("").to_lowercase().contains(&app))
                 || (!domain.is_empty() && event.url.as_deref().unwrap_or("").to_lowercase().contains(&domain));
             if hit {
-                return Ok((project_id, task_id, category, format!("规则命中：{name}"), 0.84));
+                return Ok((
+                    project_id,
+                    task_id,
+                    category.clone(),
+                    classification::summary_for_event(event, &category),
+                    0.84,
+                ));
             }
         }
-        let (category, summary) = if hay.contains("code") || hay.contains("rust") || hay.contains("github") || hay.contains("tauri") || hay.contains("screenuse") || hay.contains("codex") {
-            ("开发", "开发与调试")
-        } else if hay.contains("word") || hay.contains("wps") || hay.contains("obsidian") || hay.contains("论文") || hay.contains("markdown") {
-            ("写作", "写作与文档整理")
-        } else if hay.contains("bilibili") || hay.contains("course") || hay.contains("pdf") || hay.contains("知网") || hay.contains("论文") {
-            ("学习", "学习资料阅读")
+        let category = if hay.contains("code") || hay.contains("rust") || hay.contains("github") || hay.contains("tauri") || hay.contains("screenuse") || hay.contains("codex") {
+            "开发"
+        } else if hay.contains("scholar") || hay.contains("pubmed") || hay.contains("知网") || hay.contains("arxiv") || hay.contains("pdf") || hay.contains("论文") || hay.contains("教材") || hay.contains("ebook") {
+            "学习"
+        } else if hay.contains("word") || hay.contains("wps") || hay.contains("obsidian") || hay.contains("markdown") {
+            "写作"
+        } else if hay.contains("bilibili") || hay.contains("course") {
+            "学习"
         } else if hay.contains("wechat") || hay.contains("qq") || hay.contains("mail") || hay.contains("teams") || hay.contains("meeting") {
-            ("沟通", "沟通与消息处理")
+            "沟通"
         } else if hay.contains("steam") || hay.contains("game") || hay.contains("youtube") {
-            ("娱乐", "娱乐与视频")
+            "娱乐"
         } else {
-            ("杂务", "未归类电脑活动")
+            "杂务"
         };
         let project: Option<(String, String)> = conn.query_row("SELECT p.id, t.id FROM projects p JOIN tasks t ON t.project_id=p.id WHERE p.category=?1 ORDER BY p.updated_at DESC LIMIT 1", params![category], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        Ok((project.as_ref().map(|x| x.0.clone()), project.as_ref().map(|x| x.1.clone()), category.into(), summary.into(), 0.55))
+        Ok((
+            project.as_ref().map(|x| x.0.clone()),
+            project.as_ref().map(|x| x.1.clone()),
+            category.into(),
+            classification::summary_for_event(event, category),
+            0.55,
+        ))
     }
 
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
@@ -935,6 +961,70 @@ mod tests {
         assert!(session.project_id.is_none());
         assert!(session.task_id.is_none());
         assert!(!db.list_projects().expect("list projects").iter().any(|item| item.id == project.id));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn heartbeats_extend_one_block_and_context_start_creates_only_one_more() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-heartbeat-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let initial_count = db.list_sessions(500).expect("initial sessions").len();
+        let base = Utc::now() + Duration::seconds(2);
+        let make_event = |id: &str, title: &str, timestamp: chrono::DateTime<Utc>, metadata: serde_json::Value| {
+            RawActivityEvent {
+                id: id.into(),
+                source: "test-observer".into(),
+                timestamp: fmt(timestamp),
+                app: Some("Acrobat.exe".into()),
+                window_title: Some(title.into()),
+                url: None,
+                file_path: None,
+                workspace: None,
+                input_stats: InputStats::default(),
+                metadata,
+            }
+        };
+
+        db.ingest_raw_event(make_event("stream-1", "paper.pdf", base, serde_json::json!({"contextStart": true})))
+            .expect("start context");
+        let first = db.list_sessions(1).expect("first block")[0].clone();
+        db.ingest_raw_event(make_event(
+            "stream-1",
+            "paper.pdf",
+            base + Duration::seconds(10),
+            serde_json::json!({"heartbeat": true}),
+        ))
+        .expect("extend context");
+
+        let after_heartbeat = db.list_sessions(500).expect("sessions after heartbeat");
+        assert_eq!(after_heartbeat.len(), initial_count + 1);
+        let extended = db.get_session(&first.id).expect("load first").expect("first exists");
+        assert_eq!(extended.started_at, fmt(base));
+        assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
+        assert_ne!(extended.source, "context-complete");
+
+        db.mark_session_awaiting_confirmation(&first.id).expect("mark completed");
+        assert_eq!(
+            db.get_session(&first.id).expect("load completed").expect("completed exists").source,
+            "context-complete",
+        );
+
+        db.ingest_raw_event(RawActivityEvent {
+            id: "stream-2".into(),
+            source: "test-observer".into(),
+            timestamp: fmt(base + Duration::seconds(20)),
+            app: Some("chrome.exe".into()),
+            window_title: Some("Google Scholar".into()),
+            url: Some("https://scholar.google.com/".into()),
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({"contextStart": true}),
+        })
+        .expect("start second context");
+        assert_eq!(db.list_sessions(500).expect("final sessions").len(), initial_count + 2);
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

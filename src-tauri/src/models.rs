@@ -219,8 +219,8 @@ impl Default for AppSettings {
         Self {
             language: "zh-CN".into(),
             theme: "light".into(),
-            poll_interval_seconds: 2,
-            heartbeat_seconds: 30,
+            poll_interval_seconds: 10,
+            heartbeat_seconds: 10,
             raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
             auto_maintenance: true,
@@ -256,11 +256,8 @@ impl AppSettings {
             _ => "light",
         }
         .into();
-        self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 15);
-        self.heartbeat_seconds = self
-            .heartbeat_seconds
-            .clamp(10, 300)
-            .max(self.poll_interval_seconds.saturating_mul(2));
+        self.poll_interval_seconds = self.poll_interval_seconds.clamp(10, 60);
+        self.heartbeat_seconds = self.poll_interval_seconds;
         self.raw_event_retention_days = self.raw_event_retention_days.clamp(7, 3650);
         self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
         self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(1, 240);
@@ -318,6 +315,7 @@ mod tests {
     fn theme_defaults_and_normalizes_for_existing_settings() {
         let existing: AppSettings = serde_json::from_str("{}").expect("deserialize defaults");
         assert_eq!(existing.theme, "light");
+        assert_eq!(existing.poll_interval_seconds, 10);
 
         let mut invalid = AppSettings::default();
         invalid.theme = "unknown".into();
@@ -326,5 +324,13 @@ mod tests {
         let mut dark = AppSettings::default();
         dark.theme = "dark".into();
         assert_eq!(dark.normalized().theme, "dark");
+
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"pollIntervalSeconds":2,"heartbeatSeconds":30}"#,
+        )
+        .expect("deserialize legacy sampling settings");
+        let migrated = legacy.normalized();
+        assert_eq!(migrated.poll_interval_seconds, 10);
+        assert_eq!(migrated.heartbeat_seconds, 10);
     }
 }

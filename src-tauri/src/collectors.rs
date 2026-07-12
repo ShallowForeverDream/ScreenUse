@@ -14,7 +14,6 @@ pub trait CollectorAdapter {
     fn start(&self, db: Arc<AppDb>) -> Result<()>;
     fn stop(&self) -> Result<()>;
     fn health(&self) -> CollectorHealth;
-    fn emit(&self, db: &AppDb, event: RawActivityEvent) -> Result<()>;
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -37,7 +36,17 @@ struct ActiveContext {
     signature: String,
     event: RawActivityEvent,
     last_observed_at: Instant,
+    last_emitted_at: Instant,
 }
+
+#[derive(Debug, Clone)]
+struct PendingContext {
+    signature: String,
+    first_event: RawActivityEvent,
+    observations: u8,
+}
+
+const SWITCH_CONFIRM_OBSERVATIONS: u8 = 2;
 
 impl DesktopCollector {
     pub fn new() -> Self {
@@ -66,7 +75,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
         let collector = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut active: Option<ActiveContext> = None;
-            let mut last_emit_at: Option<Instant> = None;
+            let mut pending: Option<PendingContext> = None;
             let mut settings = db.get_settings().unwrap_or_default().normalized();
             let mut settings_loaded_at = Instant::now();
 
@@ -107,56 +116,71 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                             collector.set_error(error);
                         }
                     }
-                    last_emit_at = None;
+                    pending = None;
                 }
                 let signature = context_signature(&event, settings.idle_threshold_seconds);
-                let context_changed = active
-                    .as_ref()
-                    .is_some_and(|current| current.signature != signature);
-
-                if context_changed {
-                    if let Some(previous) = active.take() {
-                        if let Err(error) = close_context_at(&collector, &db, previous, event.timestamp.clone()) {
-                            collector.set_error(error);
-                        }
-                    }
-                }
-
                 if active.is_none() {
-                    event.id = Uuid::new_v4().to_string();
-                    event.timestamp = now();
-                    mark_metadata(&mut event, "contextStart", serde_json::Value::Bool(true));
-                    match collector.emit(&db, event.clone()) {
-                        Ok(()) => {
-                            collector.clear_error();
-                            *collector.last_event_at.lock() = Some(event.timestamp.clone());
-                            last_emit_at = Some(Instant::now());
-                            active = Some(ActiveContext {
-                                id: event.id.clone(),
-                                signature,
-                                event,
-                                last_observed_at: Instant::now(),
-                            });
-                        }
+                    pending = None;
+                    match open_context(&collector, &db, event, signature) {
+                        Ok(context) => active = Some(context),
                         Err(error) => collector.set_error(error),
                     }
-                } else if let Some(current) = active.as_mut() {
-                    event.id = current.id.clone();
-                    current.event = event.clone();
-                    current.last_observed_at = Instant::now();
-                    let heartbeat_due = last_emit_at
-                        .map(|last| last.elapsed() >= Duration::from_secs(settings.heartbeat_seconds as u64))
-                        .unwrap_or(true);
-                    if heartbeat_due {
-                        mark_metadata(&mut event, "heartbeat", serde_json::Value::Bool(true));
-                        match collector.emit(&db, event.clone()) {
-                            Ok(()) => {
-                                collector.clear_error();
-                                *collector.last_event_at.lock() = Some(event.timestamp.clone());
-                                last_emit_at = Some(Instant::now());
+                } else {
+                    let active_signature = active.as_ref().map(|current| current.signature.clone()).unwrap_or_default();
+                    if active_signature == signature {
+                        pending = None;
+                        if let Some(current) = active.as_mut() {
+                            current.last_observed_at = Instant::now();
+                            let heartbeat_due = current.last_emitted_at.elapsed()
+                                >= Duration::from_secs(settings.heartbeat_seconds as u64);
+                            if heartbeat_due {
+                                if let Err(error) = heartbeat_context(&collector, &db, current, event) {
+                                    collector.set_error(error);
+                                }
+                            } else {
                                 current.event = event;
                             }
-                            Err(error) => collector.set_error(error),
+                        }
+                    } else {
+                        if let Some(current) = active.as_mut() {
+                            current.last_observed_at = Instant::now();
+                        }
+                        let immediate = active_signature == "idle" || signature == "idle";
+                        let ready = if immediate {
+                            pending = Some(PendingContext {
+                                signature: signature.clone(),
+                                first_event: event.clone(),
+                                observations: SWITCH_CONFIRM_OBSERVATIONS,
+                            });
+                            true
+                        } else {
+                            observe_pending_context(&mut pending, &signature, &event)
+                        };
+
+                        if ready {
+                            let Some(mut next) = pending.take() else { continue; };
+                            mark_metadata(
+                                &mut next.first_event,
+                                "switchConfirmedAfterObservations",
+                                serde_json::Value::from(next.observations),
+                            );
+                            let boundary = next.first_event.timestamp.clone();
+                            if let Some(previous) = active.take() {
+                                if let Err(error) = close_context_at(&collector, &db, previous, boundary.clone()) {
+                                    collector.set_error(error);
+                                }
+                            }
+                            match open_context(&collector, &db, next.first_event, next.signature) {
+                                Ok(mut context) => {
+                                    if event.timestamp > boundary {
+                                        if let Err(error) = heartbeat_context(&collector, &db, &mut context, event) {
+                                            collector.set_error(error);
+                                        }
+                                    }
+                                    active = Some(context);
+                                }
+                                Err(error) => collector.set_error(error),
+                            }
                         }
                     }
                 }
@@ -189,9 +213,69 @@ impl CollectorAdapter for Arc<DesktopCollector> {
         }
     }
 
-    fn emit(&self, db: &AppDb, event: RawActivityEvent) -> Result<()> {
-        classification::ingest_event(db, &event).map(|_| ())
+}
+
+fn observe_pending_context(
+    pending: &mut Option<PendingContext>,
+    signature: &str,
+    event: &RawActivityEvent,
+) -> bool {
+    match pending {
+        Some(candidate) if candidate.signature == signature => {
+            candidate.observations = candidate.observations.saturating_add(1);
+        }
+        _ => {
+            *pending = Some(PendingContext {
+                signature: signature.to_string(),
+                first_event: event.clone(),
+                observations: 1,
+            });
+        }
     }
+    pending
+        .as_ref()
+        .is_some_and(|candidate| candidate.observations >= SWITCH_CONFIRM_OBSERVATIONS)
+}
+
+fn open_context(
+    collector: &DesktopCollector,
+    db: &AppDb,
+    mut event: RawActivityEvent,
+    signature: String,
+) -> Result<ActiveContext> {
+    event.id = Uuid::new_v4().to_string();
+    if event.timestamp.is_empty() {
+        event.timestamp = now();
+    }
+    mark_metadata(&mut event, "contextStart", serde_json::Value::Bool(true));
+    classification::ingest_event(db, &event)?;
+    collector.clear_error();
+    *collector.last_event_at.lock() = Some(event.timestamp.clone());
+    let observed_at = Instant::now();
+    Ok(ActiveContext {
+        id: event.id.clone(),
+        signature,
+        event,
+        last_observed_at: observed_at,
+        last_emitted_at: observed_at,
+    })
+}
+
+fn heartbeat_context(
+    collector: &DesktopCollector,
+    db: &AppDb,
+    current: &mut ActiveContext,
+    mut event: RawActivityEvent,
+) -> Result<()> {
+    event.id = current.id.clone();
+    mark_metadata(&mut event, "heartbeat", serde_json::Value::Bool(true));
+    classification::ingest_event(db, &event)?;
+    collector.clear_error();
+    *collector.last_event_at.lock() = Some(event.timestamp.clone());
+    current.event = event;
+    current.last_observed_at = Instant::now();
+    current.last_emitted_at = Instant::now();
+    Ok(())
 }
 
 fn close_context(collector: &DesktopCollector, db: &AppDb, previous: ActiveContext) -> Result<()> {
@@ -368,5 +452,71 @@ mod tests {
         assert!(!is_unexpected_observation_gap(Duration::from_secs(60), 15));
         assert!(is_unexpected_observation_gap(Duration::from_secs(61), 2));
         assert!(is_unexpected_observation_gap(Duration::from_secs(61), 15));
+    }
+
+    #[test]
+    fn requires_two_consecutive_observations_before_switching() {
+        let event = |title: &str, timestamp: &str| RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: timestamp.into(),
+            app: Some("chrome.exe".into()),
+            window_title: Some(title.into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        let mut pending = None;
+        assert!(!observe_pending_context(
+            &mut pending,
+            "search",
+            &event("Google Scholar", "2026-07-12T10:00:10Z"),
+        ));
+        assert_eq!(
+            pending.as_ref().map(|candidate| candidate.first_event.timestamp.as_str()),
+            Some("2026-07-12T10:00:10Z"),
+        );
+        assert!(observe_pending_context(
+            &mut pending,
+            "search",
+            &event("Google Scholar", "2026-07-12T10:00:20Z"),
+        ));
+        assert_eq!(pending.as_ref().map(|candidate| candidate.observations), Some(2));
+        assert_eq!(
+            pending.as_ref().map(|candidate| candidate.first_event.timestamp.as_str()),
+            Some("2026-07-12T10:00:10Z"),
+        );
+    }
+
+    #[test]
+    fn a_different_transient_context_restarts_switch_confirmation() {
+        let mut pending = Some(PendingContext {
+            signature: "loading".into(),
+            first_event: RawActivityEvent {
+                id: String::new(),
+                source: "test".into(),
+                timestamp: "2026-07-12T10:00:10Z".into(),
+                app: Some("chrome.exe".into()),
+                window_title: Some("Loading".into()),
+                url: None,
+                file_path: None,
+                workspace: None,
+                input_stats: InputStats::default(),
+                metadata: json!({}),
+            },
+            observations: 1,
+        });
+        let search = RawActivityEvent {
+            timestamp: "2026-07-12T10:00:20Z".into(),
+            window_title: Some("Google Scholar".into()),
+            ..pending.as_ref().unwrap().first_event.clone()
+        };
+        assert!(!observe_pending_context(&mut pending, "search", &search));
+        let candidate = pending.expect("new candidate");
+        assert_eq!(candidate.signature, "search");
+        assert_eq!(candidate.observations, 1);
+        assert_eq!(candidate.first_event.timestamp, "2026-07-12T10:00:20Z");
     }
 }

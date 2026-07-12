@@ -80,7 +80,8 @@ pub fn finalize_context(db: &AppDb, event: &RawActivityEvent) -> Result<Option<W
             user_confirmed: Some(false),
         },
     )?;
-    Ok(Some(updated))
+    db.mark_session_awaiting_confirmation(&updated.id)?;
+    db.get_session(&updated.id)
 }
 
 fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) -> Result<Option<Assignment>> {
@@ -238,7 +239,7 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
     ("杂务", 0.56)
 }
 
-fn summary_for_event(event: &RawActivityEvent, category: &str) -> String {
+pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> String {
     if category == "离开" {
         return "离开/空闲".into();
     }

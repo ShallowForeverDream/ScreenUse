@@ -359,7 +359,7 @@ export default function App() {
               icon={CircleAlert}
               title="待复核"
               value={`${stats.reviewCount} 条`}
-              hint={stats.reviewCount ? '只处理真正不确定的记录' : '今天无需人工处理'}
+              hint={stats.reviewCount ? '活动切换后生成，确认一次即可' : '暂无已结束的新时间块'}
               attention={stats.reviewCount > 0}
             />
           </section>
@@ -601,7 +601,7 @@ function TodayView({
       <section className="panel">
         <PanelTitle
           title="待复核"
-          subtitle="低置信或尚未匹配项目的记录。"
+          subtitle="稳定切换后，上一段会在这里等待确认；当前进行中的活动不会重复出现。"
           action={
             review.length ? (
               <button onClick={onOpenTimeline} type="button">
@@ -626,8 +626,8 @@ function TodayView({
         ) : (
           <div className="all-clear">
             <CheckCircle2 size={30} />
-            <strong>今天无需复核</strong>
-            <span>常见活动已能自动归类。</span>
+            <strong>暂无待确认时间块</strong>
+            <span>继续使用即可，活动切换后会自动生成。</span>
           </div>
         )}
       </section>
@@ -754,9 +754,9 @@ function TimelineView({
         <section className="panel guidance-card">
           <Sparkles size={24} />
           <h2>越用越省事</h2>
-          <p>先修正项目和分类，再点一次“学习规则”。以后相似窗口、网址或工作区会优先命中你的选择。</p>
+          <p>同一活动每 10 秒只延长当前时间块；稳定切换后才结束上一块并等待确认。</p>
           <div className="guidance-steps">
-            <span><b>1</b> 修正少量低置信记录</span>
+            <span><b>1</b> 确认切换后生成的时间块</span>
             <span><b>2</b> 从正确记录学习规则</span>
             <span><b>3</b> 日常只看结果</span>
           </div>
@@ -989,22 +989,13 @@ function SettingsView({
           subtitle="默认配置优先降低 CPU、写盘和打扰。"
         />
         <div className="field-grid">
-          <Field label="前台检测间隔" hint="应用切换发现速度；推荐 2 秒。">
+          <Field label="观察与更新间隔" hint="每次只延长当前时间块；检测到稳定切换才新建一块。">
             <NumberInput
               value={settings.pollIntervalSeconds}
-              min={1}
-              max={15}
+              min={10}
+              max={60}
               suffix="秒"
               onChange={(value) => update('pollIntervalSeconds', value)}
-            />
-          </Field>
-          <Field label="稳定上下文心跳" hint="同一活动只覆盖同一条原始事件。">
-            <NumberInput
-              value={settings.heartbeatSeconds}
-              min={10}
-              max={300}
-              suffix="秒"
-              onChange={(value) => update('heartbeatSeconds', value)}
             />
           </Field>
           <Field label="离开判定" hint="多久没有键鼠输入后记为离开。">
@@ -1662,7 +1653,7 @@ function needsReview(session: WorkSession) {
   return (
     session.category !== '离开' &&
     !session.userConfirmed &&
-    (!session.projectId || session.confidence < 0.72)
+    (session.source === 'context-complete' || !session.projectId || session.confidence < 0.72)
   );
 }
 
@@ -1728,6 +1719,7 @@ function sourceLabel(source: string) {
     manual: '手动创建',
     seed: '示例',
     'ai-review': 'AI 复核',
+    'context-complete': '切换后待确认',
   };
   return labels[source] || source;
 }
@@ -1735,7 +1727,7 @@ function sourceLabel(source: string) {
 function pageDescription(tab: TabId) {
   const descriptions: Record<TabId, string> = {
     today: '一天用了多久、花在哪些事务上，打开就能看清。',
-    timeline: '只修正少量不确定记录，其余由本地规则自动完成。',
+    timeline: '每 10 秒延长当前活动，稳定切换后生成一个待确认时间块。',
     projects: '按项目和任务汇总投入，不依赖手动启动计时器。',
     settings: '控制采集频率、数据保留和完全可选的 AI 复核。',
   };
