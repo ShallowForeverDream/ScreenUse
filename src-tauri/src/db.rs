@@ -20,7 +20,10 @@ impl AppDb {
     pub fn open() -> Result<Self> {
         let dirs = ProjectDirs::from("com", "ShallowDream", "ScreenUse")
             .context("cannot locate platform data dir")?;
-        let data_dir = dirs.data_dir().to_path_buf();
+        Self::open_in(dirs.data_dir().to_path_buf())
+    }
+
+    fn open_in(data_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&data_dir)?;
         fs::create_dir_all(data_dir.join("exports"))?;
         fs::create_dir_all(data_dir.join("backups"))?;
@@ -647,6 +650,7 @@ impl AppDb {
     }
 
     pub fn queue_health(&self) -> Result<QueueHealth> {
+        let temp_storage_limit_gb = self.get_settings()?.temp_storage_limit_gb as f32;
         let conn = self.conn.lock();
         let count = |status: &str| -> Result<u32> {
             Ok(conn.query_row("SELECT COUNT(*) FROM analysis_jobs WHERE status=?1", params![status], |r| r.get::<_, i64>(0))? as u32)
@@ -654,7 +658,7 @@ impl AppDb {
         Ok(QueueHealth {
             pending: count("pending")?, running: count("running")?, failed: count("failed")?, downgraded: count("downgraded")?,
             temp_storage_gb: dir_size(self.data_dir.join("media-cache")) as f32 / 1_073_741_824.0,
-            temp_storage_limit_gb: self.get_settings()?.temp_storage_limit_gb as f32,
+            temp_storage_limit_gb,
         })
     }
 
@@ -683,11 +687,11 @@ impl AppDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(r#"
             SELECT COALESCE(p.name, '未归类') AS label,
-                   ROUND(SUM((julianday(ended_at)-julianday(started_at))*24*60), 1) AS minutes,
-                   category
+                   ROUND(SUM((julianday(ws.ended_at)-julianday(ws.started_at))*24*60), 1) AS minutes,
+                   ws.category
             FROM work_sessions ws LEFT JOIN projects p ON p.id=ws.project_id
-            WHERE category != '离开'
-            GROUP BY COALESCE(p.name, '未归类'), category
+            WHERE ws.category != '离开'
+            GROUP BY COALESCE(p.name, '未归类'), ws.category
             ORDER BY minutes DESC LIMIT 12
         "#)?;
         let rows = stmt.query_map([], |r| Ok(TrendPoint { label: r.get(0)?, value: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), group: r.get(2)? }))?;
@@ -805,5 +809,15 @@ mod tests {
             input_stats: InputStats::default(), metadata: serde_json::json!({ "contextStart": true }),
         };
         assert!(starts_new_context(&event));
+    }
+
+    #[test]
+    fn dashboard_load_does_not_reenter_the_database_lock() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-dashboard-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let dashboard = db.dashboard(false).expect("load dashboard");
+        assert!(!dashboard.projects.is_empty());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
     }
 }

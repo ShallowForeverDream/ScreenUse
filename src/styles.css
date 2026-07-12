@@ -114,6 +114,8 @@ h1, h2, h3, p { margin-top: 0; }
 .boot strong, .boot span { display: block; }
 .boot strong { margin-bottom: 3px; color: #e5edf7; }
 .boot span { font-size: 13px; }
+.boot-error span { max-width: 560px; color: #fda4af; }
+.boot-error button { margin-top: 12px; }
 
 .app-shell {
   min-height: 100vh;

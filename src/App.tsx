@@ -67,6 +67,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [toast, setToast] = useState('');
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
@@ -76,6 +77,9 @@ export default function App() {
     try {
       const dashboard = await api.dashboard();
       setData(dashboard);
+      setLoadError('');
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
       setLoading(false);
     }
@@ -135,13 +139,26 @@ export default function App() {
     [daySessions, selectedDate],
   );
 
-  if (loading || !data) {
+  if (loading) {
     return (
       <div className="boot">
         <div className="boot-mark">SU</div>
         <div>
           <strong>ScreenUse</strong>
           <span>正在读取本地时间账本…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="boot boot-error">
+        <div className="boot-mark">SU</div>
+        <div>
+          <strong>本地时间账本读取失败</strong>
+          <span>{loadError || '未收到后端数据，请重试。'}</span>
+          <button className="btn ghost small" onClick={() => void load()}>重新读取</button>
         </div>
       </div>
     );
