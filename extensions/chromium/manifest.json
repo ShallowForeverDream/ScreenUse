@@ -1,11 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "ScreenUse Browser Collector",
-  "version": "0.1.0",
-  "description": "Collects Chromium tab metadata for ScreenUse. Reads URL/title/tab group metadata only, never page body.",
+  "name": "ScreenUse Active Tab Context",
+  "version": "0.2.0",
+  "description": "Sends only the active tab title and compact URL to the local ScreenUse app.",
   "permissions": [
     "tabs",
-    "tabGroups",
     "storage",
     "alarms"
   ],

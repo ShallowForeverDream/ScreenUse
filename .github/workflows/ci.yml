@@ -1,0 +1,89 @@
+name: ScreenUse CI
+
+on:
+  push:
+    branches:
+      - main
+      - codex/metadata-first-v1
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenuse-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend type-check and build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build
+
+  extensions:
+    name: Browser and VS Code extensions
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check Chromium extension
+        shell: pwsh
+        run: |
+          node --check extensions/chromium/background.js
+          node --check extensions/chromium/popup.js
+          Get-Content extensions/chromium/manifest.json | ConvertFrom-Json | Out-Null
+      - name: Install VS Code extension dependencies
+        run: npm install --prefix extensions/vscode --no-audit --no-fund
+      - name: Compile VS Code extension
+        id: vscode_compile
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cmd /c "npm run compile --prefix extensions/vscode > vscode-compile.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content vscode-compile.log
+          "exit_code=$code" >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Upload VS Code compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-compile-log
+          path: vscode-compile.log
+          retention-days: 1
+      - name: Enforce VS Code compiler result
+        if: steps.vscode_compile.outputs.exit_code != '0'
+        shell: pwsh
+        run: exit 1
+
+  rust:
+    name: Rust tests and Tauri backend check
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Check Tauri backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml

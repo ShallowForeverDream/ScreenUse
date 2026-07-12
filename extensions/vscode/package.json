@@ -1,8 +1,8 @@
 {
   "name": "screenuse-vscode-collector",
-  "displayName": "ScreenUse VS Code Collector",
-  "description": "Sends workspace, active file and Git branch metadata to ScreenUse. It does not read file body.",
-  "version": "0.1.0",
+  "displayName": "ScreenUse Editor Context",
+  "description": "Silently sends the active workspace, file, language and Git branch metadata to the local ScreenUse app. It never reads file contents.",
+  "version": "0.2.0",
   "publisher": "screenuse",
   "engines": {
     "vscode": "^1.92.0"
@@ -12,14 +12,15 @@
   ],
   "activationEvents": [
     "onStartupFinished",
-    "onDidChangeActiveTextEditor"
+    "onDidChangeActiveTextEditor",
+    "onCommand:screenuse.syncNow"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "screenuse.syncNow",
-        "title": "ScreenUse: Sync Activity Now"
+        "title": "ScreenUse: Sync Editor Context Now"
       }
     ]
   },

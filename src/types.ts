@@ -1,4 +1,5 @@
 export type Category = '学习' | '写作' | '开发' | '沟通' | '娱乐' | '杂务' | '离开' | string;
+export type AiMode = 'off' | 'manual' | 'auto' | string;
 
 export interface InputStats {
   idleSeconds: number;
@@ -94,19 +95,28 @@ export interface QueueHealth {
 
 export interface AppSettings {
   language: string;
+  pollIntervalSeconds: number;
+  heartbeatSeconds: number;
+  rawEventRetentionDays: number;
+  idleThresholdSeconds: number;
+  autoMaintenance: boolean;
+  autoStart: boolean;
+  launchAtLogin: boolean;
+  quickPauseEnabled: boolean;
+  aiMode: AiMode;
+  minAiSessionMinutes: number;
+  aiBaseUrl: string;
+  aiModel: string;
+  aiSecretRef?: string | null;
+  backupDir?: string | null;
+  ddlManagerDbPath: string;
+
+  // Kept by the backend only to migrate v0.1 settings.
   captureScope: string;
   fps: number;
   chunkMinutes: number;
   analysisTiming: string;
-  aiBaseUrl: string;
-  aiModel: string;
-  aiSecretRef?: string | null;
   tempStorageLimitGb: number;
-  idleThresholdSeconds: number;
-  backupDir?: string | null;
-  ddlManagerDbPath: string;
-  autoStart: boolean;
-  quickPauseEnabled: boolean;
 }
 
 export interface DashboardData {

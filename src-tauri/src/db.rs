@@ -22,7 +22,6 @@ impl AppDb {
             .context("cannot locate platform data dir")?;
         let data_dir = dirs.data_dir().to_path_buf();
         fs::create_dir_all(&data_dir)?;
-        fs::create_dir_all(data_dir.join("media-cache"))?;
         fs::create_dir_all(data_dir.join("exports"))?;
         fs::create_dir_all(data_dir.join("backups"))?;
         let db_path = data_dir.join("screenuse.db");
@@ -35,7 +34,6 @@ impl AppDb {
     }
 
     pub fn data_dir(&self) -> &Path { &self.data_dir }
-    pub fn media_cache_dir(&self) -> PathBuf { self.data_dir.join("media-cache") }
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
@@ -342,7 +340,7 @@ impl AppDb {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).optional()?;
         if let Some((id, last_summary, last_category, _last_end, confirmed)) = last {
-            if confirmed == 0 && last_summary == summary && last_category == category {
+            if !starts_new_context(event) && confirmed == 0 && last_summary == summary && last_category == category {
                 conn.execute("UPDATE work_sessions SET ended_at=?1, confidence=MAX(confidence, ?2), evidence_json=?3, updated_at=?4 WHERE id=?5", params![event.timestamp, confidence, serde_json::to_string(&evidence)?, now(), id])?;
                 return Ok(());
             }
@@ -390,12 +388,6 @@ impl AppDb {
         };
         let project: Option<(String, String)> = conn.query_row("SELECT p.id, t.id FROM projects p JOIN tasks t ON t.project_id=p.id WHERE p.category=?1 ORDER BY p.updated_at DESC LIMIT 1", params![category], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         Ok((project.as_ref().map(|x| x.0.clone()), project.as_ref().map(|x| x.1.clone()), category.into(), summary.into(), 0.55))
-    }
-
-    pub fn upsert_media_chunk(&self, chunk: &MediaChunk) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("INSERT OR REPLACE INTO media_chunks VALUES (?1,?2,?3,?4,?5,?6,?7)", params![chunk.id, chunk.display_id, chunk.started_at, chunk.ended_at, chunk.path, chunk.fps, chunk.status])?;
-        Ok(())
     }
 
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
@@ -462,40 +454,6 @@ impl AppDb {
             })
         })?;
         collect_rows(rows)
-    }
-
-    pub fn media_chunks_by_ids(&self, ids: &[String]) -> Result<Vec<MediaChunk>> {
-        if ids.is_empty() { return Ok(vec![]); }
-        let conn = self.conn.lock();
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id,display_id,started_at,ended_at,path,fps,status FROM media_chunks WHERE id IN ({})", placeholders);
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| Ok(MediaChunk {
-            id: r.get(0)?,
-            display_id: r.get(1)?,
-            started_at: r.get(2)?,
-            ended_at: r.get(3)?,
-            path: r.get(4)?,
-            fps: r.get(5)?,
-            status: r.get(6)?,
-        }))?;
-        collect_rows(rows)
-    }
-
-    pub fn set_media_chunks_status(&self, ids: &[String], status: &str, delete_files: bool) -> Result<()> {
-        let chunks = self.media_chunks_by_ids(ids)?;
-        if delete_files {
-            for chunk in &chunks {
-                let path = PathBuf::from(&chunk.path);
-                if path.is_dir() { let _ = fs::remove_dir_all(&path); }
-                else if path.is_file() { let _ = fs::remove_file(&path); }
-            }
-        }
-        let conn = self.conn.lock();
-        for id in ids {
-            conn.execute("UPDATE media_chunks SET status=?1 WHERE id=?2", params![status, id])?;
-        }
-        Ok(())
     }
 
     pub fn upsert_project_by_name(&self, name: &str, category: &str, source: &str) -> Result<String> {
@@ -764,36 +722,10 @@ impl AppDb {
         Ok(target)
     }
 
-    pub fn cleanup_media_cache(&self) -> Result<u32> {
-        let limit = self.get_settings()?.temp_storage_limit_gb.max(1) as u64 * 1_073_741_824;
-        let mut current_size = dir_size(self.media_cache_dir());
-        if current_size <= limit { return Ok(0); }
+}
 
-        let conn = self.conn.lock();
-        let rows = {
-            let mut stmt = conn.prepare("SELECT id,path,status FROM media_chunks ORDER BY CASE status WHEN 'analyzed' THEN 0 WHEN 'deleted' THEN 1 WHEN 'downgraded' THEN 2 ELSE 3 END, started_at ASC")?;
-            let mapped = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
-            collect_rows(mapped)?
-        };
-        drop(conn);
-
-        let mut deleted = 0;
-        for (id, path, status) in rows {
-            if current_size <= limit { break; }
-            if matches!(status.as_str(), "recording" | "running" | "pending-analysis" | "pending") { continue; }
-            let p = PathBuf::from(&path);
-            let before = path_size(&p);
-            if p.is_dir() { let _ = fs::remove_dir_all(&p); }
-            else if p.is_file() { let _ = fs::remove_file(&p); }
-            if before > 0 {
-                current_size = current_size.saturating_sub(before);
-                let conn = self.conn.lock();
-                conn.execute("UPDATE media_chunks SET status='deleted' WHERE id=?1", params![id])?;
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
-    }
+fn starts_new_context(event: &RawActivityEvent) -> bool {
+    event.metadata.get("contextStart").and_then(serde_json::Value::as_bool).unwrap_or(false)
 }
 
 fn insert_seed_session(conn: &Connection, id: &str, project_id: &str, task_id: &str, category: &str, summary: &str, start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>, confidence: f32) -> Result<()> {
@@ -861,8 +793,17 @@ fn dir_size(path: PathBuf) -> u64 {
     total
 }
 
-fn path_size(path: &Path) -> u64 {
-    if !path.exists() { return 0; }
-    if path.is_file() { return fs::metadata(path).map(|m| m.len()).unwrap_or(0); }
-    dir_size(path.to_path_buf())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_start_forces_a_new_session_boundary() {
+        let event = RawActivityEvent {
+            id: "context-1".into(), source: "test".into(), timestamp: now(), app: None,
+            window_title: None, url: None, file_path: None, workspace: None,
+            input_stats: InputStats::default(), metadata: serde_json::json!({ "contextStart": true }),
+        };
+        assert!(starts_new_context(&event));
+    }
 }
