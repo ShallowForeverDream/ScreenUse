@@ -5,7 +5,8 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 struct Assignment {
     project_id: String,
-    task_id: String,
+    task_id: Option<String>,
+    category: String,
     confidence: f32,
 }
 
@@ -22,7 +23,8 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
         return Ok(Some(session));
     };
     if session.project_id.as_deref() == Some(assignment.project_id.as_str())
-        && session.task_id.as_deref() == Some(assignment.task_id.as_str())
+        && session.task_id == assignment.task_id
+        && session.category == assignment.category
         && session.confidence >= assignment.confidence
     {
         return Ok(Some(session));
@@ -33,8 +35,8 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
         SessionPatch {
             summary: None,
             project_id: Some(assignment.project_id),
-            task_id: Some(assignment.task_id),
-            category: None,
+            task_id: assignment.task_id,
+            category: Some(assignment.category),
             confidence: Some(session.confidence.max(assignment.confidence)),
             user_confirmed: Some(false),
         },
@@ -67,7 +69,8 @@ pub fn finalize_context(
 
     if let Some(assignment) = resolve_project_task(db, event, &category)? {
         project_id = Some(assignment.project_id);
-        task_id = Some(assignment.task_id);
+        task_id = assignment.task_id;
+        category = assignment.category;
         confidence = confidence.max(assignment.confidence);
     } else if category != session.category && session.project_id.is_some() {
         category = session.category.clone();
@@ -114,9 +117,11 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
         None => return Ok(None),
     };
 
-    let task_id = best_task(&tasks, &project_id, &hay)
-        .map(|task| task.id.clone())
-        .unwrap_or(db.upsert_task_by_title(&project_id, default_task_title(category, event), if auto_created { "workspace-auto" } else { "metadata-auto" })?);
+    let task_id = if auto_created {
+        Some(db.upsert_task_by_title(&project_id, default_task_title(category, event), "workspace-auto")?)
+    } else {
+        best_task(&tasks, &project_id, &hay).map(|task| task.id.clone())
+    };
 
     let confidence = if project_score >= 90 {
         0.86
@@ -125,7 +130,12 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
     } else {
         0.70
     };
-    Ok(Some(Assignment { project_id, task_id, confidence }))
+    let assigned_category = projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| project.category.clone())
+        .unwrap_or_else(|| category.to_string());
+    Ok(Some(Assignment { project_id, task_id, category: assigned_category, confidence }))
 }
 
 fn project_score(project: &Project, category: &str, hay: &str, workspace: Option<&str>) -> i32 {
@@ -163,7 +173,10 @@ fn best_task<'a>(tasks: &'a [Task], project_id: &str, hay: &str) -> Option<&'a T
         .max_by_key(|(_, score)| *score);
     match scored {
         Some((task, score)) if score > 0 => Some(task),
-        _ => project_tasks.into_iter().find(|task| task.status == "active"),
+        _ => {
+            let active = project_tasks.into_iter().filter(|task| task.status == "active").collect::<Vec<_>>();
+            (active.len() == 1).then(|| active[0])
+        }
     }
 }
 

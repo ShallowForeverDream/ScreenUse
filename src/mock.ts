@@ -6,6 +6,16 @@ const home = typeof navigator !== 'undefined' && navigator.platform.includes('Wi
 
 export const fallbackDashboard: DashboardData = {
   collectorRunning: true,
+  activeContext: null,
+  categoryOptions: [
+    { name: '开发', color: '#60a5fa', isBuiltin: true },
+    { name: '学习', color: '#a78bfa', isBuiltin: true },
+    { name: '写作', color: '#f472b6', isBuiltin: true },
+    { name: '沟通', color: '#34d399', isBuiltin: true },
+    { name: '娱乐', color: '#fb7185', isBuiltin: true },
+    { name: '杂务', color: '#fbbf24', isBuiltin: true },
+    { name: '离开', color: '#94a3b8', isBuiltin: true },
+  ],
   settings: {
     language: 'zh-CN',
     theme: 'light',

@@ -77,6 +77,61 @@ fn delete_project(state: State<AppState>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn create_category(state: State<AppState>, name: String) -> Result<models::CategoryOption, String> {
+    state.db.create_category(&name).map_err(map_err)
+}
+
+#[tauri::command]
+fn delete_category(state: State<AppState>, name: String) -> Result<(), String> {
+    state.db.delete_category(&name).map_err(map_err)
+}
+
+#[tauri::command]
+fn create_task(state: State<AppState>, project_id: String, title: String) -> Result<models::Task, String> {
+    state.db.create_task(&project_id, &title).map_err(map_err)
+}
+
+#[tauri::command]
+fn delete_task(state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_task(&id).map_err(map_err)
+}
+
+#[tauri::command]
+fn pin_context(
+    state: State<AppState>,
+    project_id: String,
+    task_id: Option<String>,
+    minutes: u32,
+) -> Result<models::ContextPin, String> {
+    let pin = state.db.pin_context(&project_id, task_id.as_deref(), minutes).map_err(map_err)?;
+    if state.collector.health().running {
+        state.collector.stop().map_err(map_err)?;
+        state.collector.start(state.db.clone()).map_err(map_err)?;
+    }
+    let db = state.db.clone();
+    let collector = state.collector.clone();
+    let wait_minutes = minutes.clamp(5, 240);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(u64::from(wait_minutes) * 60));
+        if matches!(db.active_context(), Ok(None)) && collector.health().running {
+            let _ = collector.stop();
+            let _ = collector.start(db);
+        }
+    });
+    Ok(pin)
+}
+
+#[tauri::command]
+fn clear_context_pin(state: State<AppState>) -> Result<(), String> {
+    state.db.clear_context_pin().map_err(map_err)?;
+    if state.collector.health().running {
+        state.collector.stop().map_err(map_err)?;
+        state.collector.start(state.db.clone()).map_err(map_err)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn merge_sessions(
     state: State<AppState>,
     ids: Vec<String>,
@@ -122,8 +177,9 @@ fn compact_sessions(state: State<AppState>) -> Result<u32, String> {
 fn learn_rule_from_session(
     state: State<AppState>,
     id: String,
+    keyword: Option<String>,
 ) -> Result<models::AttributionRule, String> {
-    state.db.learn_rule_from_session(&id).map_err(map_err)
+    state.db.learn_rule_from_session(&id, keyword.as_deref()).map_err(map_err)
 }
 
 #[tauri::command]
@@ -328,6 +384,12 @@ fn main() {
             update_session,
             create_project,
             delete_project,
+            create_category,
+            delete_category,
+            create_task,
+            delete_task,
+            pin_context,
+            clear_context_pin,
             merge_sessions,
             split_session,
             retry_failed_jobs,

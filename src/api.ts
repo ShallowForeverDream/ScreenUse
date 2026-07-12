@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings, AttributionRule, DashboardData, Project, SessionPatch, WorkSession } from './types';
+import type { AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, Project, SessionPatch, Task, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -32,12 +32,35 @@ export const api = {
     if (!isTauri()) return;
     await call<void>('delete_project', { id });
   },
+  createCategory: (name: string) =>
+    call<CategoryOption>('create_category', { name }, { name, color: '#a855f7', isBuiltin: false }),
+  deleteCategory: async (name: string) => {
+    if (!isTauri()) return;
+    await call<void>('delete_category', { name });
+  },
+  createTask: (projectId: string, title: string) =>
+    call<Task>('create_task', { projectId, title }, {
+      id: `preview-task-${Date.now()}`,
+      projectId,
+      title,
+      status: 'active',
+      source: 'manual',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }),
+  deleteTask: async (id: string) => {
+    if (!isTauri()) return;
+    await call<void>('delete_task', { id });
+  },
+  pinContext: (projectId: string, taskId?: string | null, minutes = 30) =>
+    call<ContextPin>('pin_context', { projectId, taskId: taskId || null, minutes }),
+  clearContextPin: () => call<void>('clear_context_pin'),
   mergeSessions: (ids: string[], summary?: string) => call<WorkSession>('merge_sessions', { ids, summary }),
   splitSession: (id: string, splitAt: string) => call<WorkSession[]>('split_session', { id, splitAt }),
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),
   runAnalysisOnce: () => call<boolean>('run_analysis_once', undefined, false),
   compactSessions: () => call<number>('compact_sessions', undefined, 0),
-  learnRuleFromSession: (id: string) => call<AttributionRule>('learn_rule_from_session', { id }),
+  learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),
   cleanupMediaCache: () => call<number>('cleanup_media_cache', undefined, 0),
   saveSettings: (settings: AppSettings) => call<void>('save_settings', { settings }),
   exportData: (format: 'csv' | 'excel' | 'markdown') => call<string>('export_data', { format }, `browser-preview.${format}`),

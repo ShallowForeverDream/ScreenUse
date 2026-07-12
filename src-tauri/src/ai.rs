@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::models::{AppSettings, EvidenceItem, RawActivityEvent, DEFAULT_CATEGORIES};
+use crate::models::{AppSettings, EvidenceItem, RawActivityEvent};
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ impl OpenAiCompatibleClient {
     pub async fn analyze_metadata_block(
         &self,
         events: &[RawActivityEvent],
+        categories: &[String],
     ) -> Result<AiAttributionResult> {
         if events.is_empty() {
             return Err(anyhow!("no events to analyze"));
@@ -71,12 +72,13 @@ impl OpenAiCompatibleClient {
                 })
             })
             .collect();
+        let allowed_categories = categories.join("、");
         let body = json!({
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是个人电脑时间账本的归类器。只输出 JSON 对象，字段为 projectName、taskTitle、category、summary、confidence、evidence。category 只能是 学习、写作、开发、沟通、娱乐、杂务、离开；confidence 为 0-1；evidence 最多 3 项，每项含 kind、label、value、weight。只依据元数据，摘要不超过 30 个汉字。"
+                    "content": format!("你是个人电脑时间账本的归类器。只输出 JSON 对象，字段为 projectName、taskTitle、category、summary、confidence、evidence。category 只能是 {allowed_categories}；优先根据窗口标题、工作区、网址和用户项目判断事务，不要只按应用名判断。confidence 为 0-1；evidence 最多 3 项。只依据元数据，摘要不超过 30 个汉字。")
                 },
                 {
                     "role": "user",
@@ -111,13 +113,13 @@ impl OpenAiCompatibleClient {
             extract_json_object(content)
                 .and_then(|json| serde_json::from_str(&json).map_err(anyhow::Error::from))
         })?;
-        validate_result(&mut parsed)?;
+        validate_result(&mut parsed, categories)?;
         Ok(parsed)
     }
 }
 
-fn validate_result(result: &mut AiAttributionResult) -> Result<()> {
-    if !DEFAULT_CATEGORIES.contains(&result.category.as_str()) {
+fn validate_result(result: &mut AiAttributionResult, categories: &[String]) -> Result<()> {
+    if !categories.iter().any(|category| category == &result.category) {
         return Err(anyhow!("AI returned unsupported category: {}", result.category));
     }
     result.project_name = clean(&result.project_name, "自动发现项目", 80);

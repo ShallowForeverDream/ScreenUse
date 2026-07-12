@@ -39,6 +39,21 @@ export interface Task {
   updatedAt: string;
 }
 
+export interface CategoryOption {
+  name: string;
+  color: string;
+  isBuiltin: boolean;
+}
+
+export interface ContextPin {
+  projectId: string;
+  projectName: string;
+  taskId?: string | null;
+  taskTitle?: string | null;
+  category: string;
+  expiresAt: string;
+}
+
 export interface WorkSession {
   id: string;
   startedAt: string;
@@ -126,6 +141,8 @@ export interface DashboardData {
   sessions: WorkSession[];
   projects: Project[];
   tasks: Task[];
+  categoryOptions: CategoryOption[];
+  activeContext?: ContextPin | null;
   planItems: PlanItem[];
   trends: TrendPoint[];
   categories: TrendPoint[];

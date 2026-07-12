@@ -90,6 +90,25 @@ pub struct Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CategoryOption {
+    pub name: String,
+    pub color: String,
+    pub is_builtin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPin {
+    pub project_id: String,
+    pub project_name: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
+    pub category: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceItem {
     pub kind: String,
     pub label: String,
@@ -289,6 +308,8 @@ pub struct DashboardData {
     pub sessions: Vec<WorkSession>,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
+    pub category_options: Vec<CategoryOption>,
+    pub active_context: Option<ContextPin>,
     pub plan_items: Vec<PlanItem>,
     pub trends: Vec<TrendPoint>,
     pub categories: Vec<TrendPoint>,

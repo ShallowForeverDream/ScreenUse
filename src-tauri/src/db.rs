@@ -57,6 +57,12 @@ impl AppDb {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS activity_categories (
+              name TEXT PRIMARY KEY,
+              color TEXT NOT NULL,
+              is_builtin INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY,
               project_id TEXT NOT NULL,
@@ -155,10 +161,24 @@ impl AppDb {
               path TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS context_pin (
+              singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+              project_id TEXT NOT NULL,
+              task_id TEXT,
+              expires_at TEXT NOT NULL,
+              FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+              FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_work_sessions_time ON work_sessions(started_at, ended_at);
             CREATE INDEX IF NOT EXISTS idx_raw_events_time ON raw_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs(status);
         "#)?;
+        for category in DEFAULT_CATEGORIES {
+            conn.execute(
+                "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at) VALUES(?1,?2,1,?3)",
+                params![category, color_for_category(category), now()],
+            )?;
+        }
         Ok(())
     }
 
@@ -211,12 +231,72 @@ impl AppDb {
             sessions: self.list_sessions(80)?,
             projects: self.list_projects()?,
             tasks: self.list_tasks()?,
+            category_options: self.list_categories()?,
+            active_context: self.active_context()?,
             plan_items: self.list_plan_items(100)?,
             trends: self.project_task_trends()?,
             categories: self.category_trends()?,
             queue: self.queue_health()?,
             collector_running,
         })
+    }
+
+    pub fn list_categories(&self) -> Result<Vec<CategoryOption>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name,color,is_builtin FROM activity_categories ORDER BY is_builtin DESC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CategoryOption {
+                name: row.get(0)?,
+                color: row.get(1)?,
+                is_builtin: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    pub fn create_category(&self, name: &str) -> Result<CategoryOption> {
+        let name = clean_name(name, "");
+        if name.is_empty() {
+            bail!("分类名称不能为空");
+        }
+        let name: String = name.chars().take(24).collect();
+        let color = custom_category_color(&name).to_string();
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at) VALUES(?1,?2,0,?3)",
+            params![name, color, now()],
+        )?;
+        if changed == 0 {
+            bail!("同名分类已存在");
+        }
+        Ok(CategoryOption { name, color, is_builtin: false })
+    }
+
+    pub fn delete_category(&self, name: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let builtin = tx
+            .query_row(
+                "SELECT is_builtin FROM activity_categories WHERE name=?1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .context("分类不存在或已经删除")?;
+        if builtin != 0 {
+            bail!("默认分类不能删除");
+        }
+        tx.execute(
+            "UPDATE projects SET category='杂务', color=?1, updated_at=?2 WHERE category=?3",
+            params![color_for_category("杂务"), now(), name],
+        )?;
+        tx.execute("UPDATE work_sessions SET category='杂务', updated_at=?1 WHERE category=?2", params![now(), name])?;
+        tx.execute("UPDATE attribution_rules SET category='杂务' WHERE category=?1", params![name])?;
+        tx.execute("DELETE FROM activity_categories WHERE name=?1", params![name])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -235,11 +315,18 @@ impl AppDb {
         }
         let name: String = name.chars().take(80).collect();
         let category = category.trim();
-        if !DEFAULT_CATEGORIES.contains(&category) {
+        let conn = self.conn.lock();
+        let category_exists = conn
+            .query_row(
+                "SELECT 1 FROM activity_categories WHERE name=?1 LIMIT 1",
+                params![category],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !category_exists {
             bail!("不支持的项目分类：{category}");
         }
-
-        let conn = self.conn.lock();
         let duplicate = conn
             .query_row(
                 "SELECT 1 FROM projects WHERE name=?1 LIMIT 1",
@@ -312,6 +399,126 @@ impl AppDb {
             id: r.get(0)?, project_id: r.get(1)?, title: r.get(2)?, status: r.get(3)?, source: r.get(4)?, planned_due_at: r.get(5)?, created_at: r.get(6)?, updated_at: r.get(7)?,
         }))?;
         collect_rows(rows)
+    }
+
+    pub fn create_task(&self, project_id: &str, title: &str) -> Result<Task> {
+        let title = clean_name(title, "");
+        if title.is_empty() {
+            bail!("任务名称不能为空");
+        }
+        let conn = self.conn.lock();
+        let project_exists = conn
+            .query_row("SELECT 1 FROM projects WHERE id=?1", params![project_id], |row| row.get::<_, i64>(0))
+            .optional()?
+            .is_some();
+        if !project_exists {
+            bail!("请先选择项目");
+        }
+        let duplicate = conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE project_id=?1 AND title=?2 LIMIT 1",
+                params![project_id, title],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            bail!("该项目下已有同名任务");
+        }
+        let timestamp = now();
+        let task = Task {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            title,
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
+        conn.execute(
+            "INSERT INTO tasks VALUES(?1,?2,?3,?4,?5,NULL,?6,?7)",
+            params![task.id, task.project_id, task.title, task.status, task.source, task.created_at, task.updated_at],
+        )?;
+        Ok(task)
+    }
+
+    pub fn delete_task(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM attribution_rules WHERE task_id=?1", params![id])?;
+        let changed = tx.execute("DELETE FROM tasks WHERE id=?1", params![id])?;
+        if changed == 0 {
+            bail!("任务不存在或已经删除");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pin_context(&self, project_id: &str, task_id: Option<&str>, minutes: u32) -> Result<ContextPin> {
+        let conn = self.conn.lock();
+        let project: (String, String) = conn.query_row(
+            "SELECT name,category FROM projects WHERE id=?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(task_id) = task_id {
+            let belongs = conn
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2",
+                    params![task_id, project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if !belongs {
+                bail!("所选任务不属于该项目");
+            }
+        }
+        let expires_at = fmt(Utc::now() + Duration::minutes(i64::from(minutes.clamp(5, 240))));
+        conn.execute(
+            "INSERT INTO context_pin(singleton,project_id,task_id,expires_at) VALUES(1,?1,?2,?3) ON CONFLICT(singleton) DO UPDATE SET project_id=excluded.project_id,task_id=excluded.task_id,expires_at=excluded.expires_at",
+            params![project_id, task_id, expires_at],
+        )?;
+        let task_title = task_id
+            .map(|id| conn.query_row("SELECT title FROM tasks WHERE id=?1", params![id], |row| row.get(0)))
+            .transpose()?;
+        Ok(ContextPin {
+            project_id: project_id.to_string(),
+            project_name: project.0,
+            task_id: task_id.map(ToOwned::to_owned),
+            task_title,
+            category: project.1,
+            expires_at,
+        })
+    }
+
+    pub fn clear_context_pin(&self) -> Result<()> {
+        self.conn.lock().execute("DELETE FROM context_pin", [])?;
+        Ok(())
+    }
+
+    pub fn active_context(&self) -> Result<Option<ContextPin>> {
+        let conn = self.conn.lock();
+        let pin = conn
+            .query_row(
+                "SELECT cp.project_id,p.name,cp.task_id,t.title,p.category,cp.expires_at FROM context_pin cp JOIN projects p ON p.id=cp.project_id LEFT JOIN tasks t ON t.id=cp.task_id WHERE cp.singleton=1",
+                [],
+                |row| Ok(ContextPin {
+                    project_id: row.get(0)?,
+                    project_name: row.get(1)?,
+                    task_id: row.get(2)?,
+                    task_title: row.get(3)?,
+                    category: row.get(4)?,
+                    expires_at: row.get(5)?,
+                }),
+            )
+            .optional()?;
+        if pin.as_ref().is_some_and(|pin| DateTime::parse_from_rfc3339(&pin.expires_at).map(|time| time.with_timezone(&Utc) <= Utc::now()).unwrap_or(true)) {
+            conn.execute("DELETE FROM context_pin", [])?;
+            return Ok(None);
+        }
+        Ok(pin)
     }
 
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<WorkSession>> {
@@ -483,6 +690,15 @@ impl AppDb {
 
     fn heuristic_attribution(&self, event: &RawActivityEvent, is_idle: bool) -> Result<(Option<String>, Option<String>, String, String, f32)> {
         if is_idle { return Ok((None, None, "离开".into(), "离开/空闲".into(), 0.96)); }
+        if let Some(pin) = self.active_context()? {
+            return Ok((
+                Some(pin.project_id),
+                pin.task_id,
+                pin.category.clone(),
+                classification::summary_for_event(event, &pin.category),
+                0.98,
+            ));
+        }
         let hay = format!("{} {} {} {}", event.app.clone().unwrap_or_default(), event.window_title.clone().unwrap_or_default(), event.url.clone().unwrap_or_default(), event.file_path.clone().unwrap_or_default()).to_lowercase();
         let conn = self.conn.lock();
         let rules = {
@@ -492,12 +708,29 @@ impl AppDb {
         };
         for (matcher_json, project_id, task_id, category, _name) in rules {
             let matcher: serde_json::Value = serde_json::from_str(&matcher_json).unwrap_or_default();
-            let keyword = matcher.get("keyword").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let mut keywords = matcher
+                .get("keywords")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+                .map(str::to_lowercase)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            if let Some(keyword) = matcher.get("keyword").and_then(|v| v.as_str()) {
+                if !keyword.trim().is_empty() {
+                    keywords.push(keyword.to_lowercase());
+                }
+            }
             let app = matcher.get("app").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
             let domain = matcher.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let hit = (!keyword.is_empty() && hay.contains(&keyword))
-                || (!app.is_empty() && event.app.as_deref().unwrap_or("").to_lowercase().contains(&app))
-                || (!domain.is_empty() && event.url.as_deref().unwrap_or("").to_lowercase().contains(&domain));
+            let workspace = matcher.get("workspace").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let has_constraint = !keywords.is_empty() || !app.is_empty() || !domain.is_empty() || !workspace.is_empty();
+            let hit = has_constraint
+                && (keywords.is_empty() || keywords.iter().any(|keyword| hay.contains(keyword)))
+                && (app.is_empty() || event.app.as_deref().unwrap_or("").to_lowercase().contains(&app))
+                && (domain.is_empty() || event.url.as_deref().unwrap_or("").to_lowercase().contains(&domain))
+                && (workspace.is_empty() || event.workspace.as_deref().unwrap_or("").to_lowercase().contains(&workspace));
             if hit {
                 return Ok((
                     project_id,
@@ -523,10 +756,9 @@ impl AppDb {
         } else {
             "杂务"
         };
-        let project: Option<(String, String)> = conn.query_row("SELECT p.id, t.id FROM projects p JOIN tasks t ON t.project_id=p.id WHERE p.category=?1 ORDER BY p.updated_at DESC LIMIT 1", params![category], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         Ok((
-            project.as_ref().map(|x| x.0.clone()),
-            project.as_ref().map(|x| x.1.clone()),
+            None,
+            None,
             category.into(),
             classification::summary_for_event(event, category),
             0.55,
@@ -757,18 +989,56 @@ impl AppDb {
         Ok(changed)
     }
 
-    pub fn learn_rule_from_session(&self, id: &str) -> Result<AttributionRule> {
+    pub fn learn_rule_from_session(&self, id: &str, keyword: Option<&str>) -> Result<AttributionRule> {
         let session = self.get_session(id)?.context("session not found")?;
-        let strongest = session.evidence.iter()
-            .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|e| e.value.clone())
-            .unwrap_or_else(|| session.summary.clone());
-        let keyword = strongest.split(['/', '\\', '-', '|', '—']).next().unwrap_or(&strongest).trim();
+        let app = session
+            .evidence
+            .iter()
+            .find(|item| item.kind == "app")
+            .map(|item| item.value.trim().trim_end_matches(".exe").to_lowercase())
+            .unwrap_or_default();
+        let window = session
+            .evidence
+            .iter()
+            .find(|item| item.kind == "window")
+            .map(|item| item.value.trim().to_string())
+            .unwrap_or_default();
+        let mut keywords = Vec::new();
+        if let Some(keyword) = keyword.map(str::trim).filter(|value| !value.is_empty()) {
+            keywords.extend(
+                keyword
+                    .split([',', '，', ';', '；'])
+                    .map(str::trim)
+                    .filter(|value| value.chars().count() >= 2)
+                    .map(|value| value.chars().take(48).collect::<String>()),
+            );
+        }
+        for candidate in [session.project_name.as_deref(), session.task_title.as_deref()] {
+            if let Some(candidate) = candidate.map(str::trim).filter(|value| value.chars().count() >= 2) {
+                keywords.push(candidate.chars().take(48).collect());
+            }
+        }
+        let normalized_window = window.to_lowercase();
+        if !window.is_empty()
+            && normalized_window != app
+            && !is_generic_context_label(&normalized_window)
+        {
+            keywords.push(window.chars().take(64).collect());
+        }
+        keywords.sort();
+        keywords.dedup();
+        if keywords.is_empty() {
+            bail!("当前窗口没有可区分线索，请填写识别词或固定当前事务");
+        }
+        let mut matcher = serde_json::json!({ "keywords": keywords });
+        if !app.is_empty() {
+            matcher["app"] = serde_json::Value::String(app);
+        }
         let rule = AttributionRule {
             id: Uuid::new_v4().to_string(),
             name: format!("自动学习：{}", session.summary.chars().take(24).collect::<String>()),
             priority: 90,
-            matcher: serde_json::json!({ "keyword": keyword, "summary": session.summary }),
+            matcher,
             project_id: session.project_id,
             task_id: session.task_id,
             category: session.category,
@@ -912,6 +1182,21 @@ fn within_gap(left_end: &str, right_start: &str, max_minutes: i64) -> bool {
     }
 }
 
+fn custom_category_color(name: &str) -> &'static str {
+    const COLORS: [&str; 8] = [
+        "#8b5cf6", "#ec4899", "#06b6d4", "#14b8a6", "#f97316", "#6366f1", "#84cc16", "#d946ef",
+    ];
+    let hash = name.bytes().fold(0usize, |value, byte| value.wrapping_mul(31).wrapping_add(byte as usize));
+    COLORS[hash % COLORS.len()]
+}
+
+fn is_generic_context_label(value: &str) -> bool {
+    matches!(
+        value.trim().trim_end_matches(".exe"),
+        "chatgpt" | "codex" | "chrome" | "msedge" | "firefox" | "brave" | "new tab" | "新标签页" | "电脑活动"
+    )
+}
+
 fn map_work_session(row: &Row<'_>) -> rusqlite::Result<WorkSession> {
     let evidence_json: String = row.get(10)?;
     Ok(WorkSession {
@@ -959,6 +1244,21 @@ fn dir_size(path: PathBuf) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_event(id: &str, title: &str) -> RawActivityEvent {
+        RawActivityEvent {
+            id: id.into(),
+            source: "windows-foreground".into(),
+            timestamp: now(),
+            app: Some("ChatGPT.exe".into()),
+            window_title: Some(title.into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({ "contextStart": true }),
+        }
+    }
 
     #[test]
     fn context_start_forces_a_new_session_boundary() {
@@ -1008,6 +1308,103 @@ mod tests {
         assert!(session.task_id.is_none());
         assert!(!db.list_projects().expect("list projects").iter().any(|item| item.id == project.id));
 
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn custom_categories_and_tasks_can_be_created_and_removed() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-taxonomy-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("竞赛").expect("create category");
+        let project = db.create_project("ICPC", &category.name).expect("create project");
+        let task = db.create_task(&project.id, "网站开发").expect("create task");
+        assert!(db.list_tasks().expect("list tasks").iter().any(|item| item.id == task.id));
+        db.delete_task(&task.id).expect("delete task");
+        assert!(!db.list_tasks().expect("list tasks").iter().any(|item| item.id == task.id));
+        db.delete_category(&category.name).expect("delete category");
+        let updated = db.list_projects().expect("list projects").into_iter().find(|item| item.id == project.id).expect("project remains");
+        assert_eq!(updated.category, "杂务");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn generic_chat_app_is_not_assigned_to_the_latest_project() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-generic-chat-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let session = classification::ingest_event(&db, &chat_event("chat-generic", "ChatGPT"))
+            .expect("classify")
+            .expect("session");
+        assert!(session.project_id.is_none());
+        assert!(session.task_id.is_none());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn chat_title_uses_project_and_task_context_instead_of_app_name() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-chat-context-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("ICPC", "开发").expect("create project");
+        let task = db.create_task(&project.id, "网站开发").expect("create task");
+        let session = classification::ingest_event(&db, &chat_event("chat-icpc", "ICPC · icpc-trainer 网站开发"))
+            .expect("classify")
+            .expect("session");
+        assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(session.category, "开发");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn context_pin_handles_apps_with_no_visible_context() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-context-pin-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("ICPC", "开发").expect("create project");
+        let task = db.create_task(&project.id, "网站开发").expect("create task");
+        db.pin_context(&project.id, Some(&task.id), 30).expect("pin context");
+        let session = classification::ingest_event(&db, &chat_event("chat-pinned", "ChatGPT"))
+            .expect("classify")
+            .expect("session");
+        assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(session.confidence, 0.98);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn corrected_chat_context_learns_scoped_keywords() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-chat-rule-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("ICPC", "开发").expect("create project");
+        let task = db.create_task(&project.id, "网站开发").expect("create task");
+        let first = classification::ingest_event(&db, &chat_event("chat-corrected", "ChatGPT"))
+            .expect("classify")
+            .expect("session");
+        db.update_session(
+            &first.id,
+            SessionPatch {
+                summary: Some("ICPC 网站开发".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                category: Some("开发".into()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct session");
+        db.learn_rule_from_session(&first.id, Some("ICPC, icpc-trainer"))
+            .expect("learn scoped rule");
+
+        let second = classification::ingest_event(&db, &chat_event("chat-rule-hit", "ICPC trainer 对话"))
+            .expect("classify learned context")
+            .expect("session");
+        assert_eq!(second.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(second.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(second.category, "开发");
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

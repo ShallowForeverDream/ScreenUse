@@ -71,7 +71,8 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
     }
 
     let settings = db.get_settings()?.normalized();
-    match maybe_ai(&settings, &events).await {
+    let categories = db.list_categories()?.into_iter().map(|item| item.name).collect::<Vec<_>>();
+    match maybe_ai(&settings, &events, &categories).await {
         Ok(result) => {
             persist_result(&db, &job, &events, result)?;
             Ok(true)
@@ -88,7 +89,11 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
     }
 }
 
-async fn maybe_ai(settings: &crate::models::AppSettings, events: &[RawActivityEvent]) -> Result<AiAttributionResult> {
+async fn maybe_ai(
+    settings: &crate::models::AppSettings,
+    events: &[RawActivityEvent],
+    categories: &[String],
+) -> Result<AiAttributionResult> {
     let secret_name = settings.ai_secret_ref.as_deref().unwrap_or_default().trim();
     if secret_name.is_empty() {
         return Err(anyhow!("未配置 AI 凭据；本地分类不受影响"));
@@ -98,7 +103,7 @@ async fn maybe_ai(settings: &crate::models::AppSettings, events: &[RawActivityEv
         return Err(anyhow!("AI 凭据为空；本地分类不受影响"));
     }
     OpenAiCompatibleClient::new(settings, api_key)
-        .analyze_metadata_block(events)
+        .analyze_metadata_block(events, categories)
         .await
 }
 
