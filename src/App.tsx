@@ -7,6 +7,7 @@ import {
   useState,
   type CSSProperties,
 } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Activity,
   BarChart3,
@@ -745,6 +746,14 @@ function DayActivityTimeline({
   const centerRef = useRef<{ date: string; seconds: number } | null>(null);
   const wheelAtRef = useRef(0);
   const [viewport, setViewport] = useState({ left: 0, width: 0 });
+  const [tooltip, setTooltip] = useState<{
+    session: WorkSession;
+    app: string;
+    timeRange: string;
+    x: number;
+    y: number;
+    placement: 'above' | 'below';
+  } | null>(null);
   const scale = TIMELINE_SCALES[zoom] || TIMELINE_SCALES[DEFAULT_TIMELINE_ZOOM];
   const pixelsPerSecond = TIMELINE_GRID_WIDTH / scale.secondsPerGrid;
   const width = 24 * 60 * 60 * pixelsPerSecond;
@@ -774,6 +783,24 @@ function DayActivityTimeline({
     };
     setViewport({ left: element.scrollLeft, width: element.clientWidth });
   }, [pixelsPerSecond, selectedDate]);
+
+  const showSessionTooltip = useCallback((
+    element: HTMLButtonElement,
+    session: WorkSession,
+    app: string,
+    timeRange: string,
+  ) => {
+    const bounds = element.getBoundingClientRect();
+    const placement = bounds.top >= 140 ? 'above' : 'below';
+    setTooltip({
+      session,
+      app,
+      timeRange,
+      x: Math.min(window.innerWidth - 144, Math.max(144, bounds.left + bounds.width / 2)),
+      y: placement === 'above' ? bounds.top - 10 : bounds.bottom + 10,
+      placement,
+    });
+  }, []);
 
   useLayoutEffect(() => {
     const element = scrollRef.current;
@@ -833,57 +860,83 @@ function DayActivityTimeline({
   }
 
   return (
-    <div
-      className="day-track-scroll"
-      ref={scrollRef}
-      onScroll={updateViewport}
-      title="拖动滚动条查看全天；按住 Ctrl 滚动鼠标滚轮缩放"
-    >
-      <div className="day-track" style={{ width }}>
-        <div className="day-track-axis">
-          {visibleTicks.map((second) => (
-            <span
-              className={second === 0 ? 'day-start' : second === 24 * 60 * 60 ? 'day-end' : undefined}
-              key={second}
-              style={{ left: second * pixelsPerSecond }}
-            >
-              {formatAxisTime(second, scale.secondsPerGrid < 60)}
-            </span>
-          ))}
-        </div>
-        <div
-          className="day-track-lane"
-          style={{ backgroundSize: `${TIMELINE_GRID_WIDTH}px 100%` }}
-        >
-          {sorted.map((session) => {
-            const bounds = sessionBoundsOnDate(session, selectedDate);
-            const app = sessionApplication(session);
-            const blockWidth = Math.max(5, bounds.durationSeconds * pixelsPerSecond);
-            const showSeconds = scale.secondsPerGrid < 60;
-            return (
-              <button
-                className={`day-track-block${needsReview(session) ? ' needs-review' : ''}`}
-                key={session.id}
-                onClick={() => onEdit(session)}
-                title={`${formatTimelineClock(session.startedAt, showSeconds)}–${formatTimelineClock(session.endedAt, showSeconds)}\n${session.summary}\n${app}`}
-                type="button"
-                style={
-                  {
-                    left: bounds.startSeconds * pixelsPerSecond,
-                    width: blockWidth,
-                    '--block-color': categoryColor(session.category),
-                  } as CSSProperties
-                }
+    <>
+      <div
+        className="day-track-scroll"
+        ref={scrollRef}
+        onScroll={() => {
+          updateViewport();
+          setTooltip(null);
+        }}
+        title="拖动滚动条查看全天；按住 Ctrl 滚动鼠标滚轮缩放"
+      >
+        <div className="day-track" style={{ width }}>
+          <div className="day-track-axis">
+            {visibleTicks.map((second) => (
+              <span
+                className={second === 0 ? 'day-start' : second === 24 * 60 * 60 ? 'day-end' : undefined}
+                key={second}
+                style={{ left: second * pixelsPerSecond }}
               >
-                <strong>{session.summary}</strong>
-                <small>{app}</small>
-                <span>{formatTimelineClock(session.startedAt, showSeconds)}–{formatTimelineClock(session.endedAt, showSeconds)}</span>
-              </button>
-            );
-          })}
+                {formatAxisTime(second, scale.secondsPerGrid < 60)}
+              </span>
+            ))}
+          </div>
+          <div
+            className="day-track-lane"
+            style={{ backgroundSize: `${TIMELINE_GRID_WIDTH}px 100%` }}
+          >
+            {sorted.map((session) => {
+              const bounds = sessionBoundsOnDate(session, selectedDate);
+              const app = sessionApplication(session);
+              const blockWidth = Math.max(5, bounds.durationSeconds * pixelsPerSecond);
+              const showSeconds = scale.secondsPerGrid < 60;
+              const timeRange = `${formatTimelineClock(session.startedAt, showSeconds)}–${formatTimelineClock(session.endedAt, showSeconds)}`;
+              return (
+                <button
+                  aria-label={`${timeRange}，${session.summary}，${app}，点击修正`}
+                  className={`day-track-block${needsReview(session) ? ' needs-review' : ''}`}
+                  key={session.id}
+                  onBlur={() => setTooltip(null)}
+                  onClick={() => {
+                    setTooltip(null);
+                    onEdit(session);
+                  }}
+                  onFocus={(event) => showSessionTooltip(event.currentTarget, session, app, timeRange)}
+                  onMouseEnter={(event) => showSessionTooltip(event.currentTarget, session, app, timeRange)}
+                  onMouseLeave={() => setTooltip(null)}
+                  type="button"
+                  style={
+                    {
+                      left: bounds.startSeconds * pixelsPerSecond,
+                      width: blockWidth,
+                      '--block-color': categoryColor(session.category),
+                    } as CSSProperties
+                  }
+                />
+              );
+            })}
+          </div>
         </div>
       </div>
-    </div>
+      {tooltip && createPortal(
+        <div
+          className={`timeline-session-tooltip ${tooltip.placement}`}
+          role="tooltip"
+          style={{ left: tooltip.x, top: tooltip.y }}
+        >
+          <strong>{tooltip.session.summary}</strong>
+          <span>{tooltip.timeRange}</span>
+          <div>
+            <i style={{ '--tooltip-color': categoryColor(tooltip.session.category) } as CSSProperties} />
+            <b>{tooltip.session.category}</b>
+            <em>{tooltip.session.projectName || '未归类项目'}{tooltip.session.taskTitle ? ` · ${tooltip.session.taskTitle}` : ''}</em>
+          </div>
+          <small>{tooltip.app}</small>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 
