@@ -142,7 +142,20 @@ fn persist_result(
 
 fn metadata_evidence(events: &[RawActivityEvent]) -> Vec<EvidenceItem> {
     let mut evidence = Vec::new();
-    if let Some(event) = events.iter().rev().find(|event| event.window_title.as_deref().is_some_and(|value| !value.is_empty())) {
+    if let Some(page_title) = events.iter().rev().find_map(|event| {
+        event
+            .metadata
+            .get("activePageTitle")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }) {
+        evidence.push(EvidenceItem {
+            kind: "page".into(),
+            label: "当前页面".into(),
+            value: page_title.to_string(),
+            weight: 0.82,
+        });
+    } else if let Some(event) = events.iter().rev().find(|event| event.window_title.as_deref().is_some_and(|value| !value.is_empty())) {
         evidence.push(EvidenceItem {
             kind: "window".into(),
             label: "窗口".into(),

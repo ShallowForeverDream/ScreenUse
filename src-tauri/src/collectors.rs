@@ -460,12 +460,8 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             .as_ref()
             .and_then(|path| PathBuf::from(path).file_name().map(|name| name.to_string_lossy().to_string()))
             .unwrap_or_else(|| format!("pid:{pid}"));
-        let chatgpt_context = if app.eq_ignore_ascii_case("chatgpt.exe") {
-            chatgpt_selected_context(window).ok().flatten()
-        } else {
-            None
-        };
-        let title = chatgpt_context
+        let page_context = active_page_context(window, &app, &native_title);
+        let title = page_context
             .as_ref()
             .map(|context| context.title.clone())
             .unwrap_or_else(|| native_title.clone());
@@ -481,10 +477,14 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
         };
 
         let mut metadata = json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" });
-        let workspace = chatgpt_context.as_ref().and_then(|context| context.project.clone());
-        if let Some(context) = chatgpt_context {
+        let workspace = page_context.as_ref().and_then(|context| context.project.clone());
+        if let Some(context) = page_context {
             metadata["nativeWindowTitle"] = serde_json::Value::String(native_title);
-            metadata["chatgptConversationTitle"] = serde_json::Value::String(context.title);
+            metadata["activePageTitle"] = serde_json::Value::String(context.title.clone());
+            metadata["activePageSource"] = serde_json::Value::String(context.source.into());
+            if context.source == "chatgpt-conversation" {
+                metadata["chatgptConversationTitle"] = serde_json::Value::String(context.title);
+            }
             if let Some(project) = context.project {
                 metadata["chatgptProject"] = serde_json::Value::String(project);
             }
@@ -510,15 +510,83 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
 
 #[cfg(windows)]
 #[derive(Debug, Clone)]
-struct ChatGptContext {
+struct ActivePageContext {
     title: String,
     project: Option<String>,
+    source: &'static str,
+}
+
+#[cfg(windows)]
+fn active_page_context(
+    window: windows::Win32::Foundation::HWND,
+    app: &str,
+    native_title: &str,
+) -> Option<ActivePageContext> {
+    if is_chat_workspace_app(app) {
+        return chatgpt_selected_context(window).ok().flatten();
+    }
+    if is_document_app(app) {
+        let native_document = clean_document_title(native_title, app);
+        let selected_tab = if native_document.is_none() {
+            selected_document_tab(window).ok().flatten()
+        } else {
+            None
+        };
+        let visible_wps_title = if native_document.is_none()
+            && selected_tab.is_none()
+            && is_wps_app(app)
+        {
+            visible_wps_document_title()
+        } else {
+            None
+        };
+        let (title, source) = native_document
+            .map(|title| (title, "document-window-title"))
+            .or_else(|| selected_tab.map(|title| (title, "selected-document-tab")))
+            .or_else(|| visible_wps_title.map(|title| (title, "wps-visible-window")))?;
+        return Some(ActivePageContext { title, project: None, source });
+    }
+    None
+}
+
+#[cfg(windows)]
+fn is_chat_workspace_app(app: &str) -> bool {
+    ["chatgpt.exe", "codex.exe"]
+        .iter()
+        .any(|name| app.eq_ignore_ascii_case(name))
+}
+
+#[cfg(windows)]
+fn is_wps_app(app: &str) -> bool {
+    ["wps.exe", "et.exe", "wpp.exe", "wpspdf.exe"]
+        .iter()
+        .any(|name| app.eq_ignore_ascii_case(name))
+}
+
+#[cfg(windows)]
+fn is_document_app(app: &str) -> bool {
+    is_wps_app(app)
+        || [
+            "winword.exe",
+            "excel.exe",
+            "powerpnt.exe",
+            "onenote.exe",
+            "outlook.exe",
+            "acrord32.exe",
+            "acrobat.exe",
+            "typora.exe",
+            "obsidian.exe",
+            "notepad.exe",
+            "notepad++.exe",
+        ]
+        .iter()
+        .any(|name| app.eq_ignore_ascii_case(name))
 }
 
 #[cfg(windows)]
 fn chatgpt_selected_context(
     window: windows::Win32::Foundation::HWND,
-) -> Result<Option<ChatGptContext>> {
+) -> Result<Option<ActivePageContext>> {
     use windows::core::VARIANT;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -531,7 +599,7 @@ fn chatgpt_selected_context(
 
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let result = (|| -> windows::core::Result<Option<ChatGptContext>> {
+        let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
             let root = automation.ElementFromHandle(window)?;
@@ -541,9 +609,11 @@ fn chatgpt_selected_context(
                 "对话操作",
                 "聊天操作",
                 "会话操作",
+                "切换置顶摘要",
                 "Task options",
                 "Chat options",
                 "Conversation options",
+                "Toggle pinned summary",
             ] {
                 let value = VARIANT::from(label);
                 let condition = automation.CreatePropertyCondition(UIA_NamePropertyId, &value)?;
@@ -577,13 +647,181 @@ fn chatgpt_selected_context(
                 }
                 child = walker.GetNextSiblingElement(&element).ok();
             }
-            Ok(title.map(|title| ChatGptContext { title, project }))
+            Ok(title.map(|title| ActivePageContext {
+                title,
+                project,
+                source: "chatgpt-conversation",
+            }))
         })();
         if initialized {
             CoUninitialize();
         }
         result.map_err(Into::into)
     }
+}
+
+#[cfg(windows)]
+fn selected_document_tab(
+    window: windows::Win32::Foundation::HWND,
+) -> Result<Option<String>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern, TreeScope_Descendants,
+        UIA_ControlTypePropertyId, UIA_SelectionItemPatternId, UIA_TabItemControlTypeId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<String>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let value = VARIANT::from(UIA_TabItemControlTypeId.0);
+            let condition =
+                automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &value)?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition)?;
+            for index in 0..elements.Length()? {
+                let element = elements.GetElement(index)?;
+                let selected: IUIAutomationSelectionItemPattern = match element
+                    .GetCurrentPatternAs(UIA_SelectionItemPatternId)
+                {
+                    Ok(pattern) => pattern,
+                    Err(_) => continue,
+                };
+                if selected.CurrentIsSelected()?.as_bool() {
+                    let name = element.CurrentName()?.to_string();
+                    if let Some(title) = valid_selected_document_title(&name) {
+                        return Ok(Some(title));
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn clean_document_title(native_title: &str, app: &str) -> Option<String> {
+    let mut title = native_title.replace(['\r', '\n', '\t'], " ").trim().to_string();
+    let suffixes: &[&str] = if is_wps_app(app) {
+        &[" - WPS Office", " – WPS Office", " — WPS Office", " - WPS"]
+    } else {
+        &[
+            " - Microsoft Word",
+            " - Word",
+            " - Microsoft Excel",
+            " - Excel",
+            " - Microsoft PowerPoint",
+            " - PowerPoint",
+            " - Microsoft OneNote",
+            " - OneNote",
+            " - Outlook",
+            " - Adobe Acrobat Reader",
+            " - Adobe Acrobat",
+            " - Acrobat Reader",
+            " - Typora",
+            " - Obsidian",
+            " - Notepad++",
+            " - Notepad",
+        ]
+    };
+    for suffix in suffixes {
+        if let Some(stripped) = title.strip_suffix(suffix) {
+            title = stripped.trim().to_string();
+            break;
+        }
+    }
+    valid_document_title(&title)
+}
+
+#[cfg(windows)]
+fn valid_document_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 220
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "wps" | "wps office" | "word" | "microsoft word" | "excel" | "microsoft excel"
+                | "powerpoint" | "microsoft powerpoint" | "onenote" | "microsoft onenote"
+                | "outlook" | "adobe acrobat" | "acrobat reader" | "typora" | "obsidian"
+                | "notepad" | "notepad++"
+        )
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn valid_selected_document_title(value: &str) -> Option<String> {
+    let title = valid_document_title(value)?;
+    let normalized = title.to_ascii_lowercase();
+    [
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".txt", ".md",
+        ".csv", ".rtf",
+    ]
+    .iter()
+    .any(|extension| normalized.contains(extension))
+    .then_some(title)
+}
+
+#[cfg(windows)]
+fn visible_wps_document_title() -> Option<String> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
+    };
+
+    struct Search {
+        title: Option<String>,
+    }
+
+    unsafe extern "system" fn visit(window: HWND, state: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(state.0 as *mut Search) };
+        if !unsafe { IsWindowVisible(window) }.as_bool() {
+            return BOOL(1);
+        }
+        let mut pid = 0u32;
+        let _ = unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        let app = unsafe { process_image_path(pid) }.ok().and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        });
+        let Some(app) = app.filter(|app| is_wps_app(app)) else {
+            return BOOL(1);
+        };
+        let length = unsafe { GetWindowTextLengthW(window) }.max(0) as usize;
+        if length == 0 {
+            return BOOL(1);
+        }
+        let mut buffer = vec![0u16; length + 1];
+        let copied = unsafe { GetWindowTextW(window, &mut buffer) }.max(0) as usize;
+        let native_title = String::from_utf16_lossy(&buffer[..copied]);
+        if let Some(title) = clean_document_title(&native_title, &app)
+            .and_then(|title| valid_selected_document_title(&title))
+        {
+            search.title = Some(title);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search { title: None };
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
+    }
+    search.title
 }
 
 #[cfg(windows)]
@@ -740,5 +978,34 @@ mod tests {
         assert!(valid_chatgpt_title("自动记录时间优化"));
         assert!(!valid_chatgpt_title("ChatGPT"));
         assert!(!valid_chatgpt_title("  "));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn office_titles_are_reduced_to_the_active_document() {
+        assert_eq!(
+            clean_document_title("刘雨薇_课程成绩.xlsx - WPS Office", "wps.exe"),
+            Some("刘雨薇_课程成绩.xlsx".into())
+        );
+        assert_eq!(
+            clean_document_title("ICPC 训练计划.docx - Microsoft Word", "WINWORD.EXE"),
+            Some("ICPC 训练计划.docx".into())
+        );
+        assert_eq!(clean_document_title("WPS Office", "et.exe"), None);
+        assert_eq!(valid_selected_document_title("开始"), None);
+        assert_eq!(
+            valid_selected_document_title("ICPC 训练计划.docx"),
+            Some("ICPC 训练计划.docx".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supported_page_apps_cover_chat_and_office_tools() {
+        assert!(is_chat_workspace_app("ChatGPT.exe"));
+        assert!(is_chat_workspace_app("codex.exe"));
+        assert!(is_document_app("wps.exe"));
+        assert!(is_document_app("EXCEL.EXE"));
+        assert!(!is_document_app("steam.exe"));
     }
 }

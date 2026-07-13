@@ -665,8 +665,18 @@ impl AppDb {
         let settings = self.get_settings()?;
         let is_idle = event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64;
         let (project_id, task_id, category, summary, confidence) = self.heuristic_attribution(event, is_idle)?;
+        let page_title = event
+            .metadata
+            .get("activePageTitle")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty());
         let evidence = vec![
-            EvidenceItem { kind: "window".into(), label: "窗口".into(), value: event.window_title.clone().unwrap_or_else(|| "未知窗口".into()), weight: 0.7 },
+            EvidenceItem {
+                kind: if page_title.is_some() { "page".into() } else { "window".into() },
+                label: if page_title.is_some() { "当前页面".into() } else { "窗口".into() },
+                value: page_title.map(str::to_string).or_else(|| event.window_title.clone()).unwrap_or_else(|| "未知窗口".into()),
+                weight: if page_title.is_some() { 0.82 } else { 0.7 },
+            },
             EvidenceItem { kind: "app".into(), label: "应用".into(), value: event.app.clone().unwrap_or_else(|| "未知应用".into()), weight: 0.5 },
         ];
         let conn = self.conn.lock();
@@ -1268,6 +1278,35 @@ mod tests {
             input_stats: InputStats::default(), metadata: serde_json::json!({ "contextStart": true }),
         };
         assert!(starts_new_context(&event));
+    }
+
+    #[test]
+    fn active_page_title_is_saved_as_the_primary_evidence() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-page-evidence-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        db.ingest_raw_event(RawActivityEvent {
+            id: "page-evidence".into(),
+            source: "windows-foreground".into(),
+            timestamp: now(),
+            app: Some("wps.exe".into()),
+            window_title: Some("ICPC 训练计划.docx".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({
+                "contextStart": true,
+                "activePageTitle": "ICPC 训练计划.docx",
+                "activePageSource": "document-window-title"
+            }),
+        })
+        .expect("ingest document event");
+        let session = db.list_sessions(1).expect("list sessions")[0].clone();
+        assert_eq!(session.evidence[0].kind, "page");
+        assert_eq!(session.evidence[0].label, "当前页面");
+        assert_eq!(session.evidence[0].value, "ICPC 训练计划.docx");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]
