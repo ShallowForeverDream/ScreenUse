@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -14,6 +15,7 @@ import {
   CalendarDays,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -1673,6 +1675,234 @@ function SettingsView({
   );
 }
 
+interface SearchSelectOption {
+  value: string;
+  label: string;
+  meta?: string;
+  keywords?: string[];
+  color?: string;
+}
+
+function normalizeSearchText(value: string) {
+  return value.trim().toLocaleLowerCase('zh-CN');
+}
+
+function SearchCreateSelect({
+  value,
+  options,
+  inputLabel,
+  placeholder,
+  emptyText = '没有匹配项',
+  busy = false,
+  canCreate,
+  createLabel,
+  onChange,
+  onCreate,
+}: {
+  value: string;
+  options: SearchSelectOption[];
+  inputLabel: string;
+  placeholder: string;
+  emptyText?: string;
+  busy?: boolean;
+  canCreate?: (query: string) => boolean;
+  createLabel?: (query: string) => string;
+  onChange: (value: string) => void;
+  onCreate?: (query: string) => Promise<void>;
+}) {
+  const listboxId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [activeIndex, setActiveIndex] = useState(0);
+  const selected = options.find((option) => option.value === value);
+  const normalizedQuery = normalizeSearchText(query);
+  const trimmedQuery = query.trim();
+  const filtered = useMemo(() => {
+    if (!normalizedQuery) return options.slice(0, 80);
+    return options
+      .filter((option) => normalizeSearchText([
+        option.label,
+        option.meta,
+        ...(option.keywords || []),
+      ].filter(Boolean).join(' ')).includes(normalizedQuery))
+      .slice(0, 80);
+  }, [normalizedQuery, options]);
+  const showCreate = Boolean(
+    trimmedQuery
+      && onCreate
+      && (canCreate ? canCreate(trimmedQuery) : true),
+  );
+  const itemCount = filtered.length + (showCreate ? 1 : 0);
+
+  useEffect(() => {
+    if (!open) setQuery(selected?.label || '');
+  }, [open, selected?.label]);
+
+  useEffect(() => {
+    setActiveIndex((current) => Math.min(current, Math.max(0, itemCount - 1)));
+  }, [itemCount]);
+
+  const close = () => {
+    setOpen(false);
+    setQuery(selected?.label || '');
+  };
+
+  const selectOption = (option: SearchSelectOption) => {
+    onChange(option.value);
+    setQuery(option.label);
+    setOpen(false);
+  };
+
+  const createCurrent = async () => {
+    if (!showCreate || !onCreate || busy) return;
+    await onCreate(trimmedQuery);
+    setOpen(false);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!open) setOpen(true);
+      if (itemCount) {
+        setActiveIndex((current) => (
+          event.key === 'ArrowDown'
+            ? (current + 1) % itemCount
+            : (current - 1 + itemCount) % itemCount
+        ));
+      }
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      const option = filtered[activeIndex];
+      if (option) {
+        selectOption(option);
+      } else if (showCreate && activeIndex === filtered.length) {
+        void createCurrent();
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    }
+  };
+
+  return (
+    <div
+      className={`search-create-select${open ? ' open' : ''}`}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) close();
+      }}
+    >
+      <div className="search-create-input">
+        <Search size={14} />
+        <input
+          ref={inputRef}
+          aria-activedescendant={open && itemCount ? `${listboxId}-option-${activeIndex}` : undefined}
+          aria-autocomplete="list"
+          aria-controls={listboxId}
+          aria-expanded={open}
+          aria-label={inputLabel}
+          autoComplete="off"
+          disabled={busy}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setActiveIndex(0);
+            setOpen(true);
+          }}
+          onClick={() => {
+            if (!open) {
+              setQuery('');
+              setActiveIndex(0);
+              setOpen(true);
+            }
+          }}
+          onFocus={() => {
+            if (!open) {
+              setQuery('');
+              setActiveIndex(0);
+              setOpen(true);
+            }
+          }}
+          onKeyDown={onKeyDown}
+          placeholder={placeholder}
+          role="combobox"
+          value={open ? query : selected?.label || ''}
+        />
+        <button
+          aria-label={`${open ? '收起' : '展开'}${inputLabel}`}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            if (open) {
+              close();
+            } else {
+              setQuery('');
+              setActiveIndex(0);
+              setOpen(true);
+              inputRef.current?.focus();
+            }
+          }}
+          type="button"
+        >
+          <ChevronDown size={15} />
+        </button>
+      </div>
+      {open && (
+        <div className="search-create-menu" id={listboxId} role="listbox">
+          {filtered.map((option, index) => (
+            <button
+              aria-selected={option.value === value}
+              className={`${index === activeIndex ? 'active' : ''}${option.value === value ? ' selected' : ''}`}
+              id={`${listboxId}-option-${index}`}
+              key={option.value}
+              onClick={() => selectOption(option)}
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => setActiveIndex(index)}
+              role="option"
+              type="button"
+            >
+              {option.color && <i style={{ '--option-color': option.color } as CSSProperties} />}
+              <span>
+                <strong>{option.label}</strong>
+                {option.meta && <small>{option.meta}</small>}
+              </span>
+              {option.value === value && <Check size={14} />}
+            </button>
+          ))}
+          {showCreate && (
+            <button
+              aria-selected={false}
+              className={`create-option${activeIndex === filtered.length ? ' active' : ''}`}
+              id={`${listboxId}-option-${filtered.length}`}
+              onClick={() => void createCurrent()}
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => setActiveIndex(filtered.length)}
+              role="option"
+              type="button"
+            >
+              <Plus size={14} />
+              <span>
+                <strong>{createLabel ? createLabel(trimmedQuery) : `新建“${trimmedQuery}”`}</strong>
+                <small>按 Enter 直接创建</small>
+              </span>
+            </button>
+          )}
+          {!filtered.length && !showCreate && <p>{emptyText}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EditSessionModal({
   session,
   projects,
@@ -1708,19 +1938,54 @@ function EditSessionModal({
   const [projectOptions, setProjectOptions] = useState(projects);
   const [taskOptions, setTaskOptions] = useState(tasks);
   const [localCategories, setLocalCategories] = useState(categoryOptions);
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [creatingTask, setCreatingTask] = useState(false);
-  const [creatingCategory, setCreatingCategory] = useState(false);
-  const [newProjectName, setNewProjectName] = useState('');
-  const [newTaskName, setNewTaskName] = useState('');
-  const [newCategoryName, setNewCategoryName] = useState('');
   const [projectBusy, setProjectBusy] = useState(false);
   const [taskBusy, setTaskBusy] = useState(false);
   const [categoryBusy, setCategoryBusy] = useState(false);
   const [remember, setRemember] = useState(false);
   const [keyword, setKeyword] = useState('');
   const [pin, setPin] = useState(false);
-  const availableTasks = taskOptions.filter((task) => task.projectId === projectId);
+  const categorySearchOptions = useMemo<SearchSelectOption[]>(
+    () => localCategories.map((item) => ({
+      value: item.name,
+      label: item.name,
+      color: item.color,
+      meta: item.isBuiltin ? '内置分类' : '自定义分类',
+    })),
+    [localCategories],
+  );
+  const projectSearchOptions = useMemo<SearchSelectOption[]>(
+    () => [
+      { value: '', label: '暂不指定', meta: '不关联项目' },
+      ...[...projectOptions]
+        .sort((left, right) => Number(right.category === category) - Number(left.category === category))
+        .map((project) => ({
+          value: project.id,
+          label: project.name,
+          meta: project.category,
+          color: project.color || categoryColor(project.category),
+          keywords: [project.category],
+        })),
+    ],
+    [category, projectOptions],
+  );
+  const taskSearchOptions = useMemo<SearchSelectOption[]>(
+    () => [
+      { value: '', label: '暂不指定', meta: '不关联任务' },
+      ...[...taskOptions]
+        .sort((left, right) => Number(right.projectId === projectId) - Number(left.projectId === projectId))
+        .map((task) => {
+          const project = projectOptions.find((item) => item.id === task.projectId);
+          return {
+            value: task.id,
+            label: task.title,
+            meta: project ? `${project.name} · ${project.category}` : '项目已删除',
+            color: project?.color || categoryColor(project?.category || '杂务'),
+            keywords: project ? [project.name, project.category] : [],
+          };
+        }),
+    ],
+    [projectId, projectOptions, taskOptions],
+  );
 
   useEffect(() => setProjectOptions(projects), [projects]);
   useEffect(() => setTaskOptions(tasks), [tasks]);
@@ -1734,8 +1999,33 @@ function EditSessionModal({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  const createProject = async () => {
-    const name = newProjectName.trim();
+  const selectCategory = (name: string) => {
+    setCategory(name);
+    const selectedProject = projectOptions.find((project) => project.id === projectId);
+    if (selectedProject && selectedProject.category !== name) {
+      setProjectId('');
+      setTaskId('');
+    }
+  };
+
+  const selectProject = (id: string) => {
+    setProjectId(id);
+    setTaskId('');
+    const selectedProject = projectOptions.find((project) => project.id === id);
+    if (selectedProject) setCategory(selectedProject.category);
+  };
+
+  const selectTask = (id: string) => {
+    setTaskId(id);
+    const selectedTask = taskOptions.find((task) => task.id === id);
+    if (!selectedTask) return;
+    setProjectId(selectedTask.projectId);
+    const selectedProject = projectOptions.find((project) => project.id === selectedTask.projectId);
+    if (selectedProject) setCategory(selectedProject.category);
+  };
+
+  const createProject = async (rawName: string) => {
+    const name = rawName.trim();
     if (!name || projectBusy) return;
     setProjectBusy(true);
     try {
@@ -1746,8 +2036,6 @@ function EditSessionModal({
       setProjectOptions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
       setProjectId(created.id);
       setTaskId('');
-      setNewProjectName('');
-      setCreatingProject(false);
     } catch {
       // runAction already reports the error in the app toast.
     } finally {
@@ -1765,6 +2053,7 @@ function EditSessionModal({
     try {
       await runAction(() => api.deleteProject(project.id), `项目“${project.name}”已删除`);
       setProjectOptions((current) => current.filter((item) => item.id !== project.id));
+      setTaskOptions((current) => current.filter((item) => item.projectId !== project.id));
       setProjectId('');
       setTaskId('');
     } catch {
@@ -1774,16 +2063,16 @@ function EditSessionModal({
     }
   };
 
-  const createCategory = async () => {
-    const name = newCategoryName.trim();
+  const createCategory = async (rawName: string) => {
+    const name = rawName.trim();
     if (!name || categoryBusy) return;
     setCategoryBusy(true);
     try {
       const created = (await runAction(() => api.createCategory(name), `分类“${name}”已创建`)) as CategoryOption;
       setLocalCategories((current) => [...current, created]);
-      setCategory(created.name);
-      setNewCategoryName('');
-      setCreatingCategory(false);
+      selectCategory(created.name);
+    } catch {
+      // runAction already reports the error in the app toast.
     } finally {
       setCategoryBusy(false);
     }
@@ -1797,22 +2086,25 @@ function EditSessionModal({
     try {
       await runAction(() => api.deleteCategory(selected.name), `分类“${selected.name}”已删除`);
       setLocalCategories((current) => current.filter((item) => item.name !== selected.name));
+      setProjectOptions((current) => current.map((project) => (
+        project.category === selected.name ? { ...project, category: '杂务' } : project
+      )));
       setCategory('杂务');
     } finally {
       setCategoryBusy(false);
     }
   };
 
-  const createTask = async () => {
-    const title = newTaskName.trim();
+  const createTask = async (rawTitle: string) => {
+    const title = rawTitle.trim();
     if (!projectId || !title || taskBusy) return;
     setTaskBusy(true);
     try {
       const created = (await runAction(() => api.createTask(projectId, title), `任务“${title}”已创建`)) as Task;
       setTaskOptions((current) => [created, ...current]);
       setTaskId(created.id);
-      setNewTaskName('');
-      setCreatingTask(false);
+    } catch {
+      // runAction already reports the error in the app toast.
     } finally {
       setTaskBusy(false);
     }
@@ -1871,13 +2163,20 @@ function EditSessionModal({
         <div className="field-grid">
           <Field label="分类">
             <div className="project-picker">
-              <select value={category} onChange={(event) => setCategory(event.target.value)}>
-                {localCategories.map((item) => <option key={item.name}>{item.name}</option>)}
-              </select>
-              <div className="project-picker-actions">
-                <button onClick={() => setCreatingCategory((current) => !current)} type="button">
-                  <Plus size={15} />新建
-                </button>
+              <SearchCreateSelect
+                busy={categoryBusy}
+                canCreate={(query) => !localCategories.some(
+                  (item) => normalizeSearchText(item.name) === normalizeSearchText(query),
+                )}
+                createLabel={(query) => `新建分类“${query}”`}
+                inputLabel="搜索或新建分类"
+                onChange={selectCategory}
+                onCreate={createCategory}
+                options={categorySearchOptions}
+                placeholder="输入分类名称"
+                value={category}
+              />
+              <div className="project-picker-actions single">
                 <button
                   className="danger-button"
                   disabled={localCategories.find((item) => item.name === category)?.isBuiltin !== false || categoryBusy}
@@ -1887,51 +2186,25 @@ function EditSessionModal({
                   <Trash2 size={15} />删除
                 </button>
               </div>
-              {creatingCategory && (
-                <div className="inline-project-create">
-                  <input
-                    value={newCategoryName}
-                    onChange={(event) => setNewCategoryName(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault();
-                        void createCategory();
-                      }
-                    }}
-                    placeholder="分类名称"
-                    autoFocus
-                  />
-                  <button className="primary" disabled={!newCategoryName.trim() || categoryBusy} onClick={() => void createCategory()} type="button">
-                    <Check size={15} />创建
-                  </button>
-                </div>
-              )}
             </div>
           </Field>
           <Field label="项目">
             <div className="project-picker">
-              <select
+              <SearchCreateSelect
+                busy={projectBusy}
+                canCreate={(query) => Boolean(category) && !projectOptions.some(
+                  (project) => project.category === category
+                    && normalizeSearchText(project.name) === normalizeSearchText(query),
+                )}
+                createLabel={(query) => `在“${category}”中新建“${query}”`}
+                inputLabel="搜索或新建项目"
+                onChange={selectProject}
+                onCreate={createProject}
+                options={projectSearchOptions}
+                placeholder="搜索全部项目"
                 value={projectId}
-                onChange={(event) => {
-                  setProjectId(event.target.value);
-                  setTaskId('');
-                  const selectedProject = projectOptions.find((project) => project.id === event.target.value);
-                  if (selectedProject) setCategory(selectedProject.category);
-                }}
-              >
-                <option value="">未归类 / 暂不指定</option>
-                {projectOptions.map((project) => (
-                  <option key={project.id} value={project.id}>{project.name}</option>
-                ))}
-              </select>
-              <div className="project-picker-actions">
-                <button
-                  onClick={() => setCreatingProject((current) => !current)}
-                  type="button"
-                  aria-expanded={creatingProject}
-                >
-                  <Plus size={15} />新建
-                </button>
+              />
+              <div className="project-picker-actions single">
                 <button
                   className="danger-button"
                   disabled={!projectId || projectBusy}
@@ -1941,67 +2214,33 @@ function EditSessionModal({
                   <Trash2 size={15} />删除
                 </button>
               </div>
-              {creatingProject && (
-                <div className="inline-project-create">
-                  <input
-                    value={newProjectName}
-                    onChange={(event) => setNewProjectName(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault();
-                        void createProject();
-                      }
-                    }}
-                    placeholder="项目名称"
-                    autoFocus
-                  />
-                  <button
-                    className="primary"
-                    disabled={!newProjectName.trim() || projectBusy}
-                    onClick={() => void createProject()}
-                    type="button"
-                  >
-                    <Check size={15} />创建
-                  </button>
-                </div>
-              )}
             </div>
           </Field>
           <Field label="任务">
             <div className="project-picker">
-              <select value={taskId} onChange={(event) => setTaskId(event.target.value)} disabled={!projectId}>
-                <option value="">暂不指定</option>
-                {availableTasks.map((task) => (
-                  <option key={task.id} value={task.id}>{task.title}</option>
-                ))}
-              </select>
-              <div className="project-picker-actions">
-                <button disabled={!projectId} onClick={() => setCreatingTask((current) => !current)} type="button">
-                  <Plus size={15} />新建
-                </button>
+              <SearchCreateSelect
+                busy={taskBusy}
+                canCreate={(query) => Boolean(projectId) && !taskOptions.some(
+                  (task) => task.projectId === projectId
+                    && normalizeSearchText(task.title) === normalizeSearchText(query),
+                )}
+                createLabel={(query) => {
+                  const project = projectOptions.find((item) => item.id === projectId);
+                  return `在“${project?.name || '当前项目'}”中新建“${query}”`;
+                }}
+                emptyText={projectId ? '没有匹配任务' : '没有匹配任务；选择已有任务会自动带出项目和分类'}
+                inputLabel="搜索或新建任务"
+                onChange={selectTask}
+                onCreate={createTask}
+                options={taskSearchOptions}
+                placeholder="搜索全部项目中的任务"
+                value={taskId}
+              />
+              <div className="project-picker-actions single">
                 <button className="danger-button" disabled={!taskId || taskBusy} onClick={() => void deleteSelectedTask()} type="button">
                   <Trash2 size={15} />删除
                 </button>
               </div>
-              {creatingTask && (
-                <div className="inline-project-create">
-                  <input
-                    value={newTaskName}
-                    onChange={(event) => setNewTaskName(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault();
-                        void createTask();
-                      }
-                    }}
-                    placeholder="任务名称"
-                    autoFocus
-                  />
-                  <button className="primary" disabled={!projectId || !newTaskName.trim() || taskBusy} onClick={() => void createTask()} type="button">
-                    <Check size={15} />创建
-                  </button>
-                </div>
-              )}
             </div>
           </Field>
         </div>

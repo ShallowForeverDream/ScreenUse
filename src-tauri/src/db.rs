@@ -329,14 +329,14 @@ impl AppDb {
         }
         let duplicate = conn
             .query_row(
-                "SELECT 1 FROM projects WHERE name=?1 LIMIT 1",
-                params![name],
+                "SELECT 1 FROM projects WHERE name=?1 AND category=?2 LIMIT 1",
+                params![name, category],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
             .is_some();
         if duplicate {
-            bail!("同名项目已存在，请直接选择它");
+            bail!("该分类下已有同名项目，请直接选择它");
         }
 
         let timestamp = now();
@@ -845,8 +845,8 @@ impl AppDb {
         let name = clean_name(name, "自动发现项目");
         let category = clean_name(category, "杂务");
         let conn = self.conn.lock();
-        if let Some(id) = conn.query_row("SELECT id FROM projects WHERE name=?1 LIMIT 1", params![name], |r| r.get::<_, String>(0)).optional()? {
-            conn.execute("UPDATE projects SET category=?1, updated_at=?2 WHERE id=?3", params![category, now(), id])?;
+        if let Some(id) = conn.query_row("SELECT id FROM projects WHERE name=?1 AND category=?2 LIMIT 1", params![name, category], |r| r.get::<_, String>(0)).optional()? {
+            conn.execute("UPDATE projects SET updated_at=?1 WHERE id=?2", params![now(), id])?;
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
@@ -1377,6 +1377,27 @@ mod tests {
             .expect("session");
         assert!(session.project_id.is_none());
         assert!(session.task_id.is_none());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn same_names_are_scoped_by_category_and_project() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-same-name-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let first_category = db.create_category("分类甲").expect("create first category");
+        let second_category = db.create_category("分类乙").expect("create second category");
+        let first_project = db.create_project("同名项目", &first_category.name).expect("create first project");
+        let second_project = db.create_project("同名项目", &second_category.name).expect("create second project");
+
+        assert_ne!(first_project.id, second_project.id);
+        assert!(db.create_project("同名项目", &first_category.name).is_err());
+
+        let first_task = db.create_task(&first_project.id, "同名任务").expect("create first task");
+        let second_task = db.create_task(&second_project.id, "同名任务").expect("create second task");
+        assert_ne!(first_task.id, second_task.id);
+        assert!(db.create_task(&first_project.id, "同名任务").is_err());
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
