@@ -155,6 +155,8 @@ export interface SessionPatch {
   summary?: string;
   projectId?: string | null;
   taskId?: string | null;
+  clearProject?: boolean;
+  clearTask?: boolean;
   category?: string;
   confidence?: number;
   userConfirmed?: boolean;

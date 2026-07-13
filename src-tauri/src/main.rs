@@ -70,6 +70,15 @@ fn update_session(
 }
 
 #[tauri::command]
+fn update_sessions(
+    state: State<AppState>,
+    ids: Vec<String>,
+    patch: SessionPatch,
+) -> Result<Vec<models::WorkSession>, String> {
+    state.db.update_sessions(&ids, patch).map_err(map_err)
+}
+
+#[tauri::command]
 fn create_project(
     state: State<AppState>,
     name: String,
@@ -389,6 +398,7 @@ fn main() {
             stop_collector,
             collector_health,
             update_session,
+            update_sessions,
             create_project,
             delete_project,
             create_category,

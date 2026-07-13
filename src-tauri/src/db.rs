@@ -11,6 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
+
 pub struct AppDb {
     conn: Mutex<Connection>,
     db_path: PathBuf,
@@ -213,7 +215,30 @@ impl AppDb {
     pub fn get_settings(&self) -> Result<AppSettings> {
         let conn = self.conn.lock();
         let raw: Option<String> = conn.query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0)).optional()?;
-        Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+        let mut settings: AppSettings = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let migration_done = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![ONE_SECOND_SAMPLING_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !migration_done {
+            settings.poll_interval_seconds = 1;
+            settings.heartbeat_seconds = 1;
+            let timestamp = now();
+            conn.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES('app_settings',?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![serde_json::to_string(&settings)?, timestamp],
+            )?;
+            conn.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+                params![ONE_SECOND_SAMPLING_MIGRATION_KEY, timestamp],
+            )?;
+        }
+        Ok(settings)
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
@@ -538,12 +563,17 @@ impl AppDb {
 
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
-        let project_changed = patch
-            .project_id
-            .as_deref()
-            .is_some_and(|project_id| current.project_id.as_deref() != Some(project_id));
-        let project_id = patch.project_id.or(current.project_id);
-        let task_id = if patch.task_id.is_some() {
+        let clear_project = patch.clear_project.unwrap_or(false);
+        let clear_task = patch.clear_task.unwrap_or(false) || clear_project;
+        let project_id = if clear_project {
+            None
+        } else {
+            patch.project_id.or(current.project_id.clone())
+        };
+        let project_changed = project_id != current.project_id;
+        let task_id = if clear_task {
+            None
+        } else if patch.task_id.is_some() {
             patch.task_id
         } else if project_changed {
             None
@@ -561,6 +591,20 @@ impl AppDb {
         )?;
         drop(conn);
         self.get_session(id)?.context("session disappeared after update")
+    }
+
+    pub fn update_sessions(&self, ids: &[String], patch: SessionPatch) -> Result<Vec<WorkSession>> {
+        if ids.is_empty() {
+            bail!("请至少选择一条会话");
+        }
+        if ids.len() > 500 {
+            bail!("单次最多修正 500 条会话");
+        }
+        let mut updated = Vec::with_capacity(ids.len());
+        for id in ids {
+            updated.push(self.update_session(id, patch.clone())?);
+        }
+        Ok(updated)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<WorkSession>> {
@@ -1320,6 +1364,81 @@ mod tests {
     }
 
     #[test]
+    fn existing_sampling_settings_migrate_to_one_second_only_once() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-sampling-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let mut settings = AppSettings::default();
+        settings.poll_interval_seconds = 10;
+        settings.heartbeat_seconds = 10;
+        db.save_settings(&settings).expect("save legacy settings");
+
+        let migrated = db.get_settings().expect("migrate settings");
+        assert_eq!(migrated.poll_interval_seconds, 1);
+        assert_eq!(migrated.heartbeat_seconds, 1);
+
+        settings.poll_interval_seconds = 7;
+        settings.heartbeat_seconds = 7;
+        db.save_settings(&settings).expect("save user override");
+        let preserved = db.get_settings().expect("load user override");
+        assert_eq!(preserved.poll_interval_seconds, 7);
+        assert_eq!(preserved.heartbeat_seconds, 7);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn multiple_selected_sessions_are_corrected_together() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-bulk-correction-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("批量修正项目", "学习").expect("create project");
+        let task = db.create_task(&project.id, "旧任务").expect("create task");
+        let sessions = db.list_sessions(2).expect("list sessions");
+        let ids = sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>();
+        for id in &ids {
+            db.update_session(
+                id,
+                SessionPatch {
+                    summary: None,
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some("学习".into()),
+                    confidence: None,
+                    user_confirmed: Some(false),
+                },
+            )
+            .expect("prepare session");
+        }
+
+        let updated = db
+            .update_sessions(
+                &ids,
+                SessionPatch {
+                    summary: None,
+                    project_id: None,
+                    task_id: None,
+                    clear_project: Some(true),
+                    clear_task: Some(true),
+                    category: Some("杂务".into()),
+                    confidence: Some(0.98),
+                    user_confirmed: Some(true),
+                },
+            )
+            .expect("bulk correct sessions");
+
+        assert_eq!(updated.len(), 2);
+        assert!(updated.iter().all(|session| session.category == "杂务"));
+        assert!(updated.iter().all(|session| session.project_id.is_none()));
+        assert!(updated.iter().all(|session| session.task_id.is_none()));
+        assert!(updated.iter().all(|session| session.user_confirmed));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn deleting_a_project_unassigns_its_sessions_and_tasks() {
         let data_dir = std::env::temp_dir().join(format!("screenuse-project-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
@@ -1334,6 +1453,8 @@ mod tests {
                 summary: None,
                 project_id: Some(project.id.clone()),
                 task_id: Some(task_id),
+                clear_project: Some(false),
+                clear_task: Some(false),
                 category: None,
                 confidence: None,
                 user_confirmed: None,
@@ -1450,6 +1571,8 @@ mod tests {
                 summary: Some("ICPC 网站开发".into()),
                 project_id: Some(project.id.clone()),
                 task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
                 category: Some("开发".into()),
                 confidence: Some(0.98),
                 user_confirmed: Some(true),

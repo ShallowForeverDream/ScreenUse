@@ -19,8 +19,8 @@ export const fallbackDashboard: DashboardData = {
   settings: {
     language: 'zh-CN',
     theme: 'light',
-    pollIntervalSeconds: 10,
-    heartbeatSeconds: 10,
+    pollIntervalSeconds: 1,
+    heartbeatSeconds: 1,
     rawEventRetentionDays: 30,
     idleThresholdSeconds: 180,
     passiveContentCountsAsActive: true,

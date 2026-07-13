@@ -239,8 +239,8 @@ impl Default for AppSettings {
         Self {
             language: "zh-CN".into(),
             theme: "light".into(),
-            poll_interval_seconds: 10,
-            heartbeat_seconds: 10,
+            poll_interval_seconds: 1,
+            heartbeat_seconds: 1,
             raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
             passive_content_counts_as_active: true,
@@ -277,7 +277,7 @@ impl AppSettings {
             _ => "light",
         }
         .into();
-        self.poll_interval_seconds = self.poll_interval_seconds.clamp(10, 60);
+        self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 60);
         self.heartbeat_seconds = self.poll_interval_seconds;
         self.raw_event_retention_days = self.raw_event_retention_days.clamp(7, 3650);
         self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
@@ -325,6 +325,8 @@ pub struct SessionPatch {
     pub summary: Option<String>,
     pub project_id: Option<String>,
     pub task_id: Option<String>,
+    pub clear_project: Option<bool>,
+    pub clear_task: Option<bool>,
     pub category: Option<String>,
     pub confidence: Option<f32>,
     pub user_confirmed: Option<bool>,
@@ -338,7 +340,7 @@ mod tests {
     fn theme_defaults_and_normalizes_for_existing_settings() {
         let existing: AppSettings = serde_json::from_str("{}").expect("deserialize defaults");
         assert_eq!(existing.theme, "light");
-        assert_eq!(existing.poll_interval_seconds, 10);
+        assert_eq!(existing.poll_interval_seconds, 1);
         assert!(existing.passive_content_counts_as_active);
 
         let mut invalid = AppSettings::default();
@@ -354,7 +356,7 @@ mod tests {
         )
         .expect("deserialize legacy sampling settings");
         let migrated = legacy.normalized();
-        assert_eq!(migrated.poll_interval_seconds, 10);
-        assert_eq!(migrated.heartbeat_seconds, 10);
+        assert_eq!(migrated.poll_interval_seconds, 2);
+        assert_eq!(migrated.heartbeat_seconds, 2);
     }
 }

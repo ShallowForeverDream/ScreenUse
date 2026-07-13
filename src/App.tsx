@@ -52,6 +52,7 @@ import type {
   CategoryOption,
   DashboardData,
   Project,
+  SessionPatch,
   Task,
   ThemeMode,
   WorkSession,
@@ -130,7 +131,7 @@ export default function App() {
   const [toast, setToast] = useState('');
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
-  const [editing, setEditing] = useState<WorkSession | null>(null);
+  const [editing, setEditing] = useState<WorkSession[]>([]);
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
 
   const load = useCallback(async () => {
@@ -413,7 +414,7 @@ export default function App() {
             projects={data.projects}
             stats={stats}
             selectedDate={selectedDate}
-            onEdit={setEditing}
+            onEdit={(session) => setEditing([session])}
             onOpenTimeline={() => setActiveTab('timeline')}
             planItems={data.planItems}
           />
@@ -444,22 +445,33 @@ export default function App() {
         )}
       </main>
 
-      {editing && (
+      {editing.length > 0 && (
         <EditSessionModal
-          session={editing}
+          sessions={editing}
           projects={data.projects}
           tasks={data.tasks}
           categoryOptions={data.categoryOptions}
-          onClose={() => setEditing(null)}
-          onSave={async (session, patch, options) => {
+          onClose={() => setEditing([])}
+          onSave={async (sessions, patch, options) => {
             await runAction(async () => {
-              await api.updateSession(session.id, patch);
-              if (options.remember) await api.learnRuleFromSession(session.id, options.keyword);
+              await api.updateSessions(sessions.map((session) => session.id), patch);
+              if (options.remember) {
+                for (const session of sessions) {
+                  await api.learnRuleFromSession(session.id, options.keyword);
+                }
+              }
               if (options.pin && patch.projectId) {
                 await api.pinContext(patch.projectId, patch.taskId, 30);
               }
-            }, options.pin ? '已修正，并固定当前事务 30 分钟' : options.remember ? '已修正并记住规则' : '会话已修正');
-            setEditing(null);
+            }, sessions.length > 1
+              ? `已统一修正 ${sessions.length} 条会话`
+              : options.pin
+                ? '已修正，并固定当前事务 30 分钟'
+                : options.remember
+                  ? '已修正并记住规则'
+                  : '会话已修正');
+            setEditing([]);
+            if (sessions.length > 1) setSelected(new Set());
           }}
           runAction={runAction}
         />
@@ -1014,7 +1026,7 @@ function TimelineView({
   tasks: Task[];
   selected: Set<string>;
   setSelected: (next: Set<string>) => void;
-  onEdit: (session: WorkSession) => void;
+  onEdit: (sessions: WorkSession[]) => void;
   runAction: ActionRunner;
 }) {
   const [query, setQuery] = useState('');
@@ -1035,6 +1047,7 @@ function TimelineView({
       .toLowerCase()
       .includes(normalized);
   });
+  const selectedSessions = sessions.filter((session) => selected.has(session.id));
 
   const toggle = (id: string) => {
     const next = new Set(selected);
@@ -1050,6 +1063,10 @@ function TimelineView({
     if (!summary) return;
     await api.mergeSessions(ids, summary);
     setSelected(new Set());
+  };
+
+  const editSession = (session: WorkSession) => {
+    onEdit(selectedSessions.length > 1 ? selectedSessions : [session]);
   };
 
   return (
@@ -1073,6 +1090,13 @@ function TimelineView({
             只看待复核
           </label>
           <button
+            disabled={!selectedSessions.length}
+            onClick={() => onEdit(selectedSessions)}
+            type="button"
+          >
+            <Pencil size={15} />修正 {selectedSessions.length || ''}
+          </button>
+          <button
             disabled={selected.size < 2}
             onClick={() => void runAction(mergeSelected, '已合并所选会话')}
             type="button"
@@ -1088,7 +1112,7 @@ function TimelineView({
               session={session}
               selected={selected.has(session.id)}
               onToggle={() => toggle(session.id)}
-              onEdit={() => onEdit(session)}
+              onEdit={() => editSession(session)}
               onConfirm={() =>
                 void runAction(
                   () =>
@@ -1436,7 +1460,7 @@ function SettingsView({
           <Field label="观察与更新间隔" hint="每次只延长当前时间块；检测到稳定切换才新建一块。">
             <NumberInput
               value={settings.pollIntervalSeconds}
-              min={10}
+              min={1}
               max={60}
               suffix="秒"
               onChange={(value) => update('pollIntervalSeconds', value)}
@@ -1904,7 +1928,7 @@ function SearchCreateSelect({
 }
 
 function EditSessionModal({
-  session,
+  sessions,
   projects,
   tasks,
   categoryOptions,
@@ -1912,29 +1936,31 @@ function EditSessionModal({
   onSave,
   runAction,
 }: {
-  session: WorkSession;
+  sessions: WorkSession[];
   projects: Project[];
   tasks: Task[];
   categoryOptions: CategoryOption[];
   onClose: () => void;
   onSave: (
-    session: WorkSession,
-    patch: {
-      summary: string;
-      projectId?: string | null;
-      taskId?: string | null;
-      category: string;
-      confidence: number;
-      userConfirmed: boolean;
-    },
+    sessions: WorkSession[],
+    patch: SessionPatch,
     options: { remember: boolean; keyword?: string; pin: boolean },
   ) => Promise<void>;
   runAction: ActionRunner;
 }) {
+  const session = sessions[0];
+  const isBulk = sessions.length > 1;
+  const sharedValue = <T,>(read: (item: WorkSession) => T) => {
+    const first = read(session);
+    return sessions.every((item) => read(item) === first) ? first : undefined;
+  };
   const [summary, setSummary] = useState(session.summary);
-  const [category, setCategory] = useState(session.category);
-  const [projectId, setProjectId] = useState(session.projectId || '');
-  const [taskId, setTaskId] = useState(session.taskId || '');
+  const [category, setCategory] = useState(sharedValue((item) => item.category) || '');
+  const [projectId, setProjectId] = useState(sharedValue((item) => item.projectId || '') || '');
+  const [taskId, setTaskId] = useState(sharedValue((item) => item.taskId || '') || '');
+  const [categoryTouched, setCategoryTouched] = useState(false);
+  const [projectTouched, setProjectTouched] = useState(false);
+  const [taskTouched, setTaskTouched] = useState(false);
   const [projectOptions, setProjectOptions] = useState(projects);
   const [taskOptions, setTaskOptions] = useState(tasks);
   const [localCategories, setLocalCategories] = useState(categoryOptions);
@@ -2001,27 +2027,40 @@ function EditSessionModal({
 
   const selectCategory = (name: string) => {
     setCategory(name);
+    setCategoryTouched(true);
     const selectedProject = projectOptions.find((project) => project.id === projectId);
     if (selectedProject && selectedProject.category !== name) {
       setProjectId('');
       setTaskId('');
+      setProjectTouched(true);
+      setTaskTouched(true);
     }
   };
 
   const selectProject = (id: string) => {
     setProjectId(id);
     setTaskId('');
+    setProjectTouched(true);
+    setTaskTouched(true);
     const selectedProject = projectOptions.find((project) => project.id === id);
-    if (selectedProject) setCategory(selectedProject.category);
+    if (selectedProject) {
+      setCategory(selectedProject.category);
+      setCategoryTouched(true);
+    }
   };
 
   const selectTask = (id: string) => {
     setTaskId(id);
+    setTaskTouched(true);
     const selectedTask = taskOptions.find((task) => task.id === id);
     if (!selectedTask) return;
     setProjectId(selectedTask.projectId);
+    setProjectTouched(true);
     const selectedProject = projectOptions.find((project) => project.id === selectedTask.projectId);
-    if (selectedProject) setCategory(selectedProject.category);
+    if (selectedProject) {
+      setCategory(selectedProject.category);
+      setCategoryTouched(true);
+    }
   };
 
   const createProject = async (rawName: string) => {
@@ -2036,6 +2075,8 @@ function EditSessionModal({
       setProjectOptions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
       setProjectId(created.id);
       setTaskId('');
+      setProjectTouched(true);
+      setTaskTouched(true);
     } catch {
       // runAction already reports the error in the app toast.
     } finally {
@@ -2056,6 +2097,8 @@ function EditSessionModal({
       setTaskOptions((current) => current.filter((item) => item.projectId !== project.id));
       setProjectId('');
       setTaskId('');
+      setProjectTouched(true);
+      setTaskTouched(true);
     } catch {
       // runAction already reports the error in the app toast.
     } finally {
@@ -2090,6 +2133,13 @@ function EditSessionModal({
         project.category === selected.name ? { ...project, category: '杂务' } : project
       )));
       setCategory('杂务');
+      setCategoryTouched(true);
+      if (projectId && projectOptions.find((project) => project.id === projectId)?.category === selected.name) {
+        setProjectId('');
+        setTaskId('');
+        setProjectTouched(true);
+        setTaskTouched(true);
+      }
     } finally {
       setCategoryBusy(false);
     }
@@ -2103,6 +2153,7 @@ function EditSessionModal({
       const created = (await runAction(() => api.createTask(projectId, title), `任务“${title}”已创建`)) as Task;
       setTaskOptions((current) => [created, ...current]);
       setTaskId(created.id);
+      setTaskTouched(true);
     } catch {
       // runAction already reports the error in the app toast.
     } finally {
@@ -2119,6 +2170,7 @@ function EditSessionModal({
       await runAction(() => api.deleteTask(task.id), `任务“${task.title}”已删除`);
       setTaskOptions((current) => current.filter((item) => item.id !== task.id));
       setTaskId('');
+      setTaskTouched(true);
     } finally {
       setTaskBusy(false);
     }
@@ -2147,9 +2199,14 @@ function EditSessionModal({
       >
         <div className="modal-head">
           <div>
-            <h2 id="edit-session-title">修正会话</h2>
+            <h2 id="edit-session-title">{isBulk ? '批量修正' : '修正会话'}</h2>
             <p>
-              {formatDateTime(session.startedAt)} · {formatDuration(minutesBetween(session.startedAt, session.endedAt))}
+              {isBulk
+                ? `${sessions.length} 条会话 · ${formatDuration(sessions.reduce(
+                  (total, item) => total + minutesBetween(item.startedAt, item.endedAt),
+                  0,
+                ))}`
+                : `${formatDateTime(session.startedAt)} · ${formatDuration(minutesBetween(session.startedAt, session.endedAt))}`}
             </p>
           </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
@@ -2157,9 +2214,11 @@ function EditSessionModal({
           </button>
         </div>
 
-        <Field label="摘要">
-          <input value={summary} onChange={(event) => setSummary(event.target.value)} autoFocus />
-        </Field>
+        {!isBulk && (
+          <Field label="摘要">
+            <input value={summary} onChange={(event) => setSummary(event.target.value)} autoFocus />
+          </Field>
+        )}
         <div className="field-grid">
           <Field label="分类">
             <div className="project-picker">
@@ -2263,46 +2322,59 @@ function EditSessionModal({
           )}
         </div>
 
-        <details className="modal-evidence">
-          <summary>判断依据</summary>
-          {session.evidence.length ? (
-            session.evidence.map((item, index) => (
-              <span key={`${item.kind}-${index}`}>
-                <b>{item.label}</b>{item.value}
-              </span>
-            ))
-          ) : (
-            <span>没有附加元数据</span>
-          )}
-        </details>
+        {!isBulk && (
+          <>
+            <details className="modal-evidence">
+              <summary>判断依据</summary>
+              {session.evidence.length ? (
+                session.evidence.map((item, index) => (
+                  <span key={`${item.kind}-${index}`}>
+                    <b>{item.label}</b>{item.value}
+                  </span>
+                ))
+              ) : (
+                <span>没有附加元数据</span>
+              )}
+            </details>
 
-        <div className="modal-secondary">
-          <button onClick={() => void runAction(split, '会话已拆分')} type="button">
-            <SplitSquareHorizontal size={16} />拆分
-          </button>
-        </div>
+            <div className="modal-secondary">
+              <button onClick={() => void runAction(split, '会话已拆分')} type="button">
+                <SplitSquareHorizontal size={16} />拆分
+              </button>
+            </div>
+          </>
+        )}
 
         <div className="modal-actions">
           <button onClick={onClose} type="button">取消</button>
           <button
             className="primary"
-            onClick={() =>
-              void onSave(
-                session,
-                {
-                  summary: summary.trim() || session.summary,
-                  projectId: projectId || null,
-                  taskId: taskId || null,
-                  category,
-                  confidence: Math.max(0.96, session.confidence),
-                  userConfirmed: true,
-                },
-                { remember, keyword: keyword.trim() || undefined, pin },
-              )
-            }
+            disabled={isBulk && !categoryTouched && !projectTouched && !taskTouched}
+            onClick={() => {
+              const patch: SessionPatch = isBulk
+                ? {
+                    ...(categoryTouched ? { category } : {}),
+                    ...(projectTouched
+                      ? { projectId: projectId || undefined, clearProject: !projectId }
+                      : {}),
+                    ...(taskTouched ? { taskId: taskId || undefined, clearTask: !taskId } : {}),
+                    userConfirmed: true,
+                  }
+                : {
+                    summary: summary.trim() || session.summary,
+                    projectId: projectId || undefined,
+                    taskId: taskId || undefined,
+                    clearProject: !projectId,
+                    clearTask: !taskId,
+                    category,
+                    confidence: Math.max(0.96, session.confidence),
+                    userConfirmed: true,
+                  };
+              void onSave(sessions, patch, { remember, keyword: keyword.trim() || undefined, pin });
+            }}
             type="button"
           >
-            <Check size={17} />保存并确认
+            <Check size={17} />{isBulk ? `统一修正 ${sessions.length} 条` : '保存并确认'}
           </button>
         </div>
       </section>

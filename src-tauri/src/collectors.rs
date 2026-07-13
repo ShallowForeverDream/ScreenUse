@@ -199,16 +199,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     }
                 }
 
-                let idle = active
-                    .as_ref()
-                    .map(|current| current.event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64)
-                    .unwrap_or(false);
-                let poll_seconds = if idle {
-                    settings.poll_interval_seconds.max(10)
-                } else {
-                    settings.poll_interval_seconds
-                };
-                sleep(Duration::from_secs(poll_seconds as u64)).await;
+                sleep(Duration::from_secs(settings.poll_interval_seconds as u64)).await;
             }
         });
         Ok(())
@@ -310,7 +301,7 @@ fn close_context_at(collector: &DesktopCollector, db: &AppDb, previous: ActiveCo
 }
 
 fn is_unexpected_observation_gap(elapsed: Duration, poll_interval_seconds: u32) -> bool {
-    let expected = u64::from(poll_interval_seconds.max(10));
+    let expected = u64::from(poll_interval_seconds.max(1));
     elapsed > Duration::from_secs(expected.saturating_mul(4).max(60))
 }
 

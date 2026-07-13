@@ -17,6 +17,7 @@ export const api = {
   startCollector: () => call<void>('start_collector'),
   stopCollector: () => call<void>('stop_collector'),
   updateSession: (id: string, patch: SessionPatch) => call<WorkSession>('update_session', { id, patch }),
+  updateSessions: (ids: string[], patch: SessionPatch) => call<WorkSession[]>('update_sessions', { ids, patch }, []),
   createProject: (name: string, category: string) =>
     call<Project>('create_project', { name, category }, {
       id: `preview-${Date.now()}`,
