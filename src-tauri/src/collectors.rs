@@ -106,6 +106,19 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     }
                 };
                 context_store::enrich_event(&mut event);
+                if settings.passive_content_counts_as_active
+                    && event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64
+                    && is_passive_attention(&event)
+                {
+                    let input_idle_seconds = event.input_stats.idle_seconds;
+                    mark_metadata(
+                        &mut event,
+                        "inputIdleSeconds",
+                        serde_json::Value::from(input_idle_seconds),
+                    );
+                    mark_metadata(&mut event, "passiveAttention", serde_json::Value::Bool(true));
+                    event.input_stats.idle_seconds = 0;
+                }
                 sanitize_event(&mut event);
                 let observation_gap = active.as_ref().is_some_and(|current| {
                     is_unexpected_observation_gap(current.last_observed_at.elapsed(), settings.poll_interval_seconds)
@@ -340,6 +353,61 @@ fn cap(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn is_passive_attention(event: &RawActivityEvent) -> bool {
+    let app = event.app.as_deref().unwrap_or_default().to_lowercase();
+    let title = event.window_title.as_deref().unwrap_or_default().to_lowercase();
+    let hay = format!(
+        "{app} {title} {}",
+        event.url.as_deref().unwrap_or_default().to_lowercase()
+    );
+    let meeting_app = [
+        "zoom",
+        "teams",
+        "webex",
+        "wemeet",
+        "tencentmeeting",
+        "feishu",
+        "lark",
+        "dingtalk",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    let media_app = [
+        "vlc",
+        "mpv",
+        "potplayer",
+        "wmplayer",
+        "media player",
+        "spotify",
+        "music",
+        "obs64",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    let passive_title = [
+        "会议",
+        "直播",
+        "课程",
+        "讲座",
+        "演示",
+        "放映",
+        "播放",
+        "meeting",
+        "webinar",
+        "lecture",
+        "youtube",
+        "bilibili",
+        "netflix",
+        "腾讯视频",
+        "爱奇艺",
+        "优酷",
+        "慕课",
+    ]
+    .iter()
+    .any(|needle| hay.contains(needle));
+    meeting_app || media_app || passive_title
+}
+
 #[cfg(windows)]
 unsafe fn process_image_path(pid: u32) -> Result<String> {
     use windows::core::PWSTR;
@@ -383,7 +451,7 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
         } else {
             GetWindowTextW(window, &mut buffer)
         };
-        let title = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
+        let native_title = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
 
         let mut pid = 0u32;
         let _ = GetWindowThreadProcessId(window, Some(&mut pid));
@@ -392,6 +460,15 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             .as_ref()
             .and_then(|path| PathBuf::from(path).file_name().map(|name| name.to_string_lossy().to_string()))
             .unwrap_or_else(|| format!("pid:{pid}"));
+        let chatgpt_context = if app.eq_ignore_ascii_case("chatgpt.exe") {
+            chatgpt_selected_context(window).ok().flatten()
+        } else {
+            None
+        };
+        let title = chatgpt_context
+            .as_ref()
+            .map(|context| context.title.clone())
+            .unwrap_or_else(|| native_title.clone());
 
         let mut last_input = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
@@ -403,6 +480,16 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             0
         };
 
+        let mut metadata = json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" });
+        let workspace = chatgpt_context.as_ref().and_then(|context| context.project.clone());
+        if let Some(context) = chatgpt_context {
+            metadata["nativeWindowTitle"] = serde_json::Value::String(native_title);
+            metadata["chatgptConversationTitle"] = serde_json::Value::String(context.title);
+            if let Some(project) = context.project {
+                metadata["chatgptProject"] = serde_json::Value::String(project);
+            }
+        }
+
         Ok(RawActivityEvent {
             id: String::new(),
             source: "windows-foreground".into(),
@@ -411,14 +498,111 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             window_title: Some(title),
             url: None,
             file_path: executable,
-            workspace: None,
+            workspace,
             input_stats: InputStats {
                 idle_seconds,
                 ..Default::default()
             },
-            metadata: json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" }),
+            metadata,
         })
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct ChatGptContext {
+    title: String,
+    project: Option<String>,
+}
+
+#[cfg(windows)]
+fn chatgpt_selected_context(
+    window: windows::Win32::Foundation::HWND,
+) -> Result<Option<ChatGptContext>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
+        UIA_NamePropertyId, UIA_TextControlTypeId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<ChatGptContext>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let mut action: Option<IUIAutomationElement> = None;
+            for label in [
+                "任务操作",
+                "对话操作",
+                "聊天操作",
+                "会话操作",
+                "Task options",
+                "Chat options",
+                "Conversation options",
+            ] {
+                let value = VARIANT::from(label);
+                let condition = automation.CreatePropertyCondition(UIA_NamePropertyId, &value)?;
+                if let Ok(element) = root.FindFirst(TreeScope_Descendants, &condition) {
+                    action = Some(element);
+                    break;
+                }
+            }
+            let Some(action) = action else { return Ok(None); };
+            let walker = automation.ControlViewWalker()?;
+            let parent = walker.GetParentElement(&action)?;
+            let mut child = walker.GetFirstChildElement(&parent).ok();
+            let mut title = None;
+            let mut project = None;
+            for _ in 0..10 {
+                let Some(element) = child else { break; };
+                let name = element.CurrentName().map(|value| value.to_string()).unwrap_or_default();
+                if let Some(value) = name
+                    .strip_prefix("项目：")
+                    .or_else(|| name.strip_prefix("Project: "))
+                    .or_else(|| name.strip_prefix("Project："))
+                {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        project = Some(value.to_string());
+                    }
+                } else if element.CurrentControlType().ok() == Some(UIA_TextControlTypeId)
+                    && valid_chatgpt_title(&name)
+                {
+                    title = Some(name.trim().to_string());
+                }
+                child = walker.GetNextSiblingElement(&element).ok();
+            }
+            Ok(title.map(|title| ChatGptContext { title, project }))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn valid_chatgpt_title(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= 220
+        && !matches!(
+            value,
+            "ChatGPT"
+                | "Codex"
+                | "任务操作"
+                | "对话操作"
+                | "聊天操作"
+                | "会话操作"
+                | "Task options"
+                | "Chat options"
+                | "Conversation options"
+        )
 }
 
 #[cfg(not(windows))]
@@ -521,5 +705,40 @@ mod tests {
         assert_eq!(candidate.signature, "search");
         assert_eq!(candidate.observations, 1);
         assert_eq!(candidate.first_event.timestamp, "2026-07-12T10:00:20Z");
+    }
+
+    #[test]
+    fn meetings_and_video_titles_count_as_passive_attention() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: String::new(),
+            app: Some("msedge.exe".into()),
+            window_title: Some("系统设计课程 - Bilibili".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats { idle_seconds: 900, ..Default::default() },
+            metadata: json!({}),
+        };
+        assert!(is_passive_attention(&event));
+        assert!(is_passive_attention(&RawActivityEvent {
+            app: Some("Zoom.exe".into()),
+            window_title: Some("Weekly sync".into()),
+            ..event.clone()
+        }));
+        assert!(!is_passive_attention(&RawActivityEvent {
+            app: Some("notepad.exe".into()),
+            window_title: Some("notes.txt".into()),
+            ..event
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chatgpt_title_filter_rejects_only_generic_chrome() {
+        assert!(valid_chatgpt_title("自动记录时间优化"));
+        assert!(!valid_chatgpt_title("ChatGPT"));
+        assert!(!valid_chatgpt_title("  "));
     }
 }

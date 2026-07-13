@@ -116,6 +116,7 @@ export interface AppSettings {
   heartbeatSeconds: number;
   rawEventRetentionDays: number;
   idleThresholdSeconds: number;
+  passiveContentCountsAsActive: boolean;
   autoMaintenance: boolean;
   autoStart: boolean;
   launchAtLogin: boolean;

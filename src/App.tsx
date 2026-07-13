@@ -38,6 +38,8 @@ import {
   Trash2,
   WandSparkles,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import { api } from './api';
 import type {
@@ -498,8 +500,11 @@ function TodayView({
   onOpenTimeline: () => void;
   planItems: DashboardData['planItems'];
 }) {
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [timelineZoom, setTimelineZoom] = useState(1);
   const review = sessions.filter(needsReview).slice(0, 4);
   const projectRows = projectBreakdown(sessions, selectedDate).slice(0, 6);
+  const projectTotal = projectRows.reduce((sum, row) => sum + row.minutes, 0);
   const visiblePlanItems = planItems
     .filter((item) => item.status !== 'done')
     .slice(0, 5);
@@ -516,9 +521,12 @@ function TodayView({
               {stats.categories
                 .filter((item) => item.minutes > 0 && item.category !== '离开')
                 .map((item) => (
-                  <span
+                  <button
                     key={item.category}
                     title={`${item.category} ${formatDuration(item.minutes)}`}
+                    aria-label={`查看${item.category}的具体时间段`}
+                    onClick={() => setSelectedCategory(item.category)}
+                    type="button"
                     style={
                       {
                         '--segment-color': categoryColor(item.category),
@@ -532,7 +540,12 @@ function TodayView({
               {stats.categories
                 .filter((item) => item.minutes > 0)
                 .map((item) => (
-                  <div key={item.category} className="distribution-row">
+                  <button
+                    key={item.category}
+                    className="distribution-row"
+                    onClick={() => setSelectedCategory(item.category)}
+                    type="button"
+                  >
                     <span
                       className="legend-dot"
                       style={{ background: categoryColor(item.category) }}
@@ -556,7 +569,8 @@ function TodayView({
                       />
                     </div>
                     <b>{formatDuration(item.minutes)}</b>
-                  </div>
+                    <ChevronRight size={15} />
+                  </button>
                 ))}
             </div>
           </>
@@ -564,61 +578,74 @@ function TodayView({
       </section>
 
       <section className="panel">
-        <PanelTitle title="项目投入" />
-        <div className="ranking-list">
+        <PanelTitle
+          title="项目投入"
+          subtitle={projectTotal ? `${projectRows.length} 个项目 · ${formatDuration(projectTotal)}` : undefined}
+        />
+        <div className="project-investment-list">
           {projectRows.length ? (
-            projectRows.map((row, index) => (
-              <div className="ranking-row" key={row.id || row.name}>
-                <span className="rank">{index + 1}</span>
-                <div>
-                  <strong>{row.name}</strong>
-                  <span>{row.category}</span>
+            projectRows.map((row) => {
+              const project = projects.find((item) => item.id === row.id);
+              const color = project?.color || categoryColor(row.category);
+              const percent = Math.max(2, Math.round((row.minutes / Math.max(1, projectTotal)) * 100));
+              return (
+                <div className="project-investment" key={row.id || row.name}>
+                  <div className="project-investment-head">
+                    <span className="project-mark" style={{ '--project-color': color } as CSSProperties}>
+                      <FolderKanban size={15} />
+                    </span>
+                    <div>
+                      <strong>{row.name}</strong>
+                      <span>{row.category}</span>
+                    </div>
+                    <b>{formatDuration(row.minutes)}</b>
+                  </div>
+                  <div className="project-progress-row">
+                    <div className="project-progress">
+                      <span style={{ width: `${percent}%`, background: color }} />
+                    </div>
+                    <small>{percent}%</small>
+                  </div>
                 </div>
-                <b>{formatDuration(row.minutes)}</b>
-              </div>
-            ))
+              );
+            })
           ) : (
             <EmptyState title="暂无项目时间" detail="修正一条会话后，相似活动会自动归入项目。" />
           )}
         </div>
       </section>
 
-      <section className="panel span-2">
+      <section className="panel span-3 day-track-panel">
         <PanelTitle
-          title="最近活动"
+          title="今日时间段"
           action={
-            <button onClick={onOpenTimeline} type="button">
-              查看全部
-            </button>
+            <div className="timeline-zoom" aria-label="时间刻度缩放">
+              <button
+                onClick={() => setTimelineZoom((value) => Math.max(0, value - 1))}
+                disabled={timelineZoom === 0}
+                title="缩小时间刻度"
+                type="button"
+              >
+                <ZoomOut size={15} />
+              </button>
+              <span>{['全天', '标准', '放大', '精细'][timelineZoom]}</span>
+              <button
+                onClick={() => setTimelineZoom((value) => Math.min(3, value + 1))}
+                disabled={timelineZoom === 3}
+                title="放大时间刻度"
+                type="button"
+              >
+                <ZoomIn size={15} />
+              </button>
+            </div>
           }
         />
-        <div className="compact-timeline">
-          {sessions.slice(0, 7).map((session) => (
-            <button
-              className="compact-session"
-              key={session.id}
-              onClick={() => onEdit(session)}
-              type="button"
-            >
-              <span className="compact-time">{formatClock(session.startedAt)}</span>
-              <span
-                className="category-line"
-                style={{ background: categoryColor(session.category) }}
-              />
-              <span className="compact-main">
-                <strong>{session.summary}</strong>
-                <small>
-                  {session.projectName || '未归类'} · {session.category}
-                </small>
-              </span>
-              <b>{formatDuration(sessionMinutesOnDate(session, selectedDate))}</b>
-              {needsReview(session) && <CircleAlert size={16} className="warning-icon" />}
-            </button>
-          ))}
-          {!sessions.length && (
-            <EmptyState title="暂无活动" detail="ScreenUse 会在应用或标签页切换时自动生成时间段。" />
-          )}
-        </div>
+        <DayActivityTimeline
+          sessions={sessions}
+          selectedDate={selectedDate}
+          zoom={timelineZoom}
+          onEdit={onEdit}
+        />
       </section>
 
       <section className="panel">
@@ -668,6 +695,140 @@ function TodayView({
           </div>
         </section>
       )}
+      {selectedCategory && (
+        <CategoryDetailModal
+          category={selectedCategory}
+          sessions={sessions.filter((session) => session.category === selectedCategory)}
+          selectedDate={selectedDate}
+          onClose={() => setSelectedCategory(null)}
+          onEdit={(session) => {
+            setSelectedCategory(null);
+            onEdit(session);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function DayActivityTimeline({
+  sessions,
+  selectedDate,
+  zoom,
+  onEdit,
+}: {
+  sessions: WorkSession[];
+  selectedDate: string;
+  zoom: number;
+  onEdit: (session: WorkSession) => void;
+}) {
+  if (!sessions.length) {
+    return <EmptyState title="暂无活动" detail="应用切换后会自动生成可修正的时间段。" />;
+  }
+  const pixelsPerHour = [40, 58, 86, 124][zoom];
+  const width = 24 * pixelsPerHour;
+  const tickStep = zoom === 0 ? 3 : zoom === 1 ? 2 : 1;
+  const sorted = [...sessions].sort(
+    (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+  );
+  return (
+    <div className="day-track-scroll">
+      <div className="day-track" style={{ width }}>
+        <div className="day-track-axis">
+          {Array.from({ length: Math.floor(24 / tickStep) + 1 }, (_, index) => index * tickStep).map(
+            (hour) => (
+              <span key={hour} style={{ left: `${(hour / 24) * 100}%` }}>
+                {String(hour).padStart(2, '0')}:00
+              </span>
+            ),
+          )}
+        </div>
+        <div className="day-track-lane">
+          {sorted.map((session) => {
+            const bounds = sessionBoundsOnDate(session, selectedDate);
+            const app = sessionApplication(session);
+            const blockWidth = Math.max(5, (bounds.durationMinutes / 60) * pixelsPerHour);
+            return (
+              <button
+                className={`day-track-block${needsReview(session) ? ' needs-review' : ''}`}
+                key={session.id}
+                onClick={() => onEdit(session)}
+                title={`${formatClock(session.startedAt)}–${formatClock(session.endedAt)}\n${session.summary}\n${app}`}
+                type="button"
+                style={
+                  {
+                    left: (bounds.startMinutes / 60) * pixelsPerHour,
+                    width: blockWidth,
+                    '--block-color': categoryColor(session.category),
+                  } as CSSProperties
+                }
+              >
+                <strong>{session.summary}</strong>
+                <small>{app}</small>
+                <span>{formatClock(session.startedAt)}–{formatClock(session.endedAt)}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CategoryDetailModal({
+  category,
+  sessions,
+  selectedDate,
+  onClose,
+  onEdit,
+}: {
+  category: string;
+  sessions: WorkSession[];
+  selectedDate: string;
+  onClose: () => void;
+  onEdit: (session: WorkSession) => void;
+}) {
+  const sorted = [...sessions].sort(
+    (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+  );
+  const total = sorted.reduce(
+    (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
+    0,
+  );
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="modal category-detail" role="dialog" aria-modal="true" aria-label={`${category}时间段`}>
+        <div className="modal-head">
+          <div className="category-detail-title">
+            <span style={{ background: categoryColor(category) }} />
+            <div>
+              <h2>{category}</h2>
+              <p>{formatDuration(total)} · {sorted.length} 个时间段</p>
+            </div>
+          </div>
+          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
+            <X size={17} />
+          </button>
+        </div>
+        <div className="category-session-list">
+          {sorted.map((session) => (
+            <button key={session.id} onClick={() => onEdit(session)} type="button">
+              <span className="category-session-time">
+                <strong>{formatClock(session.startedAt)}</strong>
+                <small>{formatClock(session.endedAt)}</small>
+              </span>
+              <span className="category-session-main">
+                <strong>{session.summary}</strong>
+                <small>{session.projectName || '未归类'}{session.taskTitle ? ` · ${session.taskTitle}` : ''}</small>
+              </span>
+              <span className="category-session-app">{sessionApplication(session)}</span>
+              <Pencil size={15} />
+            </button>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1144,6 +1305,12 @@ function SettingsView({
           onChange={(value) => update('autoStart', value)}
           title="启动 ScreenUse 后自动记录"
           detail="关闭主窗口后仍在系统托盘静默运行。"
+        />
+        <Toggle
+          checked={settings.passiveContentCountsAsActive}
+          onChange={(value) => update('passiveContentCountsAsActive', value)}
+          title="会议与视频不计为离开"
+          detail="当前台窗口是会议、课程、直播或播放器时，即使没有键鼠输入也继续计时。"
         />
         <Toggle
           checked={settings.autoMaintenance}
@@ -1943,6 +2110,24 @@ function sessionMinutesOnDate(session: WorkSession, dateKey: string) {
   const start = Math.max(dayStart, new Date(session.startedAt).getTime());
   const end = Math.min(dayEnd, new Date(session.endedAt).getTime());
   return Math.max(0, Math.round((end - start) / 60_000));
+}
+
+function sessionBoundsOnDate(session: WorkSession, dateKey: string) {
+  const dayStart = dateFromKey(dateKey).getTime();
+  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+  const start = Math.max(dayStart, new Date(session.startedAt).getTime());
+  const end = Math.min(dayEnd, new Date(session.endedAt).getTime());
+  return {
+    startMinutes: Math.max(0, (start - dayStart) / 60_000),
+    durationMinutes: Math.max(0, (end - start) / 60_000),
+  };
+}
+
+function sessionApplication(session: WorkSession) {
+  return (
+    session.evidence.find((item) => item.kind === 'app' || item.label === '应用')?.value ||
+    '未知应用'
+  );
 }
 
 function minutesBetween(start: string, end: string) {

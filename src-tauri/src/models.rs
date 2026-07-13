@@ -205,6 +205,7 @@ pub struct AppSettings {
     pub heartbeat_seconds: u32,
     pub raw_event_retention_days: u32,
     pub idle_threshold_seconds: u32,
+    pub passive_content_counts_as_active: bool,
     pub auto_maintenance: bool,
     pub auto_start: bool,
     pub launch_at_login: bool,
@@ -242,6 +243,7 @@ impl Default for AppSettings {
             heartbeat_seconds: 10,
             raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
+            passive_content_counts_as_active: true,
             auto_maintenance: true,
             auto_start: true,
             launch_at_login: false,
@@ -337,6 +339,7 @@ mod tests {
         let existing: AppSettings = serde_json::from_str("{}").expect("deserialize defaults");
         assert_eq!(existing.theme, "light");
         assert_eq!(existing.poll_interval_seconds, 10);
+        assert!(existing.passive_content_counts_as_active);
 
         let mut invalid = AppSettings::default();
         invalid.theme = "unknown".into();
