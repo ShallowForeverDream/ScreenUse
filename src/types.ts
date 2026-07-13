@@ -136,6 +136,55 @@ export interface AppSettings {
   tempStorageLimitGb: number;
 }
 
+export interface GithubSyncConfig {
+  enabled: boolean;
+  owner: string;
+  repo: string;
+  branch: string;
+  filePath: string;
+  autoSync: boolean;
+  intervalMinutes: number;
+  deviceId: string;
+  deviceName: string;
+  tokenSecretRef: string;
+  keySecretRef: string;
+  lastSyncedAt?: string | null;
+  lastRemoteSha?: string | null;
+  lastError?: string | null;
+}
+
+export interface SyncCounts {
+  categories: number;
+  projects: number;
+  tasks: number;
+  sessions: number;
+  rules: number;
+}
+
+export interface SyncDeviceInfo {
+  id: string;
+  name: string;
+  lastSeenAt: string;
+}
+
+export interface GithubSyncStatus {
+  config: GithubSyncConfig;
+  tokenConfigured: boolean;
+  keyConfigured: boolean;
+  ready: boolean;
+  counts: SyncCounts;
+  devices: SyncDeviceInfo[];
+}
+
+export interface GithubSyncResult {
+  syncedAt: string;
+  remoteSha: string;
+  uploadedBytes: number;
+  downloadedBytes: number;
+  counts: SyncCounts;
+  message: string;
+}
+
 export interface DashboardData {
   settings: AppSettings;
   sessions: WorkSession[];

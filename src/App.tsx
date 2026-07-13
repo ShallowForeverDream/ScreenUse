@@ -20,11 +20,16 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Cloud,
   Clock3,
+  Copy,
   Database,
   Download,
   FolderKanban,
   HardDrive,
+  Github,
+  KeyRound,
+  Laptop,
   LayoutDashboard,
   Merge,
   Monitor,
@@ -36,6 +41,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShieldCheck,
   Sparkles,
   SplitSquareHorizontal,
   Sun,
@@ -52,6 +58,9 @@ import type {
   AppSettings,
   CategoryOption,
   DashboardData,
+  GithubSyncConfig,
+  GithubSyncResult,
+  GithubSyncStatus,
   Project,
   SessionPatch,
   Task,
@@ -134,6 +143,8 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [editing, setEditing] = useState<WorkSession[]>([]);
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [projectFocusId, setProjectFocusId] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -171,6 +182,18 @@ export default function App() {
     media.addEventListener('change', syncSystemTheme);
     return () => media.removeEventListener('change', syncSystemTheme);
   }, [themeMode]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setGlobalSearchOpen((open) => !open);
+      }
+      if (event.key === 'Escape') setGlobalSearchOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   useEffect(() => {
     if (data) setThemeMode(normalizeTheme(data.settings.theme));
@@ -328,7 +351,7 @@ export default function App() {
             )}
           </div>
         </div>
-        <div className="sidebar-foot">v0.2 · 数据仅存本机 SQLite</div>
+        <div className="sidebar-foot">v0.2 · 本机优先 · 可选加密同步</div>
       </aside>
 
       <main className="main">
@@ -338,6 +361,14 @@ export default function App() {
             <p>{pageDescription(activeTab)}</p>
           </div>
           <div className="topbar-right">
+            <button
+              className="global-search-trigger"
+              onClick={() => setGlobalSearchOpen(true)}
+              type="button"
+              aria-label="全局搜索"
+            >
+              <Search size={15} /><span>搜索</span><kbd>Ctrl K</kbd>
+            </button>
             {activeTab !== 'settings' && (
               <DateNavigator
                 value={selectedDate}
@@ -439,6 +470,7 @@ export default function App() {
             selectedDate={selectedDate}
             runAction={runAction}
             categoryOptions={data.categoryOptions}
+            focusProjectId={projectFocusId}
           />
         )}
         {activeTab === 'settings' && (
@@ -477,6 +509,26 @@ export default function App() {
           runAction={runAction}
         />
       )}
+      {globalSearchOpen && (
+        <GlobalSearch
+          data={data}
+          onClose={() => setGlobalSearchOpen(false)}
+          onOpenSession={(session) => {
+            setGlobalSearchOpen(false);
+            setActiveTab('timeline');
+            setEditing([session]);
+          }}
+          onOpenProject={(projectId) => {
+            setProjectFocusId(projectId);
+            setGlobalSearchOpen(false);
+            setActiveTab('projects');
+          }}
+          onNavigate={(tab) => {
+            setGlobalSearchOpen(false);
+            setActiveTab(tab);
+          }}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -511,6 +563,153 @@ function DateNavigator({
           今天
         </button>
       )}
+    </div>
+  );
+}
+
+type GlobalSearchResult =
+  | { id: string; kind: 'project'; title: string; meta: string; projectId: string; search: string }
+  | { id: string; kind: 'task'; title: string; meta: string; projectId: string; search: string }
+  | { id: string; kind: 'session'; title: string; meta: string; session: WorkSession; search: string };
+
+function GlobalSearch({
+  data,
+  onClose,
+  onOpenSession,
+  onOpenProject,
+  onNavigate,
+}: {
+  data: DashboardData;
+  onClose: () => void;
+  onOpenSession: (session: WorkSession) => void;
+  onOpenProject: (projectId: string) => void;
+  onNavigate: (tab: TabId) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [activeIndex, setActiveIndex] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => inputRef.current?.focus(), []);
+
+  const results = useMemo<GlobalSearchResult[]>(() => {
+    const needle = normalizeSearchText(query);
+    const projectsById = new Map(data.projects.map((project) => [project.id, project]));
+    const all: GlobalSearchResult[] = [
+      ...data.projects.map((project) => ({
+        id: `project:${project.id}`,
+        kind: 'project' as const,
+        title: project.name,
+        meta: `${project.category} · 项目`,
+        projectId: project.id,
+        search: normalizeSearchText(`${project.name} ${project.category} ${project.description || ''}`),
+      })),
+      ...data.tasks.map((task) => {
+        const project = projectsById.get(task.projectId);
+        return {
+          id: `task:${task.id}`,
+          kind: 'task' as const,
+          title: task.title,
+          meta: `${project?.name || '未知项目'} · 任务`,
+          projectId: task.projectId,
+          search: normalizeSearchText(`${task.title} ${project?.name || ''} ${project?.category || ''}`),
+        };
+      }),
+      ...data.sessions.map((session) => ({
+        id: `session:${session.id}`,
+        kind: 'session' as const,
+        title: session.summary,
+        meta: `${formatDateTime(session.startedAt)} · ${session.projectName || session.category}`,
+        session,
+        search: normalizeSearchText([
+          session.summary,
+          session.projectName,
+          session.taskTitle,
+          session.category,
+          ...session.evidence.map((item) => item.value),
+        ].filter(Boolean).join(' ')),
+      })),
+    ];
+    if (!needle) {
+      return all.filter((item) => item.kind === 'session').slice(0, 6);
+    }
+    return all
+      .filter((item) => item.search.includes(needle))
+      .sort((left, right) => {
+        const leftExact = normalizeSearchText(left.title).startsWith(needle) ? 1 : 0;
+        const rightExact = normalizeSearchText(right.title).startsWith(needle) ? 1 : 0;
+        return rightExact - leftExact;
+      })
+      .slice(0, 12);
+  }, [data, query]);
+
+  useEffect(() => setActiveIndex(0), [query]);
+
+  const open = (result: GlobalSearchResult) => {
+    if (result.kind === 'session') onOpenSession(result.session);
+    else onOpenProject(result.projectId);
+  };
+
+  return (
+    <div className="command-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="command-palette" role="dialog" aria-modal="true" aria-label="全局搜索">
+        <div className="command-input">
+          <Search size={19} />
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                setActiveIndex((index) => results.length ? Math.min(results.length - 1, index + 1) : 0);
+              } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                setActiveIndex((index) => Math.max(0, index - 1));
+              } else if (event.key === 'Enter' && results[activeIndex]) {
+                event.preventDefault();
+                open(results[activeIndex]);
+              }
+            }}
+            placeholder="搜索会话、项目、任务、应用或页面…"
+            aria-label="搜索 ScreenUse"
+          />
+          <kbd>Esc</kbd>
+        </div>
+        {!query && (
+          <div className="command-shortcuts">
+            {tabs.map(({ id, label, icon: Icon }) => (
+              <button key={id} onClick={() => onNavigate(id)} type="button">
+                <Icon size={15} />{label}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="command-results" role="listbox" aria-label={query ? '搜索结果' : '最近会话'}>
+          <span className="command-section-label">{query ? `${results.length} 个结果` : '最近会话'}</span>
+          {results.map((result, index) => {
+            const Icon = result.kind === 'session' ? Clock3 : result.kind === 'task' ? TimerReset : FolderKanban;
+            return (
+              <button
+                key={result.id}
+                className={index === activeIndex ? 'active' : ''}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => open(result)}
+                role="option"
+                aria-selected={index === activeIndex}
+                type="button"
+              >
+                <span className={`command-result-icon ${result.kind}`}><Icon size={16} /></span>
+                <span><strong>{result.title}</strong><small>{result.meta}</small></span>
+                <ChevronRight size={15} />
+              </button>
+            );
+          })}
+          {!results.length && <EmptyState title="没有匹配结果" detail="可以搜索项目名、任务名、窗口标题、应用或当前页面。" />}
+        </div>
+        <footer><span><kbd>↑</kbd><kbd>↓</kbd> 选择</span><span><kbd>Enter</kbd> 打开</span><span><kbd>Ctrl K</kbd> 随时搜索</span></footer>
+      </section>
     </div>
   );
 }
@@ -681,7 +880,7 @@ function TodayView({
         />
       </section>
 
-      <section className="panel">
+      <section className="panel span-3 review-panel">
         <PanelTitle
           title="待复核"
           action={
@@ -1155,18 +1354,6 @@ function TimelineView({
         </div>
       </section>
 
-      <aside className="timeline-aside">
-        <section className="panel guidance-card">
-          <Sparkles size={24} />
-          <h2>只处理不确定项</h2>
-          <p>分类正确就点“确认”；有误再点“修正”。系统会继续从修正结果学习。</p>
-          <div className="guidance-steps">
-            <span><b>1</b> 快速确认正确分类</span>
-            <span><b>2</b> 修正分类、项目或任务</span>
-            <span><b>3</b> 记住规则或临时固定</span>
-          </div>
-        </section>
-      </aside>
     </div>
   );
 }
@@ -1255,6 +1442,7 @@ function ProjectsView({
   selectedDate,
   runAction,
   categoryOptions,
+  focusProjectId,
 }: {
   projects: Project[];
   tasks: Task[];
@@ -1262,15 +1450,41 @@ function ProjectsView({
   selectedDate: string;
   runAction: ActionRunner;
   categoryOptions: CategoryOption[];
+  focusProjectId: string;
 }) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
   const [category, setCategory] = useState('开发');
   const [busyProjectId, setBusyProjectId] = useState('');
   const [busyTaskId, setBusyTaskId] = useState('');
+  const [query, setQuery] = useState('');
+  const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
+  const [taskName, setTaskName] = useState('');
   const rows = projectBreakdown(sessions, selectedDate);
   const minutesByProject = new Map(rows.map((row) => [row.id, row.minutes]));
   const tasksByProject = groupBy(tasks, (task) => task.projectId);
+  const needle = normalizeSearchText(query);
+  const visibleProjects = projects.filter((project) => !needle || normalizeSearchText([
+    project.name,
+    project.category,
+    project.description,
+    ...(tasksByProject.get(project.id) || []).map((task) => task.title),
+  ].filter(Boolean).join(' ')).includes(needle));
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) || visibleProjects[0] || projects[0];
+  const selectedTasks = selectedProject ? tasksByProject.get(selectedProject.id) || [] : [];
+
+  useEffect(() => {
+    if (focusProjectId && projects.some((project) => project.id === focusProjectId)) {
+      setSelectedProjectId(focusProjectId);
+    }
+  }, [focusProjectId, projects]);
+
+  useEffect(() => {
+    if (!selectedProjectId && projects[0]) setSelectedProjectId(projects[0].id);
+    if (selectedProjectId && !projects.some((project) => project.id === selectedProjectId)) {
+      setSelectedProjectId(projects[0]?.id || '');
+    }
+  }, [projects, selectedProjectId]);
 
   const createProject = async () => {
     const projectName = name.trim();
@@ -1300,18 +1514,33 @@ function ProjectsView({
     }
   };
 
+  const createTask = async () => {
+    const title = taskName.trim();
+    if (!selectedProject || !title) return;
+    await runAction(
+      () => api.createTask(selectedProject.id, title),
+      `任务“${title}”已创建`,
+    );
+    setTaskName('');
+  };
+
   return (
     <div className="projects-layout">
       <section className="panel">
         <PanelTitle
           title="项目账本"
-          subtitle="活动会按上下文归入项目。"
+          subtitle={`${projects.length} 个项目 · 点击卡片查看和管理任务`}
           action={(
             <button className="primary" onClick={() => setCreating((current) => !current)} type="button" aria-expanded={creating}>
               <Plus size={15} />新建项目
             </button>
           )}
         />
+        <div className="project-search">
+          <Search size={16} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或任务" />
+          {query && <button onClick={() => setQuery('')} type="button" aria-label="清空项目搜索"><X size={14} /></button>}
+        </div>
         {creating && (
           <div className="project-create-row">
             <input
@@ -1335,11 +1564,11 @@ function ProjectsView({
           </div>
         )}
         <div className="project-grid">
-          {projects.map((project) => {
+          {visibleProjects.map((project) => {
             const minutes = minutesByProject.get(project.id) || 0;
             return (
               <article
-                className="project-card"
+                className={`project-card ${selectedProject?.id === project.id ? 'active' : ''}`}
                 key={project.id}
                 style={{ '--project-color': project.color || categoryColor(project.category) } as CSSProperties}
               >
@@ -1359,30 +1588,42 @@ function ProjectsView({
                     </button>
                   </div>
                 </div>
-                <h2>{project.name}</h2>
-                <div className="project-progress">
-                  <span
-                    style={{
-                      width: `${Math.min(100, Math.max(4, (minutes / Math.max(1, rows[0]?.minutes || 1)) * 100))}%`,
-                    }}
-                  />
-                </div>
+                <button className="project-card-main" onClick={() => setSelectedProjectId(project.id)} type="button">
+                  <span><strong>{project.name}</strong><small>{(tasksByProject.get(project.id) || []).length} 个任务</small></span>
+                  <ChevronRight size={16} />
+                </button>
+                <div className="project-progress"><span style={{ width: `${Math.min(100, Math.max(4, (minutes / Math.max(1, rows[0]?.minutes || 1)) * 100))}%` }} /></div>
               </article>
             );
           })}
-          {!projects.length && (
-            <EmptyState title="还没有项目" detail="打开一个代码工作区或修正一条会话即可自动建立。" />
+          {!visibleProjects.length && (
+            <EmptyState title={projects.length ? '没有匹配项目' : '还没有项目'} detail={projects.length ? '换个项目名、分类或任务名试试。' : '打开一个代码工作区或修正一条会话即可自动建立。'} />
           )}
         </div>
       </section>
 
-      <section className="panel">
-        <PanelTitle title="项目任务" />
+      <section className="panel project-detail-panel">
+        <PanelTitle title={selectedProject?.name || '项目任务'} subtitle={selectedProject ? `${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'} />
+        {selectedProject && (
+          <div className="task-create-row">
+            <input
+              value={taskName}
+              onChange={(event) => setTaskName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  void createTask();
+                }
+              }}
+              placeholder="输入任务名，Enter 创建"
+            />
+            <button className="primary" onClick={() => void createTask()} disabled={!taskName.trim()} type="button"><Plus size={15} />添加</button>
+          </div>
+        )}
         <div className="task-list">
-          {projects.map((project) => (
-            <div className="task-group" key={project.id}>
-              <h3>{project.name}</h3>
-              {(tasksByProject.get(project.id) || []).map((task) => (
+          {selectedProject && (
+            <div className="task-group" key={selectedProject.id}>
+              {selectedTasks.map((task) => (
                 <div className="task-row" key={task.id}>
                   <TimerReset size={15} />
                   <span>{task.title}</span>
@@ -1397,8 +1638,10 @@ function ProjectsView({
                   </button>
                 </div>
               ))}
+              {!selectedTasks.length && <EmptyState title="还没有任务" detail="直接在上方输入任务名并按 Enter。" />}
             </div>
-          ))}
+          )}
+          {!selectedProject && <EmptyState title="还没有项目" detail="创建项目后即可添加任务。" />}
         </div>
       </section>
     </div>
@@ -1471,6 +1714,8 @@ function SettingsView({
           ))}
         </div>
       </section>
+
+      <GithubSyncPanel runAction={runAction} />
 
       <section className="panel settings-panel">
         <PanelTitle
@@ -1700,6 +1945,282 @@ function SettingsView({
         </button>
       </div>
     </div>
+  );
+}
+
+function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
+  const [status, setStatus] = useState<GithubSyncStatus | null>(null);
+  const [config, setConfig] = useState<GithubSyncConfig | null>(null);
+  const [token, setToken] = useState('');
+  const [syncKey, setSyncKey] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const next = await api.githubSyncStatus();
+    setStatus(next);
+    setConfig(next.config);
+    return next;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void api.githubSyncStatus().then((next) => {
+      if (!active) return;
+      setStatus(next);
+      setConfig(next.config);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const update = <K extends keyof GithubSyncConfig>(key: K, value: GithubSyncConfig[K]) => {
+    setConfig((current) => current ? { ...current, [key]: value } : current);
+  };
+
+  const save = async () => {
+    if (!config || busy) return;
+    setBusy(true);
+    try {
+      const next = await runAction(
+        () => api.saveGithubSyncConfig(config, token.trim() || undefined, syncKey.trim() || undefined),
+        '同步设置已保存',
+      ) as GithubSyncStatus;
+      setStatus(next);
+      setConfig(next.config);
+      setToken('');
+      setSyncKey('');
+    } catch {
+      // runAction already surfaces the backend message.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const generateKey = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const key = await runAction(api.generateGithubSyncKey, '已生成端侧加密密钥') as string;
+      setSyncKey(key);
+      await refresh();
+    } catch {
+      // The toast is enough; keep the form intact for correction.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revealKey = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const key = await api.readGithubSyncKey();
+      setSyncKey(key);
+    } catch {
+      try {
+        const key = await runAction(api.generateGithubSyncKey, '已生成端侧加密密钥') as string;
+        setSyncKey(key);
+        await refresh();
+      } catch {
+        // The toast contains the actionable backend error.
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyKey = async () => {
+    if (!syncKey) return;
+    try {
+      await navigator.clipboard.writeText(syncKey);
+      await runAction(async () => undefined, '同步密钥已复制');
+    } catch {
+      const input = document.getElementById('github-sync-key') as HTMLInputElement | null;
+      input?.focus();
+      input?.select();
+    }
+  };
+
+  const syncNow = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await runAction(api.syncGithubNow, 'GitHub 同步完成') as GithubSyncResult;
+      const next = await refresh();
+      setStatus({ ...next, counts: result.counts });
+    } catch {
+      await refresh().catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disconnect = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const next = await runAction(
+        () => api.disconnectGithubSync(false),
+        '已停止自动同步，凭据仍保存在系统凭据库',
+      ) as GithubSyncStatus;
+      setStatus(next);
+      setConfig(next.config);
+    } catch {
+      // runAction already reported the error.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!config || !status) {
+    return (
+      <section className="panel settings-panel sync-panel sync-panel-loading">
+        <Cloud size={20} />正在读取同步状态…
+      </section>
+    );
+  }
+
+  const repoUrl = config.owner && config.repo
+    ? `https://github.com/${config.owner}/${config.repo}`
+    : '';
+  const recordCount = status.counts.categories + status.counts.projects
+    + status.counts.tasks + status.counts.sessions + status.counts.rules;
+
+  return (
+    <section className="panel settings-panel sync-panel">
+      <div className="sync-panel-head">
+        <PanelTitle
+          title="GitHub 多端同步"
+          subtitle="独立 Private 仓库 · AES-256-GCM 加密 · 自动合并最新修改"
+        />
+        <span className={`sync-state ${status.ready ? 'ready' : ''}`}>
+          <span />{status.ready ? '可以同步' : config.enabled ? '还差凭据' : '未开启'}
+        </span>
+      </div>
+
+      <div className="sync-overview">
+        <div>
+          <Github size={18} />
+          <span><strong>{config.owner && config.repo ? `${config.owner}/${config.repo}` : '尚未设置仓库'}</strong><small>仓库不存在时首次同步自动创建为 Private</small></span>
+        </div>
+        <div>
+          <ShieldCheck size={18} />
+          <span><strong>{status.keyConfigured ? '端侧加密已就绪' : '需要同步密钥'}</strong><small>GitHub 只保存压缩后的密文</small></span>
+        </div>
+        <div>
+          <Cloud size={18} />
+          <span><strong>{config.lastSyncedAt ? formatDateTime(config.lastSyncedAt) : '尚未同步'}</strong><small>{recordCount.toLocaleString()} 条结构化记录待同步</small></span>
+        </div>
+      </div>
+
+      {config.lastError && (
+        <div className="sync-error"><CircleAlert size={16} /><span>{config.lastError}</span></div>
+      )}
+
+      <div className="sync-columns">
+        <div className="sync-form-group">
+          <h3>仓库</h3>
+          <div className="field-grid sync-fields">
+            <Field label="GitHub 用户名">
+              <input value={config.owner} onChange={(event) => update('owner', event.target.value)} placeholder="ShallowForeverDream" />
+            </Field>
+            <Field label="Private 仓库名">
+              <input value={config.repo} onChange={(event) => update('repo', event.target.value)} placeholder="ScreenUse-Data" />
+            </Field>
+            <Field label="分支">
+              <input value={config.branch} onChange={(event) => update('branch', event.target.value)} placeholder="main" />
+            </Field>
+            <Field label="设备名称">
+              <input value={config.deviceName} onChange={(event) => update('deviceName', event.target.value)} placeholder="我的电脑" />
+            </Field>
+          </div>
+          <Toggle
+            checked={config.enabled}
+            onChange={(value) => update('enabled', value)}
+            title="启用 GitHub 同步"
+            detail="开启后可手动同步；保存配置不会立即上传。"
+          />
+          <Toggle
+            checked={config.autoSync}
+            onChange={(value) => update('autoSync', value)}
+            title="后台自动同步"
+            detail={`每 ${config.intervalMinutes} 分钟检查一次远端更新。`}
+          />
+          {config.autoSync && (
+            <Field label="自动同步间隔" hint="最短 5 分钟。">
+              <NumberInput
+                value={config.intervalMinutes}
+                min={5}
+                max={1440}
+                suffix="分钟"
+                onChange={(value) => update('intervalMinutes', value)}
+              />
+            </Field>
+          )}
+        </div>
+
+        <div className="sync-form-group">
+          <h3>凭据与密钥</h3>
+          <Field label="GitHub Token" hint={status.tokenConfigured ? '已保存；留空不会覆盖。需要 repo 权限。' : '需要 repo 权限，用于读写 Private 仓库。'}>
+            <input
+              type="password"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              placeholder={status.tokenConfigured ? '已安全保存' : 'github_pat_…'}
+            />
+          </Field>
+          <Field label="同步密钥" hint="所有设备必须使用同一把密钥；密钥不会上传 GitHub。">
+            <div className="sync-key-row">
+              <input
+                id="github-sync-key"
+                type={syncKey ? 'text' : 'password'}
+                value={syncKey}
+                onChange={(event) => setSyncKey(event.target.value)}
+                placeholder={status.keyConfigured ? '密钥已保存在系统凭据库' : '生成新密钥或粘贴已有密钥'}
+              />
+              <button onClick={() => void (syncKey ? copyKey() : revealKey())} type="button" aria-label={syncKey ? '复制同步密钥' : '显示同步密钥'}>
+                {syncKey ? <Copy size={16} /> : <KeyRound size={16} />}
+              </button>
+            </div>
+          </Field>
+          <div className="sync-key-actions">
+            <button onClick={() => void generateKey()} disabled={busy} type="button">
+              <KeyRound size={15} />生成新密钥
+            </button>
+            {status.keyConfigured && !syncKey && (
+              <button onClick={() => void revealKey()} disabled={busy} type="button">
+                <Copy size={15} />复制到其他设备
+              </button>
+            )}
+          </div>
+          <div className="setting-callout good compact">
+            <ShieldCheck size={18} />
+            <div><strong>Token 和密钥只进系统凭据库</strong><span>数据库与界面状态中都不保存明文。</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="sync-bottom">
+        <div className="sync-devices">
+          <Laptop size={17} />
+          <div>
+            <strong>{status.devices.length ? `${status.devices.length} 台设备` : '当前设备尚未登记'}</strong>
+            <span>{status.devices.slice(0, 3).map((device) => device.name).join(' · ') || config.deviceName}</span>
+          </div>
+        </div>
+        <div className="sync-actions">
+          {repoUrl && config.lastSyncedAt && (
+            <button onClick={() => window.open(repoUrl, '_blank')} type="button"><Github size={15} />查看仓库</button>
+          )}
+          {config.enabled && <button onClick={() => void disconnect()} disabled={busy} type="button">停止同步</button>}
+          <button onClick={() => void save()} disabled={busy} type="button">保存同步设置</button>
+          <button className="primary" onClick={() => void syncNow()} disabled={busy || !status.ready} type="button">
+            <Cloud size={16} />{busy ? '处理中…' : '立即同步'}
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
 

@@ -15,7 +15,7 @@ const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 
 pub struct AppDb {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     db_path: PathBuf,
     data_dir: PathBuf,
 }
@@ -27,14 +27,18 @@ impl AppDb {
         Self::open_in(dirs.data_dir().to_path_buf())
     }
 
-    fn open_in(data_dir: PathBuf) -> Result<Self> {
+    pub(crate) fn open_in(data_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&data_dir)?;
         fs::create_dir_all(data_dir.join("exports"))?;
         fs::create_dir_all(data_dir.join("backups"))?;
         let db_path = data_dir.join("screenuse.db");
         let conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Self { conn: Mutex::new(conn), db_path, data_dir };
+        let db = Self {
+            conn: Mutex::new(conn),
+            db_path,
+            data_dir,
+        };
         db.migrate()?;
         db.seed_if_empty()?;
         db.backfill_idle_boundaries()?;
@@ -42,7 +46,9 @@ impl AppDb {
         Ok(db)
     }
 
-    pub fn data_dir(&self) -> &Path { &self.data_dir }
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock();
@@ -66,7 +72,8 @@ impl AppDb {
               name TEXT PRIMARY KEY,
               color TEXT NOT NULL,
               is_builtin INTEGER NOT NULL DEFAULT 0,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY,
@@ -146,7 +153,8 @@ impl AppDb {
               task_id TEXT,
               category TEXT NOT NULL,
               created_from_correction INTEGER NOT NULL DEFAULT 0,
-              enabled INTEGER NOT NULL DEFAULT 1
+              enabled INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS plan_items (
               id TEXT PRIMARY KEY,
@@ -174,13 +182,40 @@ impl AppDb {
               FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
               FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_tombstones (
+              entity_kind TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              deleted_at TEXT NOT NULL,
+              device_id TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(entity_kind, entity_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_work_sessions_time ON work_sessions(started_at, ended_at);
             CREATE INDEX IF NOT EXISTS idx_raw_events_time ON raw_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs(status);
         "#)?;
+        ensure_column(
+            &conn,
+            "activity_categories",
+            "updated_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "attribution_rules",
+            "updated_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.execute(
+            "UPDATE activity_categories SET updated_at=created_at WHERE updated_at=''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE attribution_rules SET updated_at=?1 WHERE updated_at=''",
+            params![now()],
+        )?;
         for category in DEFAULT_CATEGORIES {
             conn.execute(
-                "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at) VALUES(?1,?2,1,?3)",
+                "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at) VALUES(?1,?2,1,?3,?3)",
                 params![category, color_for_category(category), now()],
             )?;
         }
@@ -194,7 +229,9 @@ impl AppDb {
     fn seed_if_empty(&self) -> Result<()> {
         let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
-        if count > 0 { return Ok(()); }
+        if count > 0 {
+            return Ok(());
+        }
         let now = now();
         let p1 = Uuid::new_v4().to_string();
         let p2 = Uuid::new_v4().to_string();
@@ -206,24 +243,71 @@ impl AppDb {
         let t2 = Uuid::new_v4().to_string();
         let t3 = Uuid::new_v4().to_string();
         conn.execute("INSERT INTO tasks VALUES (?1, ?2, '实现采集与归因闭环', 'active', 'seed', NULL, ?3, ?3)", params![t1, p1, now])?;
-        conn.execute("INSERT INTO tasks VALUES (?1, ?2, '资料阅读与写作', 'active', 'seed', NULL, ?3, ?3)", params![t2, p2, now])?;
-        conn.execute("INSERT INTO tasks VALUES (?1, ?2, '未归类活动整理', 'active', 'seed', NULL, ?3, ?3)", params![t3, p3, now])?;
+        conn.execute(
+            "INSERT INTO tasks VALUES (?1, ?2, '资料阅读与写作', 'active', 'seed', NULL, ?3, ?3)",
+            params![t2, p2, now],
+        )?;
+        conn.execute(
+            "INSERT INTO tasks VALUES (?1, ?2, '未归类活动整理', 'active', 'seed', NULL, ?3, ?3)",
+            params![t3, p3, now],
+        )?;
 
         let s1 = Uuid::new_v4().to_string();
         let s2 = Uuid::new_v4().to_string();
         let s3 = Uuid::new_v4().to_string();
         let base = Utc::now() - Duration::hours(4);
-        insert_seed_session(&conn, &s1, &p1, &t1, "开发", "搭建 ScreenUse v1 项目骨架", base, base + Duration::minutes(75), 0.86)?;
-        insert_seed_session(&conn, &s2, &p2, &t2, "学习", "阅读竞品与时间追踪资料", base + Duration::minutes(90), base + Duration::minutes(145), 0.79)?;
-        insert_seed_session(&conn, &s3, &p1, &t1, "开发", "设计 AI 队列与失败重试策略", base + Duration::minutes(165), base + Duration::minutes(220), 0.82)?;
+        insert_seed_session(
+            &conn,
+            &s1,
+            &p1,
+            &t1,
+            "开发",
+            "搭建 ScreenUse v1 项目骨架",
+            base,
+            base + Duration::minutes(75),
+            0.86,
+        )?;
+        insert_seed_session(
+            &conn,
+            &s2,
+            &p2,
+            &t2,
+            "学习",
+            "阅读竞品与时间追踪资料",
+            base + Duration::minutes(90),
+            base + Duration::minutes(145),
+            0.79,
+        )?;
+        insert_seed_session(
+            &conn,
+            &s3,
+            &p1,
+            &t1,
+            "开发",
+            "设计 AI 队列与失败重试策略",
+            base + Duration::minutes(165),
+            base + Duration::minutes(220),
+            0.82,
+        )?;
         Ok(())
     }
 
     pub fn get_settings(&self) -> Result<AppSettings> {
         let conn = self.conn.lock();
-        let raw: Option<String> = conn.query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0)).optional()?;
-        let removed_ddl_manager_setting = raw.as_deref().is_some_and(|value| value.contains("ddlManagerDbPath"));
-        let mut settings: AppSettings = raw.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let removed_ddl_manager_setting = raw
+            .as_deref()
+            .is_some_and(|value| value.contains("ddlManagerDbPath"));
+        let mut settings: AppSettings = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
         let migration_done = conn
             .query_row(
                 "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
@@ -302,13 +386,17 @@ impl AppDb {
         let color = custom_category_color(&name).to_string();
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at) VALUES(?1,?2,0,?3)",
+            "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at) VALUES(?1,?2,0,?3,?3)",
             params![name, color, now()],
         )?;
         if changed == 0 {
             bail!("同名分类已存在");
         }
-        Ok(CategoryOption { name, color, is_builtin: false })
+        Ok(CategoryOption {
+            name,
+            color,
+            is_builtin: false,
+        })
     }
 
     pub fn delete_category(&self, name: &str) -> Result<()> {
@@ -329,9 +417,19 @@ impl AppDb {
             "UPDATE projects SET category='杂务', color=?1, updated_at=?2 WHERE category=?3",
             params![color_for_category("杂务"), now(), name],
         )?;
-        tx.execute("UPDATE work_sessions SET category='杂务', updated_at=?1 WHERE category=?2", params![now(), name])?;
-        tx.execute("UPDATE attribution_rules SET category='杂务' WHERE category=?1", params![name])?;
-        tx.execute("DELETE FROM activity_categories WHERE name=?1", params![name])?;
+        tx.execute(
+            "UPDATE work_sessions SET category='杂务', updated_at=?1 WHERE category=?2",
+            params![now(), name],
+        )?;
+        tx.execute(
+            "UPDATE attribution_rules SET category='杂务',updated_at=?1 WHERE category=?2",
+            params![now(), name],
+        )?;
+        record_tombstone(&tx, "category", name)?;
+        tx.execute(
+            "DELETE FROM activity_categories WHERE name=?1",
+            params![name],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -410,12 +508,14 @@ impl AppDb {
             else {
                 continue;
             };
-            let boundary = (idle_started - Duration::seconds(idle_threshold))
-                .max(previous_started);
+            let boundary = (idle_started - Duration::seconds(idle_threshold)).max(previous_started);
             let boundary = fmt(boundary);
 
             if boundary == previous_started_at {
-                tx.execute("DELETE FROM work_sessions WHERE id=?1", params![previous_id])?;
+                tx.execute(
+                    "DELETE FROM work_sessions WHERE id=?1",
+                    params![previous_id],
+                )?;
             } else {
                 tx.execute(
                     "UPDATE work_sessions SET ended_at=?1,updated_at=?2 WHERE id=?3",
@@ -448,9 +548,18 @@ impl AppDb {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id,name,category,source,color,description,created_at,updated_at FROM projects ORDER BY updated_at DESC")?;
-        let rows = stmt.query_map([], |r| Ok(Project {
-            id: r.get(0)?, name: r.get(1)?, category: r.get(2)?, source: r.get(3)?, color: r.get(4)?, description: r.get(5)?, created_at: r.get(6)?, updated_at: r.get(7)?,
-        }))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Project {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                category: r.get(2)?,
+                source: r.get(3)?,
+                color: r.get(4)?,
+                description: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
         collect_rows(rows)
     }
 
@@ -533,6 +642,15 @@ impl AppDb {
                 OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
             params![id],
         )?;
+        let task_ids = {
+            let mut stmt = tx.prepare("SELECT id FROM tasks WHERE project_id=?1")?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+        for task_id in task_ids {
+            record_tombstone(&tx, "task", &task_id)?;
+        }
+        record_tombstone(&tx, "project", id)?;
         tx.execute("DELETE FROM projects WHERE id=?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -541,9 +659,18 @@ impl AppDb {
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id,project_id,title,status,source,planned_due_at,created_at,updated_at FROM tasks ORDER BY updated_at DESC")?;
-        let rows = stmt.query_map([], |r| Ok(Task {
-            id: r.get(0)?, project_id: r.get(1)?, title: r.get(2)?, status: r.get(3)?, source: r.get(4)?, planned_due_at: r.get(5)?, created_at: r.get(6)?, updated_at: r.get(7)?,
-        }))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Task {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                title: r.get(2)?,
+                status: r.get(3)?,
+                source: r.get(4)?,
+                planned_due_at: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
         collect_rows(rows)
     }
 
@@ -554,7 +681,11 @@ impl AppDb {
         }
         let conn = self.conn.lock();
         let project_exists = conn
-            .query_row("SELECT 1 FROM projects WHERE id=?1", params![project_id], |row| row.get::<_, i64>(0))
+            .query_row(
+                "SELECT 1 FROM projects WHERE id=?1",
+                params![project_id],
+                |row| row.get::<_, i64>(0),
+            )
             .optional()?
             .is_some();
         if !project_exists {
@@ -584,7 +715,15 @@ impl AppDb {
         };
         conn.execute(
             "INSERT INTO tasks VALUES(?1,?2,?3,?4,?5,NULL,?6,?7)",
-            params![task.id, task.project_id, task.title, task.status, task.source, task.created_at, task.updated_at],
+            params![
+                task.id,
+                task.project_id,
+                task.title,
+                task.status,
+                task.source,
+                task.created_at,
+                task.updated_at
+            ],
         )?;
         Ok(task)
     }
@@ -592,16 +731,25 @@ impl AppDb {
     pub fn delete_task(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM attribution_rules WHERE task_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM attribution_rules WHERE task_id=?1",
+            params![id],
+        )?;
         let changed = tx.execute("DELETE FROM tasks WHERE id=?1", params![id])?;
         if changed == 0 {
             bail!("任务不存在或已经删除");
         }
+        record_tombstone(&tx, "task", id)?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn pin_context(&self, project_id: &str, task_id: Option<&str>, minutes: u32) -> Result<ContextPin> {
+    pub fn pin_context(
+        &self,
+        project_id: &str,
+        task_id: Option<&str>,
+        minutes: u32,
+    ) -> Result<ContextPin> {
         let conn = self.conn.lock();
         let project: (String, String) = conn.query_row(
             "SELECT name,category FROM projects WHERE id=?1",
@@ -627,7 +775,11 @@ impl AppDb {
             params![project_id, task_id, expires_at],
         )?;
         let task_title = task_id
-            .map(|id| conn.query_row("SELECT title FROM tasks WHERE id=?1", params![id], |row| row.get(0)))
+            .map(|id| {
+                conn.query_row("SELECT title FROM tasks WHERE id=?1", params![id], |row| {
+                    row.get(0)
+                })
+            })
             .transpose()?;
         Ok(ContextPin {
             project_id: project_id.to_string(),
@@ -660,7 +812,11 @@ impl AppDb {
                 }),
             )
             .optional()?;
-        if pin.as_ref().is_some_and(|pin| DateTime::parse_from_rfc3339(&pin.expires_at).map(|time| time.with_timezone(&Utc) <= Utc::now()).unwrap_or(true)) {
+        if pin.as_ref().is_some_and(|pin| {
+            DateTime::parse_from_rfc3339(&pin.expires_at)
+                .map(|time| time.with_timezone(&Utc) <= Utc::now())
+                .unwrap_or(true)
+        }) {
             conn.execute("DELETE FROM context_pin", [])?;
             return Ok(None);
         }
@@ -711,7 +867,8 @@ impl AppDb {
             params![project_id, task_id, summary, category, confidence, if confirmed {1} else {0}, now(), id],
         )?;
         drop(conn);
-        self.get_session(id)?.context("session disappeared after update")
+        self.get_session(id)?
+            .context("session disappeared after update")
     }
 
     pub fn update_sessions(&self, ids: &[String], patch: SessionPatch) -> Result<Vec<WorkSession>> {
@@ -768,8 +925,12 @@ impl AppDb {
             )
             .optional()?
         };
-        let Some(previous_id) = previous_id else { return Ok(current); };
-        let previous = self.get_session(&previous_id)?.context("previous session not found")?;
+        let Some(previous_id) = previous_id else {
+            return Ok(current);
+        };
+        let previous = self
+            .get_session(&previous_id)?
+            .context("previous session not found")?;
         if !can_auto_coalesce(&previous, &current) {
             return Ok(current);
         }
@@ -784,7 +945,12 @@ impl AppDb {
         )?;
         conn.execute(
             "UPDATE activities SET ended_at=?1,summary=?2,evidence_json=?3 WHERE session_id=?4",
-            params![current.ended_at, summary, serde_json::to_string(&evidence)?, previous.id],
+            params![
+                current.ended_at,
+                summary,
+                serde_json::to_string(&evidence)?,
+                previous.id
+            ],
         )?;
 
         let plan_updates = {
@@ -815,9 +981,11 @@ impl AppDb {
                 params![matched_json, now(), plan_id],
             )?;
         }
+        record_tombstone(&conn, "session", &current.id)?;
         conn.execute("DELETE FROM work_sessions WHERE id=?1", params![current.id])?;
         drop(conn);
-        self.get_session(&previous.id)?.context("coalesced session missing")
+        self.get_session(&previous.id)?
+            .context("coalesced session missing")
     }
 
     pub fn merge_sessions(&self, ids: &[String], summary: Option<String>) -> Result<WorkSession> {
@@ -828,37 +996,97 @@ impl AppDb {
         let row = {
             let mut stmt = conn.prepare(&sql)?;
             stmt.query_row(rusqlite::params_from_iter(ids), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, f32>(6)?, r.get::<_, String>(7)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, f32>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
             })?
         };
         let new_id = Uuid::new_v4().to_string();
         let evidence = merge_evidence_blobs(&row.7);
         conn.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-merge',?10)",
-            params![new_id, row.0, row.1, row.2, row.3, row.4, summary.unwrap_or(row.5), row.6, serde_json::to_string(&evidence)?, now()],
+            params![
+                new_id,
+                row.0,
+                row.1,
+                row.2,
+                row.3,
+                row.4,
+                summary.unwrap_or(row.5),
+                row.6,
+                serde_json::to_string(&evidence)?,
+                now()
+            ],
         )?;
-        for id in ids { conn.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?; }
+        for id in ids {
+            record_tombstone(&conn, "session", id)?;
+            conn.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
+        }
         drop(conn);
         self.get_session(&new_id)?.context("merged session missing")
     }
 
     pub fn split_session(&self, id: &str, split_at: &str) -> Result<Vec<WorkSession>> {
         let session = self.get_session(id)?.context("session not found")?;
-        anyhow::ensure!(split_at > session.started_at.as_str() && split_at < session.ended_at.as_str(), "split_at must be inside session range");
+        anyhow::ensure!(
+            split_at > session.started_at.as_str() && split_at < session.ended_at.as_str(),
+            "split_at must be inside session range"
+        );
         let first_id = Uuid::new_v4().to_string();
         let second_id = Uuid::new_v4().to_string();
         let evidence_json = serde_json::to_string(&session.evidence)?;
         let conn = self.conn.lock();
+        record_tombstone(&conn, "session", id)?;
         conn.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
-        conn.execute("INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)", params![first_id, session.started_at, split_at, session.project_id, session.task_id, session.category, format!("{}（前半段）", session.summary), session.confidence, evidence_json, now()])?;
+        conn.execute(
+            "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
+            params![
+                first_id,
+                session.started_at,
+                split_at,
+                session.project_id,
+                session.task_id,
+                session.category,
+                format!("{}（前半段）", session.summary),
+                session.confidence,
+                evidence_json,
+                now()
+            ],
+        )?;
         let evidence_json2 = serde_json::to_string(&session.evidence)?;
-        conn.execute("INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)", params![second_id, split_at, session.ended_at, session.project_id, session.task_id, session.category, format!("{}（后半段）", session.summary), session.confidence, evidence_json2, now()])?;
+        conn.execute(
+            "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
+            params![
+                second_id,
+                split_at,
+                session.ended_at,
+                session.project_id,
+                session.task_id,
+                session.category,
+                format!("{}（后半段）", session.summary),
+                session.confidence,
+                evidence_json2,
+                now()
+            ],
+        )?;
         drop(conn);
-        Ok(vec![self.get_session(&first_id)?.unwrap(), self.get_session(&second_id)?.unwrap()])
+        Ok(vec![
+            self.get_session(&first_id)?.unwrap(),
+            self.get_session(&second_id)?.unwrap(),
+        ])
     }
 
     pub fn ingest_raw_event(&self, mut event: RawActivityEvent) -> Result<()> {
-        if event.id.is_empty() { event.id = Uuid::new_v4().to_string(); }
+        if event.id.is_empty() {
+            event.id = Uuid::new_v4().to_string();
+        }
         self.store_raw_event(&event)?;
         self.materialize_event_session(&event)?;
         Ok(())
@@ -870,7 +1098,18 @@ impl AppDb {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO raw_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![event.id, event.source, event.timestamp, event.app, event.window_title, event.url, event.file_path, event.workspace, input_stats, metadata],
+            params![
+                event.id,
+                event.source,
+                event.timestamp,
+                event.app,
+                event.window_title,
+                event.url,
+                event.file_path,
+                event.workspace,
+                input_stats,
+                metadata
+            ],
         )?;
         let changed = conn.execute(
             "UPDATE work_sessions SET ended_at=?1, updated_at=?2 WHERE id=?3",
@@ -884,7 +1123,18 @@ impl AppDb {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO raw_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![event.id, event.source, event.timestamp, event.app, event.window_title, event.url, event.file_path, event.workspace, serde_json::to_string(&event.input_stats)?, event.metadata.to_string()],
+            params![
+                event.id,
+                event.source,
+                event.timestamp,
+                event.app,
+                event.window_title,
+                event.url,
+                event.file_path,
+                event.workspace,
+                serde_json::to_string(&event.input_stats)?,
+                event.metadata.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -892,7 +1142,8 @@ impl AppDb {
     fn materialize_event_session(&self, event: &RawActivityEvent) -> Result<()> {
         let settings = self.get_settings()?;
         let is_idle = event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64;
-        let (project_id, task_id, category, summary, confidence) = self.heuristic_attribution(event, is_idle)?;
+        let (project_id, task_id, category, summary, confidence) =
+            self.heuristic_attribution(event, is_idle)?;
         let page_title = event
             .metadata
             .get("activePageTitle")
@@ -900,12 +1151,28 @@ impl AppDb {
             .filter(|value| !value.trim().is_empty());
         let evidence = vec![
             EvidenceItem {
-                kind: if page_title.is_some() { "page".into() } else { "window".into() },
-                label: if page_title.is_some() { "当前页面".into() } else { "窗口".into() },
-                value: page_title.map(str::to_string).or_else(|| event.window_title.clone()).unwrap_or_else(|| "未知窗口".into()),
+                kind: if page_title.is_some() {
+                    "page".into()
+                } else {
+                    "window".into()
+                },
+                label: if page_title.is_some() {
+                    "当前页面".into()
+                } else {
+                    "窗口".into()
+                },
+                value: page_title
+                    .map(str::to_string)
+                    .or_else(|| event.window_title.clone())
+                    .unwrap_or_else(|| "未知窗口".into()),
                 weight: if page_title.is_some() { 0.82 } else { 0.7 },
             },
-            EvidenceItem { kind: "app".into(), label: "应用".into(), value: event.app.clone().unwrap_or_else(|| "未知应用".into()), weight: 0.5 },
+            EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: event.app.clone().unwrap_or_else(|| "未知应用".into()),
+                weight: 0.5,
+            },
         ];
         let conn = self.conn.lock();
         let last: Option<(String, String, String, String, i64)> = conn.query_row(
@@ -914,20 +1181,41 @@ impl AppDb {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).optional()?;
         if let Some((id, last_summary, last_category, _last_end, confirmed)) = last {
-            if !starts_new_context(event) && confirmed == 0 && last_summary == summary && last_category == category {
+            if !starts_new_context(event)
+                && confirmed == 0
+                && last_summary == summary
+                && last_category == category
+            {
                 conn.execute("UPDATE work_sessions SET ended_at=?1, confidence=MAX(confidence, ?2), evidence_json=?3, updated_at=?4 WHERE id=?5", params![event.timestamp, confidence, serde_json::to_string(&evidence)?, now(), id])?;
                 return Ok(());
             }
         }
         conn.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'collector-rule',?10)",
-            params![Uuid::new_v4().to_string(), event.timestamp, event.timestamp, project_id, task_id, category, summary, confidence, serde_json::to_string(&evidence)?, now()],
+            params![
+                Uuid::new_v4().to_string(),
+                event.timestamp,
+                event.timestamp,
+                project_id,
+                task_id,
+                category,
+                summary,
+                confidence,
+                serde_json::to_string(&evidence)?,
+                now()
+            ],
         )?;
         Ok(())
     }
 
-    fn heuristic_attribution(&self, event: &RawActivityEvent, is_idle: bool) -> Result<(Option<String>, Option<String>, String, String, f32)> {
-        if is_idle { return Ok((None, None, "离开".into(), "离开/空闲".into(), 0.96)); }
+    fn heuristic_attribution(
+        &self,
+        event: &RawActivityEvent,
+        is_idle: bool,
+    ) -> Result<(Option<String>, Option<String>, String, String, f32)> {
+        if is_idle {
+            return Ok((None, None, "离开".into(), "离开/空闲".into(), 0.96));
+        }
         if let Some(pin) = self.active_context()? {
             return Ok((
                 Some(pin.project_id),
@@ -937,15 +1225,31 @@ impl AppDb {
                 0.98,
             ));
         }
-        let hay = format!("{} {} {} {}", event.app.clone().unwrap_or_default(), event.window_title.clone().unwrap_or_default(), event.url.clone().unwrap_or_default(), event.file_path.clone().unwrap_or_default()).to_lowercase();
+        let hay = format!(
+            "{} {} {} {}",
+            event.app.clone().unwrap_or_default(),
+            event.window_title.clone().unwrap_or_default(),
+            event.url.clone().unwrap_or_default(),
+            event.file_path.clone().unwrap_or_default()
+        )
+        .to_lowercase();
         let conn = self.conn.lock();
         let rules = {
             let mut stmt = conn.prepare("SELECT matcher_json,project_id,task_id,category,name FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC")?;
-            let mapped = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
             collect_rows(mapped)?
         };
         for (matcher_json, project_id, task_id, category, _name) in rules {
-            let matcher: serde_json::Value = serde_json::from_str(&matcher_json).unwrap_or_default();
+            let matcher: serde_json::Value =
+                serde_json::from_str(&matcher_json).unwrap_or_default();
             let mut keywords = matcher
                 .get("keywords")
                 .and_then(|value| value.as_array())
@@ -960,15 +1264,48 @@ impl AppDb {
                     keywords.push(keyword.to_lowercase());
                 }
             }
-            let app = matcher.get("app").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let domain = matcher.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let workspace = matcher.get("workspace").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let has_constraint = !keywords.is_empty() || !app.is_empty() || !domain.is_empty() || !workspace.is_empty();
+            let app = matcher
+                .get("app")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let domain = matcher
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let workspace = matcher
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let has_constraint = !keywords.is_empty()
+                || !app.is_empty()
+                || !domain.is_empty()
+                || !workspace.is_empty();
             let hit = has_constraint
                 && (keywords.is_empty() || keywords.iter().any(|keyword| hay.contains(keyword)))
-                && (app.is_empty() || event.app.as_deref().unwrap_or("").to_lowercase().contains(&app))
-                && (domain.is_empty() || event.url.as_deref().unwrap_or("").to_lowercase().contains(&domain))
-                && (workspace.is_empty() || event.workspace.as_deref().unwrap_or("").to_lowercase().contains(&workspace));
+                && (app.is_empty()
+                    || event
+                        .app
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&app))
+                && (domain.is_empty()
+                    || event
+                        .url
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&domain))
+                && (workspace.is_empty()
+                    || event
+                        .workspace
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&workspace));
             if hit {
                 return Ok((
                     project_id,
@@ -979,15 +1316,38 @@ impl AppDb {
                 ));
             }
         }
-        let category = if hay.contains("code") || hay.contains("rust") || hay.contains("github") || hay.contains("tauri") || hay.contains("screenuse") || hay.contains("codex") {
+        let category = if hay.contains("code")
+            || hay.contains("rust")
+            || hay.contains("github")
+            || hay.contains("tauri")
+            || hay.contains("screenuse")
+            || hay.contains("codex")
+        {
             "开发"
-        } else if hay.contains("scholar") || hay.contains("pubmed") || hay.contains("知网") || hay.contains("arxiv") || hay.contains("pdf") || hay.contains("论文") || hay.contains("教材") || hay.contains("ebook") {
+        } else if hay.contains("scholar")
+            || hay.contains("pubmed")
+            || hay.contains("知网")
+            || hay.contains("arxiv")
+            || hay.contains("pdf")
+            || hay.contains("论文")
+            || hay.contains("教材")
+            || hay.contains("ebook")
+        {
             "学习"
-        } else if hay.contains("word") || hay.contains("wps") || hay.contains("obsidian") || hay.contains("markdown") {
+        } else if hay.contains("word")
+            || hay.contains("wps")
+            || hay.contains("obsidian")
+            || hay.contains("markdown")
+        {
             "写作"
         } else if hay.contains("bilibili") || hay.contains("course") {
             "学习"
-        } else if hay.contains("wechat") || hay.contains("qq") || hay.contains("mail") || hay.contains("teams") || hay.contains("meeting") {
+        } else if hay.contains("wechat")
+            || hay.contains("qq")
+            || hay.contains("mail")
+            || hay.contains("teams")
+            || hay.contains("meeting")
+        {
             "沟通"
         } else if hay.contains("steam") || hay.contains("game") || hay.contains("youtube") {
             "娱乐"
@@ -1005,7 +1365,19 @@ impl AppDb {
 
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute("INSERT OR REPLACE INTO analysis_jobs VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![job.id, serde_json::to_string(&job.chunk_ids)?, job.metadata_range.started_at, job.metadata_range.ended_at, job.mode, job.retry_count, job.status, job.error])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO analysis_jobs VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                job.id,
+                serde_json::to_string(&job.chunk_ids)?,
+                job.metadata_range.started_at,
+                job.metadata_range.ended_at,
+                job.mode,
+                job.retry_count,
+                job.status,
+                job.error
+            ],
+        )?;
         Ok(())
     }
 
@@ -1016,12 +1388,17 @@ impl AppDb {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? as u32, r.get(6)?, r.get(7)?)),
         ).optional()?;
-        if let Some((id, chunk_ids_json, started_at, ended_at, mode, retry_count, _status, error)) = row {
+        if let Some((id, chunk_ids_json, started_at, ended_at, mode, retry_count, _status, error)) =
+            row
+        {
             conn.execute("UPDATE analysis_jobs SET status='running', error=NULL WHERE id=?1 AND status='pending'", params![id])?;
             Ok(Some(AnalysisJob {
                 id,
                 chunk_ids: parse_json(&chunk_ids_json),
-                metadata_range: TimeRange { started_at, ended_at },
+                metadata_range: TimeRange {
+                    started_at,
+                    ended_at,
+                },
                 mode,
                 retry_count,
                 status: "running".into(),
@@ -1032,7 +1409,13 @@ impl AppDb {
         }
     }
 
-    pub fn mark_analysis_job_status(&self, id: &str, status: &str, retry_count: Option<u32>, error: Option<String>) -> Result<()> {
+    pub fn mark_analysis_job_status(
+        &self,
+        id: &str,
+        status: &str,
+        retry_count: Option<u32>,
+        error: Option<String>,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE analysis_jobs SET status=?1, retry_count=COALESCE(?2,retry_count), error=?3 WHERE id=?4",
@@ -1041,7 +1424,11 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn list_raw_events_between(&self, started_at: &str, ended_at: &str) -> Result<Vec<RawActivityEvent>> {
+    pub fn list_raw_events_between(
+        &self,
+        started_at: &str,
+        ended_at: &str,
+    ) -> Result<Vec<RawActivityEvent>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(r#"
             SELECT id,source,timestamp,app,window_title,url,file_path,workspace,input_stats_json,metadata_json
@@ -1069,31 +1456,72 @@ impl AppDb {
         collect_rows(rows)
     }
 
-    pub fn upsert_project_by_name(&self, name: &str, category: &str, source: &str) -> Result<String> {
+    pub fn upsert_project_by_name(
+        &self,
+        name: &str,
+        category: &str,
+        source: &str,
+    ) -> Result<String> {
         let name = clean_name(name, "自动发现项目");
         let category = clean_name(category, "杂务");
         let conn = self.conn.lock();
-        if let Some(id) = conn.query_row("SELECT id FROM projects WHERE name=?1 AND category=?2 LIMIT 1", params![name, category], |r| r.get::<_, String>(0)).optional()? {
-            conn.execute("UPDATE projects SET updated_at=?1 WHERE id=?2", params![now(), id])?;
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM projects WHERE name=?1 AND category=?2 LIMIT 1",
+                params![name, category],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            conn.execute(
+                "UPDATE projects SET updated_at=?1 WHERE id=?2",
+                params![now(), id],
+            )?;
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO projects VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
-            params![id, name, category, source, color_for_category(&category), format!("由 ScreenUse 根据窗口、URL、目录和计划源自动发现：{name}"), now()],
+            params![
+                id,
+                name,
+                category,
+                source,
+                color_for_category(&category),
+                format!("由 ScreenUse 根据窗口、URL、目录和计划源自动发现：{name}"),
+                now()
+            ],
         )?;
         Ok(id)
     }
 
-    pub fn upsert_task_by_title(&self, project_id: &str, title: &str, source: &str) -> Result<String> {
+    pub fn upsert_task_by_title(
+        &self,
+        project_id: &str,
+        title: &str,
+        source: &str,
+    ) -> Result<String> {
         let title = clean_name(title, "待确认活动");
         let conn = self.conn.lock();
-        if let Some(id) = conn.query_row("SELECT id FROM tasks WHERE project_id=?1 AND title=?2 LIMIT 1", params![project_id, title], |r| r.get::<_, String>(0)).optional()? {
-            conn.execute("UPDATE tasks SET status='active', updated_at=?1 WHERE id=?2", params![now(), id])?;
+        if let Some(id) = conn
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id=?1 AND title=?2 LIMIT 1",
+                params![project_id, title],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            conn.execute(
+                "UPDATE tasks SET status='active', updated_at=?1 WHERE id=?2",
+                params![now(), id],
+            )?;
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
-        conn.execute("INSERT INTO tasks VALUES (?1,?2,?3,'active',?4,NULL,?5,?5)", params![id, project_id, title, source, now()])?;
+        conn.execute(
+            "INSERT INTO tasks VALUES (?1,?2,?3,'active',?4,NULL,?5,?5)",
+            params![id, project_id, title, source, now()],
+        )?;
         Ok(id)
     }
 
@@ -1137,7 +1565,16 @@ impl AppDb {
         )?;
         conn.execute(
             "INSERT INTO activities VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![Uuid::new_v4().to_string(), id, source, "自动归因活动", summary, range.started_at, range.ended_at, serde_json::to_string(&evidence)?],
+            params![
+                Uuid::new_v4().to_string(),
+                id,
+                source,
+                "自动归因活动",
+                summary,
+                range.started_at,
+                range.ended_at,
+                serde_json::to_string(&evidence)?
+            ],
         )?;
         drop(conn);
         self.match_plan_items_for_session(&id)?;
@@ -1145,16 +1582,39 @@ impl AppDb {
     }
 
     fn match_plan_items_for_session(&self, session_id: &str) -> Result<()> {
-        let session = match self.get_session(session_id)? { Some(s) => s, None => return Ok(()) };
-        let hay = format!("{} {} {} {}", session.summary, session.category, session.project_name.unwrap_or_default(), session.task_title.unwrap_or_default()).to_lowercase();
+        let session = match self.get_session(session_id)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let hay = format!(
+            "{} {} {} {}",
+            session.summary,
+            session.category,
+            session.project_name.unwrap_or_default(),
+            session.task_title.unwrap_or_default()
+        )
+        .to_lowercase();
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT id,title,note,matched_session_ids_json FROM plan_items")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?)))?;
+        let mut stmt =
+            conn.prepare("SELECT id,title,note,matched_session_ids_json FROM plan_items")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
         let mut updates = Vec::new();
         for row in rows {
             let (id, title, note, matched_json) = row?;
             let needle = format!("{} {}", title, note.unwrap_or_default()).to_lowercase();
-            if !needle.is_empty() && (hay.contains(&needle) || needle.split_whitespace().any(|part| part.len() >= 3 && hay.contains(part))) {
+            if !needle.is_empty()
+                && (hay.contains(&needle)
+                    || needle
+                        .split_whitespace()
+                        .any(|part| part.len() >= 3 && hay.contains(part)))
+            {
                 let mut matched: Vec<String> = parse_json(&matched_json);
                 if !matched.iter().any(|s| s == session_id) {
                     matched.push(session_id.to_string());
@@ -1164,7 +1624,10 @@ impl AppDb {
         }
         drop(stmt);
         for (id, matched_json) in updates {
-            conn.execute("UPDATE plan_items SET matched_session_ids_json=?1, updated_at=?2 WHERE id=?3", params![matched_json, now(), id])?;
+            conn.execute(
+                "UPDATE plan_items SET matched_session_ids_json=?1, updated_at=?2 WHERE id=?3",
+                params![matched_json, now(), id],
+            )?;
         }
         Ok(())
     }
@@ -1188,7 +1651,11 @@ impl AppDb {
         Ok(changed)
     }
 
-    pub fn learn_rule_from_session(&self, id: &str, keyword: Option<&str>) -> Result<AttributionRule> {
+    pub fn learn_rule_from_session(
+        &self,
+        id: &str,
+        keyword: Option<&str>,
+    ) -> Result<AttributionRule> {
         let session = self.get_session(id)?.context("session not found")?;
         let app = session
             .evidence
@@ -1212,8 +1679,14 @@ impl AppDb {
                     .map(|value| value.chars().take(48).collect::<String>()),
             );
         }
-        for candidate in [session.project_name.as_deref(), session.task_title.as_deref()] {
-            if let Some(candidate) = candidate.map(str::trim).filter(|value| value.chars().count() >= 2) {
+        for candidate in [
+            session.project_name.as_deref(),
+            session.task_title.as_deref(),
+        ] {
+            if let Some(candidate) = candidate
+                .map(str::trim)
+                .filter(|value| value.chars().count() >= 2)
+            {
                 keywords.push(candidate.chars().take(48).collect());
             }
         }
@@ -1235,7 +1708,10 @@ impl AppDb {
         }
         let rule = AttributionRule {
             id: Uuid::new_v4().to_string(),
-            name: format!("自动学习：{}", session.summary.chars().take(24).collect::<String>()),
+            name: format!(
+                "自动学习：{}",
+                session.summary.chars().take(24).collect::<String>()
+            ),
             priority: 90,
             matcher,
             project_id: session.project_id,
@@ -1246,8 +1722,9 @@ impl AppDb {
         };
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO attribution_rules VALUES (?1,?2,?3,?4,?5,?6,?7,1,1)",
-            params![rule.id, rule.name, rule.priority, rule.matcher.to_string(), rule.project_id, rule.task_id, rule.category],
+            "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,1,1,?8)",
+            params![rule.id, rule.name, rule.priority, rule.matcher.to_string(), rule.project_id, rule.task_id, rule.category, now()],
         )?;
         Ok(rule)
     }
@@ -1262,10 +1739,17 @@ impl AppDb {
         let temp_storage_limit_gb = self.get_settings()?.temp_storage_limit_gb as f32;
         let conn = self.conn.lock();
         let count = |status: &str| -> Result<u32> {
-            Ok(conn.query_row("SELECT COUNT(*) FROM analysis_jobs WHERE status=?1", params![status], |r| r.get::<_, i64>(0))? as u32)
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM analysis_jobs WHERE status=?1",
+                params![status],
+                |r| r.get::<_, i64>(0),
+            )? as u32)
         };
         Ok(QueueHealth {
-            pending: count("pending")?, running: count("running")?, failed: count("failed")?, downgraded: count("downgraded")?,
+            pending: count("pending")?,
+            running: count("running")?,
+            failed: count("failed")?,
+            downgraded: count("downgraded")?,
             temp_storage_gb: dir_size(self.data_dir.join("media-cache")) as f32 / 1_073_741_824.0,
             temp_storage_limit_gb,
         })
@@ -1277,7 +1761,17 @@ impl AppDb {
         let rows = stmt.query_map(params![limit], |r| {
             let tags: String = r.get(7)?;
             let matched: String = r.get(8)?;
-            Ok(PlanItem { id: r.get(0)?, source: r.get(1)?, title: r.get(2)?, note: r.get(3)?, start_at: r.get(4)?, due_at: r.get(5)?, status: r.get(6)?, tags: parse_json(&tags), matched_session_ids: parse_json(&matched) })
+            Ok(PlanItem {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                title: r.get(2)?,
+                note: r.get(3)?,
+                start_at: r.get(4)?,
+                due_at: r.get(5)?,
+                status: r.get(6)?,
+                tags: parse_json(&tags),
+                matched_session_ids: parse_json(&matched),
+            })
         })?;
         collect_rows(rows)
     }
@@ -1286,7 +1780,21 @@ impl AppDb {
         let conn = self.conn.lock();
         let mut count = 0;
         for item in items {
-            conn.execute("INSERT OR REPLACE INTO plan_items VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![item.id, item.source, item.title, item.note, item.start_at, item.due_at, item.status, serde_json::to_string(&item.tags)?, serde_json::to_string(&item.matched_session_ids)?, now()])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO plan_items VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    item.id,
+                    item.source,
+                    item.title,
+                    item.note,
+                    item.start_at,
+                    item.due_at,
+                    item.status,
+                    serde_json::to_string(&item.tags)?,
+                    serde_json::to_string(&item.matched_session_ids)?,
+                    now()
+                ],
+            )?;
             count += 1;
         }
         Ok(count)
@@ -1303,7 +1811,13 @@ impl AppDb {
             GROUP BY COALESCE(p.name, '未归类'), ws.category
             ORDER BY minutes DESC LIMIT 12
         "#)?;
-        let rows = stmt.query_map([], |r| Ok(TrendPoint { label: r.get(0)?, value: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), group: r.get(2)? }))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TrendPoint {
+                label: r.get(0)?,
+                value: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                group: r.get(2)?,
+            })
+        })?;
         collect_rows(rows)
     }
 
@@ -1313,51 +1827,145 @@ impl AppDb {
             SELECT category, ROUND(SUM((julianday(ended_at)-julianday(started_at))*24*60), 1) AS minutes, category
             FROM work_sessions GROUP BY category ORDER BY minutes DESC
         "#)?;
-        let rows = stmt.query_map([], |r| Ok(TrendPoint { label: r.get(0)?, value: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), group: r.get(2)? }))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TrendPoint {
+                label: r.get(0)?,
+                value: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                group: r.get(2)?,
+            })
+        })?;
         collect_rows(rows)
     }
 
     pub fn export_path(&self, extension: &str) -> PathBuf {
-        self.data_dir.join("exports").join(format!("screenuse-{}.{}", Utc::now().format("%Y%m%d-%H%M%S"), extension))
+        self.data_dir.join("exports").join(format!(
+            "screenuse-{}.{}",
+            Utc::now().format("%Y%m%d-%H%M%S"),
+            extension
+        ))
     }
 
     pub fn record_export(&self, format: &str, path: &Path) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute("INSERT INTO export_records VALUES (?1,?2,?3,?4)", params![Uuid::new_v4().to_string(), format, path.display().to_string(), now()])?;
+        conn.execute(
+            "INSERT INTO export_records VALUES (?1,?2,?3,?4)",
+            params![
+                Uuid::new_v4().to_string(),
+                format,
+                path.display().to_string(),
+                now()
+            ],
+        )?;
         Ok(())
     }
 
     pub fn backup_now(&self, target_dir: Option<String>) -> Result<PathBuf> {
-        let dir = target_dir.map(PathBuf::from).unwrap_or_else(|| self.data_dir.join("backups"));
+        let dir = target_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.data_dir.join("backups"));
         fs::create_dir_all(&dir)?;
-        let target = dir.join(format!("screenuse-backup-{}.db", Utc::now().format("%Y%m%d-%H%M%S")));
+        let target = dir.join(format!(
+            "screenuse-backup-{}.db",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
         fs::copy(&self.db_path, &target)?;
         Ok(target)
     }
-
 }
 
 fn starts_new_context(event: &RawActivityEvent) -> bool {
-    event.metadata.get("contextStart").and_then(serde_json::Value::as_bool).unwrap_or(false)
+    event
+        .metadata
+        .get("contextStart")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
-fn insert_seed_session(conn: &Connection, id: &str, project_id: &str, task_id: &str, category: &str, summary: &str, start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>, confidence: f32) -> Result<()> {
+fn insert_seed_session(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    task_id: &str,
+    category: &str,
+    summary: &str,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    confidence: f32,
+) -> Result<()> {
     let evidence = vec![
-        EvidenceItem { kind: "window".into(), label: "窗口".into(), value: "Codex / VS Code / Chrome".into(), weight: 0.7 },
-        EvidenceItem { kind: "ai".into(), label: "AI摘要".into(), value: summary.into(), weight: 0.9 },
+        EvidenceItem {
+            kind: "window".into(),
+            label: "窗口".into(),
+            value: "Codex / VS Code / Chrome".into(),
+            weight: 0.7,
+        },
+        EvidenceItem {
+            kind: "ai".into(),
+            label: "AI摘要".into(),
+            value: summary.into(),
+            weight: 0.9,
+        },
     ];
-    conn.execute("INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'seed',?10)", params![id, fmt(start), fmt(end), project_id, task_id, category, summary, confidence, serde_json::to_string(&evidence)?, now()])?;
+    conn.execute(
+        "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'seed',?10)",
+        params![
+            id,
+            fmt(start),
+            fmt(end),
+            project_id,
+            task_id,
+            category,
+            summary,
+            confidence,
+            serde_json::to_string(&evidence)?,
+            now()
+        ],
+    )?;
     Ok(())
 }
 
-pub fn now() -> String { fmt(Utc::now()) }
-fn fmt(t: chrono::DateTime<Utc>) -> String { t.to_rfc3339_opts(SecondsFormat::Secs, true) }
+pub fn now() -> String {
+    fmt(Utc::now())
+}
+fn fmt(t: chrono::DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
 
-fn parse_json<T: DeserializeOwned + Default>(s: &str) -> T { serde_json::from_str(s).unwrap_or_default() }
+fn parse_json<T: DeserializeOwned + Default>(s: &str) -> T {
+    serde_json::from_str(s).unwrap_or_default()
+}
 
 fn clean_name(value: &str, fallback: &str) -> String {
     let cleaned = value.trim().replace(['\r', '\n', '\t'], " ");
-    if cleaned.is_empty() { fallback.to_string() } else { cleaned.chars().take(80).collect() }
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned.chars().take(80).collect()
+    }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+    ))?;
+    Ok(())
+}
+
+fn record_tombstone(conn: &Connection, entity_kind: &str, entity_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_tombstones(entity_kind,entity_id,deleted_at,device_id)
+         VALUES(?1,?2,?3,'')
+         ON CONFLICT(entity_kind,entity_id) DO UPDATE SET deleted_at=excluded.deleted_at",
+        params![entity_kind, entity_id, now()],
+    )?;
+    Ok(())
 }
 
 fn color_for_category(category: &str) -> &'static str {
@@ -1444,14 +2052,24 @@ fn custom_category_color(name: &str) -> &'static str {
     const COLORS: [&str; 8] = [
         "#8b5cf6", "#ec4899", "#06b6d4", "#14b8a6", "#f97316", "#6366f1", "#84cc16", "#d946ef",
     ];
-    let hash = name.bytes().fold(0usize, |value, byte| value.wrapping_mul(31).wrapping_add(byte as usize));
+    let hash = name.bytes().fold(0usize, |value, byte| {
+        value.wrapping_mul(31).wrapping_add(byte as usize)
+    });
     COLORS[hash % COLORS.len()]
 }
 
 fn is_generic_context_label(value: &str) -> bool {
     matches!(
         value.trim().trim_end_matches(".exe"),
-        "chatgpt" | "codex" | "chrome" | "msedge" | "firefox" | "brave" | "new tab" | "新标签页" | "电脑活动"
+        "chatgpt"
+            | "codex"
+            | "chrome"
+            | "msedge"
+            | "firefox"
+            | "brave"
+            | "new tab"
+            | "新标签页"
+            | "电脑活动"
     )
 }
 
@@ -1474,25 +2092,37 @@ fn map_work_session(row: &Row<'_>) -> rusqlite::Result<WorkSession> {
     })
 }
 
-fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>) -> Result<Vec<T>> {
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> Result<Vec<T>> {
     let mut out = Vec::new();
-    for row in rows { out.push(row?); }
+    for row in rows {
+        out.push(row?);
+    }
     Ok(out)
 }
 
 fn merge_evidence_blobs(blob: &str) -> Vec<EvidenceItem> {
-    blob.split("||").flat_map(|part| serde_json::from_str::<Vec<EvidenceItem>>(part).unwrap_or_default()).take(20).collect()
+    blob.split("||")
+        .flat_map(|part| serde_json::from_str::<Vec<EvidenceItem>>(part).unwrap_or_default())
+        .take(20)
+        .collect()
 }
 
 fn dir_size(path: PathBuf) -> u64 {
-    if !path.exists() { return 0; }
+    if !path.exists() {
+        return 0;
+    }
     let mut total = 0;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Ok(meta) = entry.metadata() {
-                if meta.is_file() { total += meta.len(); }
-                else if meta.is_dir() { total += dir_size(p); }
+                if meta.is_file() {
+                    total += meta.len();
+                } else if meta.is_dir() {
+                    total += dir_size(p);
+                }
             }
         }
     }
@@ -1521,16 +2151,24 @@ mod tests {
     #[test]
     fn context_start_forces_a_new_session_boundary() {
         let event = RawActivityEvent {
-            id: "context-1".into(), source: "test".into(), timestamp: now(), app: None,
-            window_title: None, url: None, file_path: None, workspace: None,
-            input_stats: InputStats::default(), metadata: serde_json::json!({ "contextStart": true }),
+            id: "context-1".into(),
+            source: "test".into(),
+            timestamp: now(),
+            app: None,
+            window_title: None,
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({ "contextStart": true }),
         };
         assert!(starts_new_context(&event));
     }
 
     #[test]
     fn active_page_title_is_saved_as_the_primary_evidence() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-page-evidence-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-page-evidence-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         db.ingest_raw_event(RawActivityEvent {
             id: "page-evidence".into(),
@@ -1559,7 +2197,8 @@ mod tests {
 
     #[test]
     fn dashboard_load_does_not_reenter_the_database_lock() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-dashboard-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-dashboard-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let dashboard = db.dashboard(false).expect("load dashboard");
         assert!(!dashboard.projects.is_empty());
@@ -1569,7 +2208,8 @@ mod tests {
 
     #[test]
     fn existing_sampling_settings_migrate_to_one_second_only_once() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-sampling-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-sampling-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let mut settings = AppSettings::default();
         settings.poll_interval_seconds = 10;
@@ -1593,7 +2233,8 @@ mod tests {
 
     #[test]
     fn historical_idle_boundary_moves_back_to_the_last_input_time_once() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-idle-boundary-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-idle-boundary-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let active_id = Uuid::new_v4().to_string();
         let idle_id = Uuid::new_v4().to_string();
@@ -1606,8 +2247,11 @@ mod tests {
         .expect("serialize evidence");
         {
             let conn = db.conn.lock();
-            conn.execute("DELETE FROM settings WHERE key=?1", params![IDLE_BOUNDARY_MIGRATION_KEY])
-                .expect("reset migration marker");
+            conn.execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![IDLE_BOUNDARY_MIGRATION_KEY],
+            )
+            .expect("reset migration marker");
             conn.execute(
                 "INSERT INTO work_sessions VALUES (?1,'2026-07-12T10:00:00Z','2026-07-12T10:05:00Z',NULL,NULL,'杂务','QQ',0.8,?2,0,'context-complete',?3)",
                 params![active_id, evidence, now()],
@@ -1622,8 +2266,14 @@ mod tests {
 
         assert_eq!(db.backfill_idle_boundaries().expect("backfill idle"), 1);
         assert_eq!(db.backfill_idle_boundaries().expect("do not repeat"), 0);
-        let active = db.get_session(&active_id).expect("load active").expect("active exists");
-        let idle = db.get_session(&idle_id).expect("load idle").expect("idle exists");
+        let active = db
+            .get_session(&active_id)
+            .expect("load active")
+            .expect("active exists");
+        let idle = db
+            .get_session(&idle_id)
+            .expect("load idle")
+            .expect("idle exists");
         assert_eq!(active.ended_at, "2026-07-12T10:02:00Z");
         assert_eq!(idle.started_at, "2026-07-12T10:02:00Z");
 
@@ -1633,7 +2283,8 @@ mod tests {
 
     #[test]
     fn removed_ddl_manager_items_are_purged_on_open() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-ddl-removal-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-ddl-removal-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         db.upsert_plan_items(&[PlanItem {
             id: "ddl-task:legacy".into(),
@@ -1661,12 +2312,19 @@ mod tests {
 
     #[test]
     fn adjacent_same_app_assignment_is_coalesced_but_real_app_switches_remain() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-coalesce-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-coalesce-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
-        let project = db.create_project("连续会话", "杂务").expect("create project");
+        let project = db
+            .create_project("连续会话", "杂务")
+            .expect("create project");
         let task = db.create_task(&project.id, "QQ").expect("create task");
         let base = Utc::now() + Duration::hours(2);
-        let insert = |id: &str, start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>, summary: &str, app: &str| {
+        let insert = |id: &str,
+                      start: chrono::DateTime<Utc>,
+                      end: chrono::DateTime<Utc>,
+                      summary: &str,
+                      app: &str| {
             let evidence = vec![EvidenceItem {
                 kind: "app".into(),
                 label: "应用".into(),
@@ -1682,7 +2340,13 @@ mod tests {
                 .expect("insert session");
         };
 
-        insert("qq-main", base, base + Duration::seconds(40), "QQ", "QQ.exe");
+        insert(
+            "qq-main",
+            base,
+            base + Duration::seconds(40),
+            "QQ",
+            "QQ.exe",
+        );
         insert(
             "qq-viewer",
             base + Duration::seconds(40),
@@ -1706,11 +2370,17 @@ mod tests {
         );
 
         assert_eq!(db.compact_sessions().expect("compact sessions"), 1);
-        let merged = db.get_session("qq-main").expect("load merged").expect("merged exists");
+        let merged = db
+            .get_session("qq-main")
+            .expect("load merged")
+            .expect("merged exists");
         assert_eq!(merged.ended_at, fmt(base + Duration::seconds(55)));
         assert_eq!(merged.summary, "QQ");
         assert!(db.get_session("qq-viewer").expect("load removed").is_none());
-        assert!(db.get_session("chat-switch").expect("load switch").is_some());
+        assert!(db
+            .get_session("chat-switch")
+            .expect("load switch")
+            .is_some());
         assert!(db.get_session("qq-return").expect("load return").is_some());
 
         drop(db);
@@ -1719,12 +2389,18 @@ mod tests {
 
     #[test]
     fn multiple_selected_sessions_are_corrected_together() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-bulk-correction-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-bulk-correction-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
-        let project = db.create_project("批量修正项目", "学习").expect("create project");
+        let project = db
+            .create_project("批量修正项目", "学习")
+            .expect("create project");
         let task = db.create_task(&project.id, "旧任务").expect("create task");
         let sessions = db.list_sessions(2).expect("list sessions");
-        let ids = sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>();
+        let ids = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
         for id in &ids {
             db.update_session(
                 id,
@@ -1770,9 +2446,12 @@ mod tests {
 
     #[test]
     fn deleting_a_project_unassigns_its_sessions_and_tasks() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-project-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-project-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
-        let project = db.create_project("误归类项目", "开发").expect("create project");
+        let project = db
+            .create_project("误归类项目", "开发")
+            .expect("create project");
         let task_id = db
             .upsert_task_by_title(&project.id, "临时任务", "manual")
             .expect("create task");
@@ -1793,10 +2472,17 @@ mod tests {
         .expect("assign session");
 
         db.delete_project(&project.id).expect("delete project");
-        let session = db.get_session(&session_id).expect("load session").expect("session remains");
+        let session = db
+            .get_session(&session_id)
+            .expect("load session")
+            .expect("session remains");
         assert!(session.project_id.is_none());
         assert!(session.task_id.is_none());
-        assert!(!db.list_projects().expect("list projects").iter().any(|item| item.id == project.id));
+        assert!(!db
+            .list_projects()
+            .expect("list projects")
+            .iter()
+            .any(|item| item.id == project.id));
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -1804,16 +2490,34 @@ mod tests {
 
     #[test]
     fn custom_categories_and_tasks_can_be_created_and_removed() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-taxonomy-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-taxonomy-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let category = db.create_category("竞赛").expect("create category");
-        let project = db.create_project("ICPC", &category.name).expect("create project");
-        let task = db.create_task(&project.id, "网站开发").expect("create task");
-        assert!(db.list_tasks().expect("list tasks").iter().any(|item| item.id == task.id));
+        let project = db
+            .create_project("ICPC", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "网站开发")
+            .expect("create task");
+        assert!(db
+            .list_tasks()
+            .expect("list tasks")
+            .iter()
+            .any(|item| item.id == task.id));
         db.delete_task(&task.id).expect("delete task");
-        assert!(!db.list_tasks().expect("list tasks").iter().any(|item| item.id == task.id));
+        assert!(!db
+            .list_tasks()
+            .expect("list tasks")
+            .iter()
+            .any(|item| item.id == task.id));
         db.delete_category(&category.name).expect("delete category");
-        let updated = db.list_projects().expect("list projects").into_iter().find(|item| item.id == project.id).expect("project remains");
+        let updated = db
+            .list_projects()
+            .expect("list projects")
+            .into_iter()
+            .find(|item| item.id == project.id)
+            .expect("project remains");
         assert_eq!(updated.category, "杂务");
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -1821,7 +2525,8 @@ mod tests {
 
     #[test]
     fn generic_chat_app_is_not_assigned_to_the_latest_project() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-generic-chat-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-generic-chat-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let session = classification::ingest_event(&db, &chat_event("chat-generic", "ChatGPT"))
             .expect("classify")
@@ -1834,18 +2539,29 @@ mod tests {
 
     #[test]
     fn same_names_are_scoped_by_category_and_project() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-same-name-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-same-name-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let first_category = db.create_category("分类甲").expect("create first category");
-        let second_category = db.create_category("分类乙").expect("create second category");
-        let first_project = db.create_project("同名项目", &first_category.name).expect("create first project");
-        let second_project = db.create_project("同名项目", &second_category.name).expect("create second project");
+        let second_category = db
+            .create_category("分类乙")
+            .expect("create second category");
+        let first_project = db
+            .create_project("同名项目", &first_category.name)
+            .expect("create first project");
+        let second_project = db
+            .create_project("同名项目", &second_category.name)
+            .expect("create second project");
 
         assert_ne!(first_project.id, second_project.id);
         assert!(db.create_project("同名项目", &first_category.name).is_err());
 
-        let first_task = db.create_task(&first_project.id, "同名任务").expect("create first task");
-        let second_task = db.create_task(&second_project.id, "同名任务").expect("create second task");
+        let first_task = db
+            .create_task(&first_project.id, "同名任务")
+            .expect("create first task");
+        let second_task = db
+            .create_task(&second_project.id, "同名任务")
+            .expect("create second task");
         assert_ne!(first_task.id, second_task.id);
         assert!(db.create_task(&first_project.id, "同名任务").is_err());
 
@@ -1855,13 +2571,19 @@ mod tests {
 
     #[test]
     fn chat_title_uses_project_and_task_context_instead_of_app_name() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-chat-context-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-chat-context-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let project = db.create_project("ICPC", "开发").expect("create project");
-        let task = db.create_task(&project.id, "网站开发").expect("create task");
-        let session = classification::ingest_event(&db, &chat_event("chat-icpc", "ICPC · icpc-trainer 网站开发"))
-            .expect("classify")
-            .expect("session");
+        let task = db
+            .create_task(&project.id, "网站开发")
+            .expect("create task");
+        let session = classification::ingest_event(
+            &db,
+            &chat_event("chat-icpc", "ICPC · icpc-trainer 网站开发"),
+        )
+        .expect("classify")
+        .expect("session");
         assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
         assert_eq!(session.category, "开发");
@@ -1871,11 +2593,15 @@ mod tests {
 
     #[test]
     fn context_pin_handles_apps_with_no_visible_context() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-context-pin-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-context-pin-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let project = db.create_project("ICPC", "开发").expect("create project");
-        let task = db.create_task(&project.id, "网站开发").expect("create task");
-        db.pin_context(&project.id, Some(&task.id), 30).expect("pin context");
+        let task = db
+            .create_task(&project.id, "网站开发")
+            .expect("create task");
+        db.pin_context(&project.id, Some(&task.id), 30)
+            .expect("pin context");
         let session = classification::ingest_event(&db, &chat_event("chat-pinned", "ChatGPT"))
             .expect("classify")
             .expect("session");
@@ -1888,10 +2614,13 @@ mod tests {
 
     #[test]
     fn corrected_chat_context_learns_scoped_keywords() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-chat-rule-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-chat-rule-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let project = db.create_project("ICPC", "开发").expect("create project");
-        let task = db.create_task(&project.id, "网站开发").expect("create task");
+        let task = db
+            .create_task(&project.id, "网站开发")
+            .expect("create task");
         let first = classification::ingest_event(&db, &chat_event("chat-corrected", "ChatGPT"))
             .expect("classify")
             .expect("session");
@@ -1912,9 +2641,10 @@ mod tests {
         db.learn_rule_from_session(&first.id, Some("ICPC, icpc-trainer"))
             .expect("learn scoped rule");
 
-        let second = classification::ingest_event(&db, &chat_event("chat-rule-hit", "ICPC trainer 对话"))
-            .expect("classify learned context")
-            .expect("session");
+        let second =
+            classification::ingest_event(&db, &chat_event("chat-rule-hit", "ICPC trainer 对话"))
+                .expect("classify learned context")
+                .expect("session");
         assert_eq!(second.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(second.task_id.as_deref(), Some(task.id.as_str()));
         assert_eq!(second.category, "开发");
@@ -1924,11 +2654,15 @@ mod tests {
 
     #[test]
     fn heartbeats_extend_one_block_and_context_start_creates_only_one_more() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-heartbeat-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-heartbeat-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let initial_count = db.list_sessions(500).expect("initial sessions").len();
         let base = Utc::now() + Duration::seconds(2);
-        let make_event = |id: &str, title: &str, timestamp: chrono::DateTime<Utc>, metadata: serde_json::Value| {
+        let make_event = |id: &str,
+                          title: &str,
+                          timestamp: chrono::DateTime<Utc>,
+                          metadata: serde_json::Value| {
             RawActivityEvent {
                 id: id.into(),
                 source: "test-observer".into(),
@@ -1943,8 +2677,13 @@ mod tests {
             }
         };
 
-        db.ingest_raw_event(make_event("stream-1", "paper.pdf", base, serde_json::json!({"contextStart": true})))
-            .expect("start context");
+        db.ingest_raw_event(make_event(
+            "stream-1",
+            "paper.pdf",
+            base,
+            serde_json::json!({"contextStart": true}),
+        ))
+        .expect("start context");
         let first = db.list_sessions(1).expect("first block")[0].clone();
         db.ingest_raw_event(make_event(
             "stream-1",
@@ -1956,14 +2695,21 @@ mod tests {
 
         let after_heartbeat = db.list_sessions(500).expect("sessions after heartbeat");
         assert_eq!(after_heartbeat.len(), initial_count + 1);
-        let extended = db.get_session(&first.id).expect("load first").expect("first exists");
+        let extended = db
+            .get_session(&first.id)
+            .expect("load first")
+            .expect("first exists");
         assert_eq!(extended.started_at, fmt(base));
         assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
         assert_ne!(extended.source, "context-complete");
 
-        db.mark_session_awaiting_confirmation(&first.id).expect("mark completed");
+        db.mark_session_awaiting_confirmation(&first.id)
+            .expect("mark completed");
         assert_eq!(
-            db.get_session(&first.id).expect("load completed").expect("completed exists").source,
+            db.get_session(&first.id)
+                .expect("load completed")
+                .expect("completed exists")
+                .source,
             "context-complete",
         );
 
@@ -1980,7 +2726,10 @@ mod tests {
             metadata: serde_json::json!({"contextStart": true}),
         })
         .expect("start second context");
-        assert_eq!(db.list_sessions(500).expect("final sessions").len(), initial_count + 2);
+        assert_eq!(
+            db.list_sessions(500).expect("final sessions").len(),
+            initial_count + 2
+        );
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -1988,7 +2737,8 @@ mod tests {
 
     #[test]
     fn fast_heartbeat_extends_the_known_session_without_reclassification() {
-        let data_dir = std::env::temp_dir().join(format!("screenuse-fast-heartbeat-test-{}", Uuid::new_v4()));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-fast-heartbeat-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         let base = Utc::now() + Duration::seconds(2);
         let mut event = RawActivityEvent {
@@ -2008,9 +2758,13 @@ mod tests {
 
         event.timestamp = fmt(base + Duration::seconds(10));
         event.metadata = serde_json::json!({"heartbeat": true});
-        db.heartbeat_raw_event(&event, &session.id).expect("extend known session");
+        db.heartbeat_raw_event(&event, &session.id)
+            .expect("extend known session");
 
-        let extended = db.get_session(&session.id).expect("load session").expect("session exists");
+        let extended = db
+            .get_session(&session.id)
+            .expect("load session")
+            .expect("session exists");
         assert_eq!(extended.started_at, fmt(base));
         assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
         assert_eq!(extended.summary, session.summary);

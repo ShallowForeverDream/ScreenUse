@@ -13,6 +13,7 @@ mod collectors;
 mod context_store;
 mod db;
 mod export;
+mod github_sync;
 mod integration_server;
 mod integrations;
 mod maintenance;
@@ -22,7 +23,9 @@ mod secrets;
 use collectors::{CollectorAdapter, DesktopCollector};
 use db::AppDb;
 use integrations::{IcsAdapter, IntegrationAdapter};
-use models::{AppSettings, DashboardData, SessionPatch};
+use models::{
+    AppSettings, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, SessionPatch,
+};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -103,7 +106,11 @@ fn delete_category(state: State<AppState>, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn create_task(state: State<AppState>, project_id: String, title: String) -> Result<models::Task, String> {
+fn create_task(
+    state: State<AppState>,
+    project_id: String,
+    title: String,
+) -> Result<models::Task, String> {
     state.db.create_task(&project_id, &title).map_err(map_err)
 }
 
@@ -119,7 +126,10 @@ fn pin_context(
     task_id: Option<String>,
     minutes: u32,
 ) -> Result<models::ContextPin, String> {
-    let pin = state.db.pin_context(&project_id, task_id.as_deref(), minutes).map_err(map_err)?;
+    let pin = state
+        .db
+        .pin_context(&project_id, task_id.as_deref(), minutes)
+        .map_err(map_err)?;
     if state.collector.health().running {
         state.collector.stop().map_err(map_err)?;
         state.collector.start(state.db.clone()).map_err(map_err)?;
@@ -195,7 +205,10 @@ fn learn_rule_from_session(
     id: String,
     keyword: Option<String>,
 ) -> Result<models::AttributionRule, String> {
-    state.db.learn_rule_from_session(&id, keyword.as_deref()).map_err(map_err)
+    state
+        .db
+        .learn_rule_from_session(&id, keyword.as_deref())
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -211,6 +224,46 @@ fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), St
         autostart::set_launch_at_login(settings.launch_at_login).map_err(map_err)?;
     }
     state.db.save_settings(&settings).map_err(map_err)
+}
+
+#[tauri::command]
+fn get_github_sync_status(state: State<AppState>) -> Result<GithubSyncStatus, String> {
+    github_sync::status(&state.db).map_err(map_err)
+}
+
+#[tauri::command]
+fn save_github_sync_config(
+    state: State<AppState>,
+    config: GithubSyncConfig,
+    token: Option<String>,
+    encryption_key: Option<String>,
+) -> Result<GithubSyncStatus, String> {
+    github_sync::save_configuration(&state.db, config, token, encryption_key).map_err(map_err)
+}
+
+#[tauri::command]
+fn generate_github_sync_key(state: State<AppState>) -> Result<String, String> {
+    github_sync::generate_encryption_key(&state.db).map_err(map_err)
+}
+
+#[tauri::command]
+fn read_github_sync_key(state: State<AppState>) -> Result<String, String> {
+    github_sync::read_encryption_key(&state.db).map_err(map_err)
+}
+
+#[tauri::command]
+async fn sync_github_now(state: State<'_, AppState>) -> Result<GithubSyncResult, String> {
+    github_sync::sync_now(state.db.clone())
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+fn disconnect_github_sync(
+    state: State<AppState>,
+    remove_credentials: bool,
+) -> Result<GithubSyncStatus, String> {
+    github_sync::disconnect(&state.db, remove_credentials).map_err(map_err)
 }
 
 #[tauri::command]
@@ -288,7 +341,10 @@ async fn test_ai_config(settings: AppSettings, secret_name: String) -> Result<St
 
 fn run_optional_ai(db: Arc<AppDb>) {
     tauri::async_runtime::spawn(async move {
-        let has_pending = db.queue_health().map(|health| health.pending > 0).unwrap_or(false);
+        let has_pending = db
+            .queue_health()
+            .map(|health| health.pending > 0)
+            .unwrap_or(false);
         if !has_pending && !analysis_worker::enqueue_recent_uncertain(&db).unwrap_or(false) {
             return;
         }
@@ -363,12 +419,11 @@ fn main() {
             integration_server::start_local_ingest_server().map_err(tauri::Error::Anyhow)?;
             analysis_worker::start_analysis_worker(db.clone());
             maintenance::start_worker(db.clone());
+            github_sync::start_worker(db.clone());
             setup_tray(app, db.clone(), collector.clone())?;
 
             if settings.auto_start {
-                collector
-                    .start(db.clone())
-                    .map_err(tauri::Error::Anyhow)?;
+                collector.start(db.clone()).map_err(tauri::Error::Anyhow)?;
             }
             if autostart::background_launch_requested() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -401,6 +456,12 @@ fn main() {
             learn_rule_from_session,
             cleanup_media_cache,
             save_settings,
+            get_github_sync_status,
+            save_github_sync_config,
+            generate_github_sync_key,
+            read_github_sync_key,
+            sync_github_now,
+            disconnect_github_sync,
             export_data,
             backup_now,
             reveal_data_dir,

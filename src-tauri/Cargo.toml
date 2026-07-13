@@ -18,18 +18,21 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri = { version = "2.2", features = ["tray-icon", "image-ico", "image-png"] }
 tauri-plugin-opener = "2.2"
 anyhow = "1.0"
+aes-gcm = "0.10"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5.0"
+flate2 = "1.0"
 keyring = { version = "3.6", features = ["windows-native"] }
 parking_lot = "0.12"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tiny_http = "0.12"
-tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]

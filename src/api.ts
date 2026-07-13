@@ -1,8 +1,38 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, Project, SessionPatch, Task, WorkSession } from './types';
+import type { AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+const previewSyncStatus = (): GithubSyncStatus => ({
+  config: {
+    enabled: false,
+    owner: 'ShallowForeverDream',
+    repo: 'ScreenUse-Data',
+    branch: 'main',
+    filePath: 'screenuse/snapshot-v1.json.gz.enc',
+    autoSync: true,
+    intervalMinutes: 15,
+    deviceId: 'browser-preview',
+    deviceName: '这台电脑',
+    tokenSecretRef: 'github-sync-token',
+    keySecretRef: 'github-sync-key',
+    lastSyncedAt: null,
+    lastRemoteSha: null,
+    lastError: null,
+  },
+  tokenConfigured: false,
+  keyConfigured: false,
+  ready: false,
+  counts: {
+    categories: fallbackDashboard.categoryOptions.length,
+    projects: fallbackDashboard.projects.length,
+    tasks: fallbackDashboard.tasks.length,
+    sessions: fallbackDashboard.sessions.length,
+    rules: 0,
+  },
+  devices: [],
+});
 
 async function call<T>(command: string, args?: Record<string, unknown>, fallback?: T): Promise<T> {
   if (!isTauri()) {
@@ -64,6 +94,45 @@ export const api = {
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),
   cleanupMediaCache: () => call<number>('cleanup_media_cache', undefined, 0),
   saveSettings: (settings: AppSettings) => call<void>('save_settings', { settings }),
+  githubSyncStatus: () => call<GithubSyncStatus>('get_github_sync_status', undefined, previewSyncStatus()),
+  saveGithubSyncConfig: (
+    config: GithubSyncConfig,
+    token?: string,
+    encryptionKey?: string,
+  ) => call<GithubSyncStatus>('save_github_sync_config', {
+    config,
+    token: token || null,
+    encryptionKey: encryptionKey || null,
+  }, {
+    ...previewSyncStatus(),
+    config,
+    tokenConfigured: Boolean(token),
+    keyConfigured: Boolean(encryptionKey),
+    ready: config.enabled && Boolean(config.owner && token && encryptionKey),
+  }),
+  generateGithubSyncKey: () => call<string>(
+    'generate_github_sync_key',
+    undefined,
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+  ),
+  readGithubSyncKey: () => call<string>(
+    'read_github_sync_key',
+    undefined,
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+  ),
+  syncGithubNow: () => call<GithubSyncResult>('sync_github_now', undefined, {
+    syncedAt: new Date().toISOString(),
+    remoteSha: 'browser-preview',
+    uploadedBytes: 4096,
+    downloadedBytes: 0,
+    counts: previewSyncStatus().counts,
+    message: '浏览器预览：已模拟同步',
+  }),
+  disconnectGithubSync: (removeCredentials = false) => call<GithubSyncStatus>(
+    'disconnect_github_sync',
+    { removeCredentials },
+    previewSyncStatus(),
+  ),
   exportData: (format: 'csv' | 'excel' | 'markdown') => call<string>('export_data', { format }, `browser-preview.${format}`),
   backupNow: (targetDir?: string) => call<string>('backup_now', { targetDir }, 'browser-preview-backup.db'),
   revealDataDir: () => call<string>('reveal_data_dir', undefined, '浏览器预览模式'),

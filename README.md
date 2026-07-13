@@ -99,6 +99,7 @@ SQLite 会话、日期概览、时间轴和导出
 - 系统托盘启动、暂停、打开和退出。
 - 可选 Windows 登录后静默启动；后台启动时只显示托盘，不弹主窗口。
 - Windows Release 使用 GUI 子系统，直接运行或登录启动时不会附带命令行窗口。
+- 可选 GitHub 私有仓库同步：端侧 AES-256-GCM 加密、自动创建私有数据仓库、多设备增量合并和删除墓碑。
 - 自动原始事件轮转、旧媒体迁移清理、数据库压缩和备份。
 - 可选 OpenAI-compatible API；请求最多 80 条精简元数据、30 秒超时、URL 去查询参数和锚点。
 
@@ -186,6 +187,17 @@ pnpm compile
 - `attribution_rules`：从人工修正学习的规则；
 - `projects` / `tasks`：归因目标；
 - `analysis_jobs`：仅在启用可选 AI 时使用。
+
+### GitHub 多端同步
+
+“设置 → GitHub 同步”可把分类、项目、任务、会话、规则和删除记录同步到一个**独立的私有仓库**。推荐仓库名为 `ScreenUse-Data`，不要把个人时间账本提交到公开的 ScreenUse 源码仓库。
+
+1. 创建一个 GitHub Personal Access Token，权限只需覆盖目标私有仓库的 Contents 读写；
+2. 填写 GitHub 用户名、私有数据仓库名和 Token；仓库不存在时 ScreenUse 会自动创建为 Private；
+3. 首台设备生成同步密钥并妥善保存，其他设备填入同一密钥；
+4. 点击“保存并同步”，之后可按设定间隔自动同步。
+
+同步文件在上传前会先 gzip 压缩，再用 AES-256-GCM 在本机加密。Token 和同步密钥写入系统凭据库，不进入 SQLite、日志或 Git 提交。每条记录按 `updated_at` 合并；删除操作会产生墓碑，避免旧设备把已删除内容重新带回。远端 SHA 冲突时会重新拉取、合并并重试。详细模型见 [`docs/GITHUB_SYNC.md`](docs/GITHUB_SYNC.md)。
 
 ## 设计参考
 

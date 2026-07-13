@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "离开"];
 
@@ -341,12 +342,148 @@ mod tests {
         dark.theme = "dark".into();
         assert_eq!(dark.normalized().theme, "dark");
 
-        let legacy: AppSettings = serde_json::from_str(
-            r#"{"pollIntervalSeconds":2,"heartbeatSeconds":30}"#,
-        )
-        .expect("deserialize legacy sampling settings");
+        let legacy: AppSettings =
+            serde_json::from_str(r#"{"pollIntervalSeconds":2,"heartbeatSeconds":30}"#)
+                .expect("deserialize legacy sampling settings");
         let migrated = legacy.normalized();
         assert_eq!(migrated.poll_interval_seconds, 2);
         assert_eq!(migrated.heartbeat_seconds, 2);
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GithubSyncConfig {
+    pub enabled: bool,
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+    pub file_path: String,
+    pub auto_sync: bool,
+    pub interval_minutes: u32,
+    pub device_id: String,
+    pub device_name: String,
+    pub token_secret_ref: String,
+    pub key_secret_ref: String,
+    pub last_synced_at: Option<String>,
+    pub last_remote_sha: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for GithubSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            owner: String::new(),
+            repo: "ScreenUse-Data".into(),
+            branch: "main".into(),
+            file_path: "screenuse/snapshot-v1.json.gz.enc".into(),
+            auto_sync: true,
+            interval_minutes: 15,
+            device_id: Uuid::new_v4().to_string(),
+            device_name: default_device_name(),
+            token_secret_ref: "github-sync-token".into(),
+            key_secret_ref: "github-sync-key".into(),
+            last_synced_at: None,
+            last_remote_sha: None,
+            last_error: None,
+        }
+    }
+}
+
+impl GithubSyncConfig {
+    pub fn normalized(mut self) -> Self {
+        self.owner = self
+            .owner
+            .trim()
+            .trim_start_matches('@')
+            .chars()
+            .take(80)
+            .collect();
+        self.repo = self
+            .repo
+            .trim()
+            .trim_end_matches(".git")
+            .chars()
+            .take(100)
+            .collect();
+        if self.repo.is_empty() {
+            self.repo = "ScreenUse-Data".into();
+        }
+        self.branch = self.branch.trim().chars().take(100).collect();
+        if self.branch.is_empty() {
+            self.branch = "main".into();
+        }
+        self.file_path = self
+            .file_path
+            .trim()
+            .trim_start_matches('/')
+            .chars()
+            .take(180)
+            .collect();
+        if self.file_path.is_empty() {
+            self.file_path = "screenuse/snapshot-v1.json.gz.enc".into();
+        }
+        self.interval_minutes = self.interval_minutes.clamp(5, 1_440);
+        if self.device_id.trim().is_empty() {
+            self.device_id = Uuid::new_v4().to_string();
+        }
+        self.device_name = self.device_name.trim().chars().take(80).collect();
+        if self.device_name.is_empty() {
+            self.device_name = default_device_name();
+        }
+        if self.token_secret_ref.trim().is_empty() {
+            self.token_secret_ref = "github-sync-token".into();
+        }
+        if self.key_secret_ref.trim().is_empty() {
+            self.key_secret_ref = "github-sync-key".into();
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCounts {
+    pub categories: u32,
+    pub projects: u32,
+    pub tasks: u32,
+    pub sessions: u32,
+    pub rules: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubSyncStatus {
+    pub config: GithubSyncConfig,
+    pub token_configured: bool,
+    pub key_configured: bool,
+    pub ready: bool,
+    pub counts: SyncCounts,
+    pub devices: Vec<SyncDeviceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubSyncResult {
+    pub synced_at: String,
+    pub remote_sha: String,
+    pub uploaded_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub counts: SyncCounts,
+    pub message: String,
+}
+
+fn default_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "这台电脑".into())
 }
