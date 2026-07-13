@@ -461,7 +461,7 @@ h1, h2, h3, p { margin-top: 0; }
 .project-progress-row small { color: var(--subtle); font-size: 10px; text-align: right; }
 
 .day-track-panel { overflow: hidden; }
-.timeline-zoom { display: grid; grid-template-columns: 30px 48px 30px; align-items: center; gap: 4px; }
+.timeline-zoom { display: grid; grid-template-columns: 30px minmax(78px, auto) 30px; align-items: center; gap: 4px; }
 .timeline-zoom button { width: 30px; height: 30px; padding: 0; }
 .timeline-zoom span { color: var(--muted); text-align: center; font-size: 11px; font-weight: 700; }
 .day-track-scroll {
@@ -469,6 +469,8 @@ h1, h2, h3, p { margin-top: 0; }
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0 1px 7px;
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
   scrollbar-color: color-mix(in srgb, var(--blue-strong) 25%, transparent) transparent;
 }
 .day-track {
@@ -488,14 +490,15 @@ h1, h2, h3, p { margin-top: 0; }
   color: var(--subtle);
   font-size: 10px;
   transform: translateX(-50%);
+  white-space: nowrap;
 }
-.day-track-axis span:first-child { transform: none; }
-.day-track-axis span:last-child { transform: translateX(-100%); }
+.day-track-axis span.day-start { transform: none; }
+.day-track-axis span.day-end { transform: translateX(-100%); }
 .day-track-lane {
   position: relative;
   height: 86px;
   background-image: linear-gradient(to right, var(--border) 1px, transparent 1px);
-  background-size: calc(100% / 24) 100%;
+  background-size: 64px 100%;
 }
 .day-track-block {
   position: absolute;

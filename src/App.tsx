@@ -1,7 +1,9 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
 } from 'react';
@@ -72,6 +74,20 @@ const categoryColors: Record<string, string> = {
 };
 
 const THEME_STORAGE_KEY = 'screenuse-theme';
+
+const TIMELINE_GRID_WIDTH = 64;
+const TIMELINE_SCALES = [
+  { secondsPerGrid: 3600, label: '1 小时/格' },
+  { secondsPerGrid: 1800, label: '30 分钟/格' },
+  { secondsPerGrid: 600, label: '10 分钟/格' },
+  { secondsPerGrid: 300, label: '5 分钟/格' },
+  { secondsPerGrid: 60, label: '1 分钟/格' },
+  { secondsPerGrid: 30, label: '30 秒/格' },
+  { secondsPerGrid: 10, label: '10 秒/格' },
+  { secondsPerGrid: 5, label: '5 秒/格' },
+  { secondsPerGrid: 1, label: '1 秒/格' },
+] as const;
+const DEFAULT_TIMELINE_ZOOM = 2;
 
 function normalizeTheme(value: unknown): ThemeMode {
   return value === 'system' || value === 'light' || value === 'dark' ? value : 'light';
@@ -501,7 +517,7 @@ function TodayView({
   planItems: DashboardData['planItems'];
 }) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
-  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [timelineZoom, setTimelineZoom] = useState(DEFAULT_TIMELINE_ZOOM);
   const review = sessions.filter(needsReview).slice(0, 4);
   const projectRows = projectBreakdown(sessions, selectedDate).slice(0, 6);
   const projectTotal = projectRows.reduce((sum, row) => sum + row.minutes, 0);
@@ -623,16 +639,16 @@ function TodayView({
               <button
                 onClick={() => setTimelineZoom((value) => Math.max(0, value - 1))}
                 disabled={timelineZoom === 0}
-                title="缩小时间刻度"
+                title="缩小时间刻度（也可按 Ctrl 向下滚轮）"
                 type="button"
               >
                 <ZoomOut size={15} />
               </button>
-              <span>{['全天', '标准', '放大', '精细'][timelineZoom]}</span>
+              <span>{TIMELINE_SCALES[timelineZoom].label}</span>
               <button
-                onClick={() => setTimelineZoom((value) => Math.min(3, value + 1))}
-                disabled={timelineZoom === 3}
-                title="放大时间刻度"
+                onClick={() => setTimelineZoom((value) => Math.min(TIMELINE_SCALES.length - 1, value + 1))}
+                disabled={timelineZoom === TIMELINE_SCALES.length - 1}
+                title="放大时间刻度（也可按 Ctrl 向上滚轮）"
                 type="button"
               >
                 <ZoomIn size={15} />
@@ -644,6 +660,7 @@ function TodayView({
           sessions={sessions}
           selectedDate={selectedDate}
           zoom={timelineZoom}
+          onZoomChange={setTimelineZoom}
           onEdit={onEdit}
         />
       </section>
@@ -715,49 +732,144 @@ function DayActivityTimeline({
   sessions,
   selectedDate,
   zoom,
+  onZoomChange,
   onEdit,
 }: {
   sessions: WorkSession[];
   selectedDate: string;
   zoom: number;
+  onZoomChange: (zoom: number) => void;
   onEdit: (session: WorkSession) => void;
 }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const centerRef = useRef<{ date: string; seconds: number } | null>(null);
+  const wheelAtRef = useRef(0);
+  const [viewport, setViewport] = useState({ left: 0, width: 0 });
+  const scale = TIMELINE_SCALES[zoom] || TIMELINE_SCALES[DEFAULT_TIMELINE_ZOOM];
+  const pixelsPerSecond = TIMELINE_GRID_WIDTH / scale.secondsPerGrid;
+  const width = 24 * 60 * 60 * pixelsPerSecond;
+  const sorted = useMemo(
+    () => [...sessions].sort(
+      (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+    ),
+    [sessions],
+  );
+  const initialCenterSeconds = useMemo(() => {
+    if (selectedDate === localDateKey(new Date())) {
+      const now = new Date();
+      return now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    }
+    const latest = sorted[sorted.length - 1];
+    if (!latest) return 12 * 60 * 60;
+    const bounds = sessionBoundsOnDate(latest, selectedDate);
+    return Math.min(24 * 60 * 60, bounds.startSeconds + bounds.durationSeconds / 2);
+  }, [selectedDate, sorted]);
+
+  const updateViewport = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    centerRef.current = {
+      date: selectedDate,
+      seconds: (element.scrollLeft + element.clientWidth / 2) / pixelsPerSecond,
+    };
+    setViewport({ left: element.scrollLeft, width: element.clientWidth });
+  }, [pixelsPerSecond, selectedDate]);
+
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const centerSeconds = centerRef.current?.date === selectedDate
+      ? centerRef.current.seconds
+      : initialCenterSeconds;
+    const maximum = Math.max(0, width - element.clientWidth);
+    element.scrollLeft = Math.min(
+      maximum,
+      Math.max(0, centerSeconds * pixelsPerSecond - element.clientWidth / 2),
+    );
+    updateViewport();
+  }, [initialCenterSeconds, pixelsPerSecond, selectedDate, updateViewport, width]);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [updateViewport]);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      const now = performance.now();
+      if (now - wheelAtRef.current < 80 || event.deltaY === 0) return;
+      wheelAtRef.current = now;
+      onZoomChange(Math.max(
+        0,
+        Math.min(TIMELINE_SCALES.length - 1, zoom + (event.deltaY < 0 ? 1 : -1)),
+      ));
+    };
+    element.addEventListener('wheel', handleWheel, { passive: false });
+    return () => element.removeEventListener('wheel', handleWheel);
+  }, [onZoomChange, zoom]);
+
+  const firstTick = Math.max(
+    0,
+    Math.floor((viewport.left / pixelsPerSecond) / scale.secondsPerGrid) - 2,
+  );
+  const lastTick = Math.min(
+    Math.floor((24 * 60 * 60) / scale.secondsPerGrid),
+    Math.ceil(((viewport.left + viewport.width) / pixelsPerSecond) / scale.secondsPerGrid) + 2,
+  );
+  const visibleTicks = Array.from(
+    { length: Math.max(0, lastTick - firstTick + 1) },
+    (_, index) => (firstTick + index) * scale.secondsPerGrid,
+  );
+
   if (!sessions.length) {
     return <EmptyState title="暂无活动" detail="应用切换后会自动生成可修正的时间段。" />;
   }
-  const pixelsPerHour = [40, 58, 86, 124][zoom];
-  const width = 24 * pixelsPerHour;
-  const tickStep = zoom === 0 ? 3 : zoom === 1 ? 2 : 1;
-  const sorted = [...sessions].sort(
-    (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
-  );
+
   return (
-    <div className="day-track-scroll">
+    <div
+      className="day-track-scroll"
+      ref={scrollRef}
+      onScroll={updateViewport}
+      title="拖动滚动条查看全天；按住 Ctrl 滚动鼠标滚轮缩放"
+    >
       <div className="day-track" style={{ width }}>
         <div className="day-track-axis">
-          {Array.from({ length: Math.floor(24 / tickStep) + 1 }, (_, index) => index * tickStep).map(
-            (hour) => (
-              <span key={hour} style={{ left: `${(hour / 24) * 100}%` }}>
-                {String(hour).padStart(2, '0')}:00
-              </span>
-            ),
-          )}
+          {visibleTicks.map((second) => (
+            <span
+              className={second === 0 ? 'day-start' : second === 24 * 60 * 60 ? 'day-end' : undefined}
+              key={second}
+              style={{ left: second * pixelsPerSecond }}
+            >
+              {formatAxisTime(second, scale.secondsPerGrid < 60)}
+            </span>
+          ))}
         </div>
-        <div className="day-track-lane">
+        <div
+          className="day-track-lane"
+          style={{ backgroundSize: `${TIMELINE_GRID_WIDTH}px 100%` }}
+        >
           {sorted.map((session) => {
             const bounds = sessionBoundsOnDate(session, selectedDate);
             const app = sessionApplication(session);
-            const blockWidth = Math.max(5, (bounds.durationMinutes / 60) * pixelsPerHour);
+            const blockWidth = Math.max(5, bounds.durationSeconds * pixelsPerSecond);
+            const showSeconds = scale.secondsPerGrid < 60;
             return (
               <button
                 className={`day-track-block${needsReview(session) ? ' needs-review' : ''}`}
                 key={session.id}
                 onClick={() => onEdit(session)}
-                title={`${formatClock(session.startedAt)}–${formatClock(session.endedAt)}\n${session.summary}\n${app}`}
+                title={`${formatTimelineClock(session.startedAt, showSeconds)}–${formatTimelineClock(session.endedAt, showSeconds)}\n${session.summary}\n${app}`}
                 type="button"
                 style={
                   {
-                    left: (bounds.startMinutes / 60) * pixelsPerHour,
+                    left: bounds.startSeconds * pixelsPerSecond,
                     width: blockWidth,
                     '--block-color': categoryColor(session.category),
                   } as CSSProperties
@@ -765,7 +877,7 @@ function DayActivityTimeline({
               >
                 <strong>{session.summary}</strong>
                 <small>{app}</small>
-                <span>{formatClock(session.startedAt)}–{formatClock(session.endedAt)}</span>
+                <span>{formatTimelineClock(session.startedAt, showSeconds)}–{formatTimelineClock(session.endedAt, showSeconds)}</span>
               </button>
             );
           })}
@@ -2118,8 +2230,8 @@ function sessionBoundsOnDate(session: WorkSession, dateKey: string) {
   const start = Math.max(dayStart, new Date(session.startedAt).getTime());
   const end = Math.min(dayEnd, new Date(session.endedAt).getTime());
   return {
-    startMinutes: Math.max(0, (start - dayStart) / 60_000),
-    durationMinutes: Math.max(0, (end - start) / 60_000),
+    startSeconds: Math.max(0, (start - dayStart) / 1000),
+    durationSeconds: Math.max(0, (end - start) / 1000),
   };
 }
 
@@ -2150,6 +2262,23 @@ function formatClock(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function formatTimelineClock(value: string, showSeconds: boolean) {
+  return new Date(value).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: showSeconds ? '2-digit' : undefined,
+  });
+}
+
+function formatAxisTime(totalSeconds: number, showSeconds: boolean) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  return showSeconds
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+    : `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 }
 
 function formatDateTime(value: string) {

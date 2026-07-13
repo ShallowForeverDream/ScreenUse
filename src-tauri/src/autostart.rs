@@ -9,12 +9,10 @@ pub fn background_launch_requested() -> bool {
 
 #[cfg(windows)]
 pub fn set_launch_at_login(enabled: bool) -> Result<()> {
-    use std::process::Command;
-
     if enabled {
         let executable = std::env::current_exe().context("cannot locate ScreenUse executable")?;
         let value = launch_command(&executable);
-        let output = Command::new("reg.exe")
+        let output = hidden_reg_command()
             .args(["ADD", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d"])
             .arg(value)
             .args(["/f"])
@@ -29,7 +27,7 @@ pub fn set_launch_at_login(enabled: bool) -> Result<()> {
         return Ok(());
     }
 
-    let output = Command::new("reg.exe")
+    let output = hidden_reg_command()
         .args(["DELETE", RUN_KEY, "/v", VALUE_NAME, "/f"])
         .output()
         .context("cannot update Windows login startup")?;
@@ -50,10 +48,20 @@ pub fn set_launch_at_login(_enabled: bool) -> Result<()> {
 
 #[cfg(windows)]
 fn startup_value_exists() -> bool {
-    std::process::Command::new("reg.exe")
+    hidden_reg_command()
         .args(["QUERY", RUN_KEY, "/v", VALUE_NAME])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn hidden_reg_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new("reg.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(windows)]

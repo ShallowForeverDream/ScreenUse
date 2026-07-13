@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[cfg(all(not(debug_assertions), not(feature = "custom-protocol")))]
 compile_error!(
     "ScreenUse release builds must use `pnpm tauri:build` (or enable `--features custom-protocol`)"
