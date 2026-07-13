@@ -1,3 +1,8 @@
+#[cfg(all(not(debug_assertions), not(feature = "custom-protocol")))]
+compile_error!(
+    "ScreenUse release builds must use `pnpm tauri:build` (or enable `--features custom-protocol`)"
+);
+
 mod ai;
 mod analysis_worker;
 mod autostart;

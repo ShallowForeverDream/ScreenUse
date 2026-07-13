@@ -101,6 +101,8 @@ SQLite 会话、日期概览、时间轴和导出
 
 ## 运行与构建
 
+> Release 必须使用 `pnpm tauri:build`（内部调用 Tauri CLI），不要直接执行 `cargo build --release`。后者不会启用 Tauri 的 `custom-protocol`，生成的窗口会错误访问开发地址 `127.0.0.1:1420`。仓库现在会直接阻止这种无效构建。
+
 ### 环境
 
 - Windows 10/11；

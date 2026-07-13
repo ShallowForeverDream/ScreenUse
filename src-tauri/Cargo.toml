@@ -9,6 +9,11 @@ rust-version = "1.77"
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 
+[features]
+# Production builds enable this so the WebView loads bundled assets instead of
+# build.devUrl. Keep release builds from silently producing a dev-only exe.
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2.2", features = ["tray-icon", "image-ico", "image-png"] }
 tauri-plugin-opener = "2.2"
