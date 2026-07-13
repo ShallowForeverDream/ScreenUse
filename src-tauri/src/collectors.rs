@@ -3,6 +3,7 @@ use crate::context_store;
 use crate::db::{now, AppDb};
 use crate::models::{InputStats, RawActivityEvent};
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +36,7 @@ struct ActiveContext {
     id: String,
     session_id: String,
     signature: String,
+    started_at: String,
     event: RawActivityEvent,
     last_observed_at: Instant,
     last_emitted_at: Instant,
@@ -47,7 +49,7 @@ struct PendingContext {
     observations: u8,
 }
 
-const SWITCH_CONFIRM_OBSERVATIONS: u8 = 2;
+const SWITCH_CONFIRM_SECONDS: i64 = 5;
 
 impl DesktopCollector {
     pub fn new() -> Self {
@@ -77,6 +79,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
         tauri::async_runtime::spawn(async move {
             let mut active: Option<ActiveContext> = None;
             let mut pending: Option<PendingContext> = None;
+            let mut task_view_started_at: Option<String> = None;
             let mut settings = db.get_settings().unwrap_or_default().normalized();
             let mut settings_loaded_at = Instant::now();
 
@@ -120,6 +123,19 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     event.input_stats.idle_seconds = 0;
                 }
                 sanitize_event(&mut event);
+
+                // Task View is a transition surface, not a standalone activity. Keep its
+                // first timestamp and assign that interval to the context selected next.
+                if is_windows_task_view(&event) {
+                    task_view_started_at.get_or_insert_with(|| event.timestamp.clone());
+                    pending = None;
+                    if let Some(current) = active.as_mut() {
+                        current.last_observed_at = Instant::now();
+                    }
+                    sleep(Duration::from_secs(settings.poll_interval_seconds as u64)).await;
+                    continue;
+                }
+
                 let observation_gap = active.as_ref().is_some_and(|current| {
                     is_unexpected_observation_gap(current.last_observed_at.elapsed(), settings.poll_interval_seconds)
                 });
@@ -131,10 +147,15 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         }
                     }
                     pending = None;
+                    task_view_started_at = None;
                 }
                 let signature = context_signature(&event, settings.idle_threshold_seconds);
                 if active.is_none() {
                     pending = None;
+                    if let Some(boundary) = task_view_started_at.take() {
+                        event.timestamp = boundary;
+                        mark_metadata(&mut event, "taskViewHandoff", serde_json::Value::Bool(true));
+                    }
                     match open_context(&collector, &db, event, signature) {
                         Ok(context) => active = Some(context),
                         Err(error) => collector.set_error(error),
@@ -143,6 +164,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     let active_signature = active.as_ref().map(|current| current.signature.clone()).unwrap_or_default();
                     if active_signature == signature {
                         pending = None;
+                        task_view_started_at = None;
                         if let Some(current) = active.as_mut() {
                             current.last_observed_at = Instant::now();
                             let heartbeat_due = current.last_emitted_at.elapsed()
@@ -159,20 +181,44 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         if let Some(current) = active.as_mut() {
                             current.last_observed_at = Instant::now();
                         }
+                        let mut transition_event = event.clone();
+                        if signature == "idle" {
+                            if let Some(current) = active.as_ref() {
+                                transition_event.timestamp = idle_boundary_at(&event, &current.started_at);
+                                mark_metadata(
+                                    &mut transition_event,
+                                    "idleBoundaryBackdated",
+                                    serde_json::Value::Bool(true),
+                                );
+                            }
+                        } else if pending
+                            .as_ref()
+                            .map_or(true, |candidate| candidate.signature != signature)
+                        {
+                            if let Some(boundary) = task_view_started_at.as_ref() {
+                                transition_event.timestamp = boundary.clone();
+                                mark_metadata(
+                                    &mut transition_event,
+                                    "taskViewHandoff",
+                                    serde_json::Value::Bool(true),
+                                );
+                            }
+                        }
                         let immediate = active_signature == "idle" || signature == "idle";
                         let ready = if immediate {
                             pending = Some(PendingContext {
                                 signature: signature.clone(),
-                                first_event: event.clone(),
-                                observations: SWITCH_CONFIRM_OBSERVATIONS,
+                                first_event: transition_event,
+                                observations: 1,
                             });
                             true
                         } else {
-                            observe_pending_context(&mut pending, &signature, &event)
+                            observe_pending_context(&mut pending, &signature, &transition_event)
                         };
 
                         if ready {
                             let Some(mut next) = pending.take() else { continue; };
+                            task_view_started_at = None;
                             mark_metadata(
                                 &mut next.first_event,
                                 "switchConfirmedAfterObservations",
@@ -237,9 +283,10 @@ fn observe_pending_context(
             });
         }
     }
-    pending
-        .as_ref()
-        .is_some_and(|candidate| candidate.observations >= SWITCH_CONFIRM_OBSERVATIONS)
+    pending.as_ref().is_some_and(|candidate| {
+        elapsed_seconds(&candidate.first_event.timestamp, &event.timestamp)
+            .is_some_and(|seconds| seconds >= SWITCH_CONFIRM_SECONDS)
+    })
 }
 
 fn open_context(
@@ -258,10 +305,12 @@ fn open_context(
     collector.clear_error();
     *collector.last_event_at.lock() = Some(event.timestamp.clone());
     let observed_at = Instant::now();
+    let started_at = event.timestamp.clone();
     Ok(ActiveContext {
         id: event.id.clone(),
         session_id: session.id,
         signature,
+        started_at,
         event,
         last_observed_at: observed_at,
         last_emitted_at: observed_at,
@@ -321,6 +370,43 @@ fn context_signature(event: &RawActivityEvent, idle_threshold_seconds: u32) -> S
     )
 }
 
+fn elapsed_seconds(started_at: &str, ended_at: &str) -> Option<i64> {
+    let started = DateTime::parse_from_rfc3339(started_at).ok()?;
+    let ended = DateTime::parse_from_rfc3339(ended_at).ok()?;
+    Some((ended - started).num_seconds())
+}
+
+fn idle_boundary_at(event: &RawActivityEvent, active_started_at: &str) -> String {
+    let observed = DateTime::parse_from_rfc3339(&event.timestamp)
+        .map(|value| value.with_timezone(&Utc));
+    let active_started = DateTime::parse_from_rfc3339(active_started_at)
+        .map(|value| value.with_timezone(&Utc));
+    match (observed, active_started) {
+        (Ok(observed), Ok(active_started)) => {
+            let candidate = observed - ChronoDuration::seconds(event.input_stats.idle_seconds as i64);
+            candidate
+                .max(active_started)
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        }
+        _ => event.timestamp.clone(),
+    }
+}
+
+fn is_windows_task_view(event: &RawActivityEvent) -> bool {
+    let app = event.app.as_deref().unwrap_or_default().trim().to_lowercase();
+    let title = event.window_title.as_deref().unwrap_or_default().trim().to_lowercase();
+    let shell_app = [
+        "explorer.exe",
+        "shellexperiencehost.exe",
+        "applicationframehost.exe",
+        "taskhostw.exe",
+    ]
+    .contains(&app.as_str());
+    shell_app
+        && (matches!(title.as_str(), "任务视图" | "task view")
+            || title.contains("multitaskingviewframe"))
+}
+
 fn signature_window_title<'a>(app: &str, title: Option<&'a str>) -> &'a str {
     let title = title.unwrap_or_default();
     if (app == "qq" || app == "qq.exe")
@@ -359,57 +445,25 @@ fn cap(value: &str, max_chars: usize) -> String {
 
 fn is_passive_attention(event: &RawActivityEvent) -> bool {
     let app = event.app.as_deref().unwrap_or_default().to_lowercase();
-    let title = event.window_title.as_deref().unwrap_or_default().to_lowercase();
-    let hay = format!(
-        "{app} {title} {}",
-        event.url.as_deref().unwrap_or_default().to_lowercase()
-    );
-    let meeting_app = [
-        "zoom",
-        "teams",
-        "webex",
-        "wemeet",
-        "tencentmeeting",
-        "feishu",
-        "lark",
-        "dingtalk",
-    ]
-    .iter()
-    .any(|needle| app.contains(needle));
-    let media_app = [
+    let browser_video_playing = event
+        .metadata
+        .get("browser")
+        .and_then(|browser| browser.get("videoPlaying"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let video_player = [
         "vlc",
         "mpv",
         "potplayer",
         "wmplayer",
         "media player",
-        "spotify",
-        "music",
-        "obs64",
+        "mpc-hc",
+        "mpc-be",
+        "smplayer",
     ]
     .iter()
     .any(|needle| app.contains(needle));
-    let passive_title = [
-        "会议",
-        "直播",
-        "课程",
-        "讲座",
-        "演示",
-        "放映",
-        "播放",
-        "meeting",
-        "webinar",
-        "lecture",
-        "youtube",
-        "bilibili",
-        "netflix",
-        "腾讯视频",
-        "爱奇艺",
-        "优酷",
-        "慕课",
-    ]
-    .iter()
-    .any(|needle| hay.contains(needle));
-    meeting_app || media_app || passive_title
+    browser_video_playing || video_player
 }
 
 #[cfg(windows)]
@@ -906,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn requires_two_consecutive_observations_before_switching() {
+    fn requires_five_continuous_seconds_before_switching() {
         let event = |title: &str, timestamp: &str| RawActivityEvent {
             id: String::new(),
             source: "test".into(),
@@ -929,12 +983,17 @@ mod tests {
             pending.as_ref().map(|candidate| candidate.first_event.timestamp.as_str()),
             Some("2026-07-12T10:00:10Z"),
         );
+        assert!(!observe_pending_context(
+            &mut pending,
+            "search",
+            &event("Google Scholar", "2026-07-12T10:00:14Z"),
+        ));
         assert!(observe_pending_context(
             &mut pending,
             "search",
-            &event("Google Scholar", "2026-07-12T10:00:20Z"),
+            &event("Google Scholar", "2026-07-12T10:00:15Z"),
         ));
-        assert_eq!(pending.as_ref().map(|candidate| candidate.observations), Some(2));
+        assert_eq!(pending.as_ref().map(|candidate| candidate.observations), Some(3));
         assert_eq!(
             pending.as_ref().map(|candidate| candidate.first_event.timestamp.as_str()),
             Some("2026-07-12T10:00:10Z"),
@@ -972,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn meetings_and_video_titles_count_as_passive_attention() {
+    fn only_confirmed_video_playback_counts_as_passive_attention() {
         let event = RawActivityEvent {
             id: String::new(),
             source: "test".into(),
@@ -983,17 +1042,64 @@ mod tests {
             file_path: None,
             workspace: None,
             input_stats: InputStats { idle_seconds: 900, ..Default::default() },
-            metadata: json!({}),
+            metadata: json!({ "browser": { "videoPlaying": true } }),
         };
         assert!(is_passive_attention(&event));
-        assert!(is_passive_attention(&RawActivityEvent {
+        assert!(!is_passive_attention(&RawActivityEvent {
             app: Some("Zoom.exe".into()),
             window_title: Some("Weekly sync".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }));
+        assert!(is_passive_attention(&RawActivityEvent {
+            app: Some("vlc.exe".into()),
+            window_title: Some("recording.mp4".into()),
+            metadata: json!({}),
             ..event.clone()
         }));
         assert!(!is_passive_attention(&RawActivityEvent {
             app: Some("notepad.exe".into()),
             window_title: Some("notes.txt".into()),
+            metadata: json!({}),
+            ..event
+        }));
+    }
+
+    #[test]
+    fn idle_boundary_is_backdated_to_last_input_but_not_before_context_start() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-12T10:05:00Z".into(),
+            app: Some("QQ.exe".into()),
+            window_title: Some("QQ".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats { idle_seconds: 180, ..Default::default() },
+            metadata: json!({}),
+        };
+        assert_eq!(idle_boundary_at(&event, "2026-07-12T10:00:00Z"), "2026-07-12T10:02:00Z");
+        assert_eq!(idle_boundary_at(&event, "2026-07-12T10:04:00Z"), "2026-07-12T10:04:00Z");
+    }
+
+    #[test]
+    fn windows_task_view_is_a_handoff_surface() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-12T10:00:00Z".into(),
+            app: Some("explorer.exe".into()),
+            window_title: Some("任务视图".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        assert!(is_windows_task_view(&event));
+        assert!(!is_windows_task_view(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
             ..event
         }));
     }

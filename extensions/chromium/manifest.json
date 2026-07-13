@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ScreenUse Active Tab Context",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Sends only the active tab title and compact URL to the local ScreenUse app.",
   "permissions": [
     "tabs",
@@ -15,6 +15,13 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["media-state.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "ScreenUse"

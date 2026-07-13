@@ -15,6 +15,7 @@ pub struct BrowserContext {
     pub tab_id: Option<i64>,
     pub window_id: Option<i64>,
     pub audible: bool,
+    pub video_playing: bool,
     pub(crate) updated_at: Option<SystemTime>,
 }
 
@@ -72,6 +73,7 @@ pub fn enrich_event(event: &mut RawActivityEvent) {
                 "tabId": snapshot.browser.tab_id,
                 "windowId": snapshot.browser.window_id,
                 "audible": snapshot.browser.audible,
+                "videoPlaying": snapshot.browser.video_playing,
             }),
         );
     }
@@ -153,6 +155,7 @@ mod tests {
             tab_id: Some(2),
             window_id: Some(1),
             audible: false,
+            video_playing: false,
             updated_at: None,
         });
         let mut event = RawActivityEvent {

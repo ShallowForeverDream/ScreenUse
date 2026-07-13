@@ -73,6 +73,7 @@ fn browser_context(value: &Value) -> BrowserContext {
     let mut tab_id = value.get("tabId").and_then(Value::as_i64);
     let mut window_id = value.get("windowId").and_then(Value::as_i64);
     let mut audible = value.get("audible").and_then(Value::as_bool).unwrap_or(false);
+    let mut video_playing = value.get("videoPlaying").and_then(Value::as_bool).unwrap_or(false);
 
     // Backward-compatible parsing for the v0.1 extension payload. Only the
     // focused window's active tab is retained; the full tab list is discarded.
@@ -92,6 +93,7 @@ fn browser_context(value: &Value) -> BrowserContext {
                 url = tab.get("url").and_then(Value::as_str).map(ToOwned::to_owned);
                 tab_id = tab.get("id").and_then(Value::as_i64);
                 audible = tab.get("audible").and_then(Value::as_bool).unwrap_or(false);
+                video_playing = tab.get("videoPlaying").and_then(Value::as_bool).unwrap_or(false);
             }
         }
     }
@@ -115,6 +117,7 @@ fn browser_context(value: &Value) -> BrowserContext {
         tab_id,
         window_id,
         audible,
+        video_playing,
         ..Default::default()
     }
 }

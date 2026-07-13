@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
+const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 
 pub struct AppDb {
     conn: Mutex<Connection>,
@@ -36,6 +37,7 @@ impl AppDb {
         let db = Self { conn: Mutex::new(conn), db_path, data_dir };
         db.migrate()?;
         db.seed_if_empty()?;
+        db.backfill_idle_boundaries()?;
         db.compact_sessions()?;
         Ok(db)
     }
@@ -332,6 +334,115 @@ impl AppDb {
         tx.execute("DELETE FROM activity_categories WHERE name=?1", params![name])?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn backfill_idle_boundaries(&self) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        let idle_threshold = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|raw| serde_json::from_str::<AppSettings>(&raw).ok())
+            .unwrap_or_default()
+            .normalized()
+            .idle_threshold_seconds as i64;
+        let already_done = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![IDLE_BOUNDARY_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_done {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
+        let idle_sessions = {
+            let mut stmt = tx.prepare(
+                "SELECT id,started_at FROM work_sessions
+                 WHERE category='离开' AND user_confirmed=0
+                   AND source IN ('context-complete','collector-rule')
+                 ORDER BY started_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+
+        let mut changed = 0;
+        for (idle_id, idle_started_at) in idle_sessions {
+            let previous = tx
+                .query_row(
+                    "SELECT id,started_at,ended_at FROM work_sessions
+                     WHERE category<>'离开' AND user_confirmed=0
+                       AND source IN ('context-complete','collector-rule')
+                       AND started_at < ?1 AND ended_at <= ?1
+                     ORDER BY ended_at DESC LIMIT 1",
+                    params![idle_started_at],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((previous_id, previous_started_at, previous_ended_at)) = previous else {
+                continue;
+            };
+            if !within_gap_seconds(&previous_ended_at, &idle_started_at, 3) {
+                continue;
+            }
+            let Ok(idle_started) = DateTime::parse_from_rfc3339(&idle_started_at)
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            let Ok(previous_started) = DateTime::parse_from_rfc3339(&previous_started_at)
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            let boundary = (idle_started - Duration::seconds(idle_threshold))
+                .max(previous_started);
+            let boundary = fmt(boundary);
+
+            if boundary == previous_started_at {
+                tx.execute("DELETE FROM work_sessions WHERE id=?1", params![previous_id])?;
+            } else {
+                tx.execute(
+                    "UPDATE work_sessions SET ended_at=?1,updated_at=?2 WHERE id=?3",
+                    params![boundary, now(), previous_id],
+                )?;
+                tx.execute(
+                    "UPDATE activities SET ended_at=?1 WHERE session_id=?2",
+                    params![boundary, previous_id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE work_sessions SET started_at=?1,updated_at=?2 WHERE id=?3",
+                params![boundary, now(), idle_id],
+            )?;
+            tx.execute(
+                "UPDATE activities SET started_at=?1 WHERE session_id=?2",
+                params![boundary, idle_id],
+            )?;
+            changed += 1;
+        }
+
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![IDLE_BOUNDARY_MIGRATION_KEY, now()],
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -1475,6 +1586,46 @@ mod tests {
         let preserved = db.get_settings().expect("load user override");
         assert_eq!(preserved.poll_interval_seconds, 7);
         assert_eq!(preserved.heartbeat_seconds, 7);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn historical_idle_boundary_moves_back_to_the_last_input_time_once() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-idle-boundary-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let active_id = Uuid::new_v4().to_string();
+        let idle_id = Uuid::new_v4().to_string();
+        let evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "QQ.exe".into(),
+            weight: 0.75,
+        }])
+        .expect("serialize evidence");
+        {
+            let conn = db.conn.lock();
+            conn.execute("DELETE FROM settings WHERE key=?1", params![IDLE_BOUNDARY_MIGRATION_KEY])
+                .expect("reset migration marker");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES (?1,'2026-07-12T10:00:00Z','2026-07-12T10:05:00Z',NULL,NULL,'杂务','QQ',0.8,?2,0,'context-complete',?3)",
+                params![active_id, evidence, now()],
+            )
+            .expect("insert active session");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES (?1,'2026-07-12T10:05:00Z','2026-07-12T10:06:00Z',NULL,NULL,'离开','离开/空闲',0.96,?2,0,'context-complete',?3)",
+                params![idle_id, evidence, now()],
+            )
+            .expect("insert idle session");
+        }
+
+        assert_eq!(db.backfill_idle_boundaries().expect("backfill idle"), 1);
+        assert_eq!(db.backfill_idle_boundaries().expect("do not repeat"), 0);
+        let active = db.get_session(&active_id).expect("load active").expect("active exists");
+        let idle = db.get_session(&idle_id).expect("load idle").expect("idle exists");
+        assert_eq!(active.ended_at, "2026-07-12T10:02:00Z");
+        assert_eq!(idle.started_at, "2026-07-12T10:02:00Z");
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

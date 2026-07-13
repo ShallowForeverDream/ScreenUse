@@ -35,6 +35,13 @@ async function readActiveContext() {
   if (!tab || tab.id == null) return null;
 
   const url = compactUrl(tab.url);
+  let videoPlaying = false;
+  try {
+    const mediaState = await chrome.tabs.sendMessage(tab.id, { type: 'screenuse-media-state' });
+    videoPlaying = Boolean(mediaState?.videoPlaying);
+  } catch {
+    // Browser-internal pages do not run content scripts.
+  }
   return {
     source: 'chromium-extension',
     capturedAt: new Date().toISOString(),
@@ -45,6 +52,7 @@ async function readActiveContext() {
     title: tab.title || null,
     url,
     audible: Boolean(tab.audible),
+    videoPlaying,
   };
 }
 
@@ -54,7 +62,7 @@ async function syncActiveContext(reason = 'event', force = false) {
     if (!payload) return { ok: false, inactive: true };
 
     payload.reason = reason;
-    const signature = `${payload.eventId}|${payload.title || ''}|${payload.audible}`;
+    const signature = `${payload.eventId}|${payload.title || ''}|${payload.audible}|${payload.videoPlaying}`;
     const now = Date.now();
     if (!force && signature === lastSignature && now - lastSentAt < 55_000) {
       return { ok: true, skipped: true };
@@ -115,6 +123,11 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'screenuse-media-changed') {
+    scheduleSync('media-state-changed', true);
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message?.type === 'screenuse-sync-now') {
     void syncActiveContext('manual', true).then(sendResponse);
     return true;
