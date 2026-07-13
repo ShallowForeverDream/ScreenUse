@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
 
 pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "离开"];
 
@@ -220,7 +219,6 @@ pub struct AppSettings {
     pub ai_secret_ref: Option<String>,
 
     pub backup_dir: Option<String>,
-    pub ddl_manager_db_path: String,
 
     // v0.1 compatibility fields. They remain deserializable so existing settings
     // migrate cleanly, but the runtime normalizes them to metadata-only values.
@@ -233,9 +231,6 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| ".".into());
         Self {
             language: "zh-CN".into(),
             theme: "light".into(),
@@ -254,11 +249,6 @@ impl Default for AppSettings {
             ai_model: "".into(),
             ai_secret_ref: None,
             backup_dir: None,
-            ddl_manager_db_path: PathBuf::from(home)
-                .join(".ddl-manager")
-                .join("app.db")
-                .display()
-                .to_string(),
             capture_scope: "metadata-only".into(),
             fps: 0.0,
             chunk_minutes: 0,

@@ -36,6 +36,7 @@ impl AppDb {
         let db = Self { conn: Mutex::new(conn), db_path, data_dir };
         db.migrate()?;
         db.seed_if_empty()?;
+        db.compact_sessions()?;
         Ok(db)
     }
 
@@ -181,6 +182,10 @@ impl AppDb {
                 params![category, color_for_category(category), now()],
             )?;
         }
+        conn.execute(
+            "DELETE FROM plan_items WHERE source='DDL-Manager' OR id LIKE 'ddl-task:%' OR id LIKE 'ddl-day:%'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -215,7 +220,8 @@ impl AppDb {
     pub fn get_settings(&self) -> Result<AppSettings> {
         let conn = self.conn.lock();
         let raw: Option<String> = conn.query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0)).optional()?;
-        let mut settings: AppSettings = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let removed_ddl_manager_setting = raw.as_deref().is_some_and(|value| value.contains("ddlManagerDbPath"));
+        let mut settings: AppSettings = raw.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
         let migration_done = conn
             .query_row(
                 "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
@@ -227,16 +233,20 @@ impl AppDb {
         if !migration_done {
             settings.poll_interval_seconds = 1;
             settings.heartbeat_seconds = 1;
+        }
+        if !migration_done || removed_ddl_manager_setting {
             let timestamp = now();
             conn.execute(
                 "INSERT INTO settings(key,value,updated_at) VALUES('app_settings',?1,?2)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 params![serde_json::to_string(&settings)?, timestamp],
             )?;
-            conn.execute(
-                "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
-                params![ONE_SECOND_SAMPLING_MIGRATION_KEY, timestamp],
-            )?;
+            if !migration_done {
+                conn.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+                    params![ONE_SECOND_SAMPLING_MIGRATION_KEY, timestamp],
+                )?;
+            }
         }
         Ok(settings)
     }
@@ -636,6 +646,69 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn coalesce_session_neighbors(&self, id: &str) -> Result<WorkSession> {
+        let current = self.get_session(id)?.context("session not found")?;
+        let previous_id = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT id FROM work_sessions WHERE started_at < ?1 ORDER BY started_at DESC LIMIT 1",
+                params![current.started_at],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        };
+        let Some(previous_id) = previous_id else { return Ok(current); };
+        let previous = self.get_session(&previous_id)?.context("previous session not found")?;
+        if !can_auto_coalesce(&previous, &current) {
+            return Ok(current);
+        }
+
+        let summary = preferred_coalesced_summary(&previous.summary, &current.summary);
+        let evidence = merge_evidence(&previous.evidence, &current.evidence);
+        let confidence = previous.confidence.max(current.confidence);
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE work_sessions SET ended_at=?1,summary=?2,confidence=?3,evidence_json=?4,updated_at=?5 WHERE id=?6",
+            params![current.ended_at, summary, confidence, serde_json::to_string(&evidence)?, now(), previous.id],
+        )?;
+        conn.execute(
+            "UPDATE activities SET ended_at=?1,summary=?2,evidence_json=?3 WHERE session_id=?4",
+            params![current.ended_at, summary, serde_json::to_string(&evidence)?, previous.id],
+        )?;
+
+        let plan_updates = {
+            let mut stmt = conn.prepare(
+                "SELECT id,matched_session_ids_json FROM plan_items WHERE matched_session_ids_json LIKE ?1",
+            )?;
+            let rows = stmt.query_map(params![format!("%{}%", current.id)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (plan_id, matched_json) = row?;
+                let mut matched: Vec<String> = parse_json(&matched_json);
+                for session_id in &mut matched {
+                    if session_id == &current.id {
+                        *session_id = previous.id.clone();
+                    }
+                }
+                matched.sort();
+                matched.dedup();
+                updates.push((plan_id, serde_json::to_string(&matched)?));
+            }
+            updates
+        };
+        for (plan_id, matched_json) in plan_updates {
+            conn.execute(
+                "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
+                params![matched_json, now(), plan_id],
+            )?;
+        }
+        conn.execute("DELETE FROM work_sessions WHERE id=?1", params![current.id])?;
+        drop(conn);
+        self.get_session(&previous.id)?.context("coalesced session missing")
+    }
+
     pub fn merge_sessions(&self, ids: &[String], summary: Option<String>) -> Result<WorkSession> {
         anyhow::ensure!(!ids.is_empty(), "no session ids provided");
         let conn = self.conn.lock();
@@ -986,59 +1059,20 @@ impl AppDb {
     }
 
     pub fn compact_sessions(&self) -> Result<u32> {
-        #[derive(Clone)]
-        struct Row {
-            id: String,
-            started_at: String,
-            ended_at: String,
-            project_id: Option<String>,
-            task_id: Option<String>,
-            category: String,
-            summary: String,
-            confidence: f32,
-            evidence_json: String,
-            user_confirmed: bool,
-        }
-        let conn = self.conn.lock();
-        let rows = {
-            let mut stmt = conn.prepare(r#"
-                SELECT id,started_at,ended_at,project_id,task_id,category,summary,confidence,evidence_json,user_confirmed
-                FROM work_sessions
-                ORDER BY started_at ASC
-            "#)?;
-            let mapped = stmt.query_map([], |r| Ok(Row {
-                id: r.get(0)?,
-                started_at: r.get(1)?,
-                ended_at: r.get(2)?,
-                project_id: r.get(3)?,
-                task_id: r.get(4)?,
-                category: r.get(5)?,
-                summary: r.get(6)?,
-                confidence: r.get(7)?,
-                evidence_json: r.get(8)?,
-                user_confirmed: r.get::<_, i64>(9)? != 0,
-            }))?;
-            collect_rows(mapped)?
+        let ids = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare("SELECT id FROM work_sessions ORDER BY started_at ASC")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
         };
         let mut changed = 0;
-        let mut i = 0;
-        while i + 1 < rows.len() {
-            let a = &rows[i];
-            let b = &rows[i + 1];
-            let same = !a.user_confirmed
-                && !b.user_confirmed
-                && a.project_id == b.project_id
-                && a.task_id == b.task_id
-                && a.category == b.category
-                && a.summary == b.summary
-                && within_gap(&a.ended_at, &b.started_at, 10);
-            if same {
-                let merged_evidence = merge_evidence_blobs(&format!("{}||{}", a.evidence_json, b.evidence_json));
-                conn.execute("UPDATE work_sessions SET ended_at=?1, confidence=?2, evidence_json=?3, updated_at=?4 WHERE id=?5", params![b.ended_at, a.confidence.max(b.confidence), serde_json::to_string(&merged_evidence)?, now(), a.id])?;
-                conn.execute("DELETE FROM work_sessions WHERE id=?1", params![b.id])?;
-                changed += 1;
+        for id in ids {
+            if self.get_session(&id)?.is_some() {
+                let session = self.coalesce_session_neighbors(&id)?;
+                if session.id != id {
+                    changed += 1;
+                }
             }
-            i += 1;
         }
         Ok(changed)
     }
@@ -1227,13 +1261,72 @@ fn color_for_category(category: &str) -> &'static str {
     }
 }
 
-fn within_gap(left_end: &str, right_start: &str, max_minutes: i64) -> bool {
+fn within_gap_seconds(left_end: &str, right_start: &str, max_seconds: i64) -> bool {
     let left = DateTime::parse_from_rfc3339(left_end).map(|t| t.with_timezone(&Utc));
     let right = DateTime::parse_from_rfc3339(right_start).map(|t| t.with_timezone(&Utc));
     match (left, right) {
-        (Ok(left), Ok(right)) => right >= left && right - left <= Duration::minutes(max_minutes),
+        (Ok(left), Ok(right)) => right >= left && right - left <= Duration::seconds(max_seconds),
         _ => false,
     }
+}
+
+fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
+    if left.user_confirmed
+        || right.user_confirmed
+        || left.source != "context-complete"
+        || right.source != "context-complete"
+        || left.project_id != right.project_id
+        || left.task_id != right.task_id
+        || left.category != right.category
+        || !within_gap_seconds(&left.ended_at, &right.started_at, 3)
+    {
+        return false;
+    }
+    let left_app = primary_session_app(left);
+    let right_app = primary_session_app(right);
+    left_app.is_some()
+        && left_app == right_app
+        && (left.project_id.is_some() || left.task_id.is_some() || left.summary == right.summary)
+}
+
+fn primary_session_app(session: &WorkSession) -> Option<String> {
+    session
+        .evidence
+        .iter()
+        .find(|item| item.kind == "app")
+        .map(|item| item.value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn preferred_coalesced_summary(left: &str, right: &str) -> String {
+    if is_transient_summary(left) && !is_transient_summary(right) {
+        right.to_string()
+    } else {
+        left.to_string()
+    }
+}
+
+fn is_transient_summary(value: &str) -> bool {
+    let value = value.to_lowercase();
+    ["图片查看器", "无标题", "新标签页", "loading", "加载中"]
+        .iter()
+        .any(|needle| value.contains(needle))
+}
+
+fn merge_evidence(left: &[EvidenceItem], right: &[EvidenceItem]) -> Vec<EvidenceItem> {
+    let mut merged = Vec::new();
+    for item in left.iter().chain(right.iter()) {
+        if !merged
+            .iter()
+            .any(|known: &EvidenceItem| known.kind == item.kind && known.value == item.value)
+        {
+            merged.push(item.clone());
+        }
+        if merged.len() >= 20 {
+            break;
+        }
+    }
+    merged
 }
 
 fn custom_category_color(name: &str) -> &'static str {
@@ -1382,6 +1475,92 @@ mod tests {
         let preserved = db.get_settings().expect("load user override");
         assert_eq!(preserved.poll_interval_seconds, 7);
         assert_eq!(preserved.heartbeat_seconds, 7);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn removed_ddl_manager_items_are_purged_on_open() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-ddl-removal-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        db.upsert_plan_items(&[PlanItem {
+            id: "ddl-task:legacy".into(),
+            source: "DDL-Manager".into(),
+            title: "旧 DDL 项目".into(),
+            note: None,
+            start_at: None,
+            due_at: None,
+            status: "todo".into(),
+            tags: vec![],
+            matched_session_ids: vec![],
+        }])
+        .expect("insert legacy item");
+        drop(db);
+
+        let reopened = AppDb::open_in(data_dir.clone()).expect("reopen test database");
+        assert!(reopened
+            .list_plan_items(50)
+            .expect("list plan items")
+            .iter()
+            .all(|item| item.source != "DDL-Manager" && !item.id.starts_with("ddl-")));
+        drop(reopened);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn adjacent_same_app_assignment_is_coalesced_but_real_app_switches_remain() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-coalesce-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("连续会话", "杂务").expect("create project");
+        let task = db.create_task(&project.id, "QQ").expect("create task");
+        let base = Utc::now() + Duration::hours(2);
+        let insert = |id: &str, start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>, summary: &str, app: &str| {
+            let evidence = vec![EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: app.into(),
+                weight: 0.5,
+            }];
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,'杂务',?6,0.88,?7,0,'context-complete',?8)",
+                    params![id, fmt(start), fmt(end), project.id, task.id, summary, serde_json::to_string(&evidence).unwrap(), now()],
+                )
+                .expect("insert session");
+        };
+
+        insert("qq-main", base, base + Duration::seconds(40), "QQ", "QQ.exe");
+        insert(
+            "qq-viewer",
+            base + Duration::seconds(40),
+            base + Duration::seconds(55),
+            "QQ · 图片查看器",
+            "QQ.exe",
+        );
+        insert(
+            "chat-switch",
+            base + Duration::seconds(55),
+            base + Duration::seconds(65),
+            "ChatGPT",
+            "ChatGPT.exe",
+        );
+        insert(
+            "qq-return",
+            base + Duration::seconds(65),
+            base + Duration::seconds(80),
+            "QQ",
+            "QQ.exe",
+        );
+
+        assert_eq!(db.compact_sessions().expect("compact sessions"), 1);
+        let merged = db.get_session("qq-main").expect("load merged").expect("merged exists");
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(55)));
+        assert_eq!(merged.summary, "QQ");
+        assert!(db.get_session("qq-viewer").expect("load removed").is_none());
+        assert!(db.get_session("chat-switch").expect("load switch").is_some());
+        assert!(db.get_session("qq-return").expect("load return").is_some());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

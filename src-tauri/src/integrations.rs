@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
 use crate::models::PlanItem;
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use anyhow::Result;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -11,62 +10,6 @@ use std::collections::hash_map::DefaultHasher;
 pub trait IntegrationAdapter {
     fn name(&self) -> &'static str;
     fn pull_plan_items(&self) -> Result<Vec<PlanItem>>;
-}
-
-pub struct DdlManagerAdapter {
-    pub db_path: String,
-}
-
-impl IntegrationAdapter for DdlManagerAdapter {
-    fn name(&self) -> &'static str { "ddl-manager" }
-
-    fn pull_plan_items(&self) -> Result<Vec<PlanItem>> {
-        let path = Path::new(&self.db_path);
-        if !path.exists() { return Ok(vec![]); }
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("open DDL-Manager db: {}", path.display()))?;
-        let mut items = Vec::new();
-        let mut stmt = conn.prepare(r#"
-            SELECT t.id, t.title, t.note, t.due_time_utc, t.status,
-                   COALESCE(GROUP_CONCAT(tag.name, ','), '') AS tags
-            FROM task t
-            LEFT JOIN task_tag tt ON tt.task_id=t.id AND tt.is_deleted=0
-            LEFT JOIN tag ON tag.id=tt.tag_id AND tag.is_deleted=0
-            WHERE t.is_deleted=0
-            GROUP BY t.id
-            ORDER BY COALESCE(t.due_time_utc, t.updated_at_utc) ASC
-        "#)?;
-        let rows = stmt.query_map([], |r| {
-            let tags_raw: String = r.get(5)?;
-            Ok(PlanItem {
-                id: format!("ddl-task:{}", r.get::<_, String>(0)?),
-                source: "DDL-Manager".into(),
-                title: r.get(1)?,
-                note: r.get(2)?,
-                start_at: None,
-                due_at: r.get(3)?,
-                status: if r.get::<_, i64>(4)? == 1 { "done".into() } else { "todo".into() },
-                tags: tags_raw.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
-                matched_session_ids: vec![],
-            })
-        })?;
-        for row in rows { items.push(row?); }
-
-        let mut stmt = conn.prepare("SELECT id,title,note,event_time_utc FROM important_day WHERE is_deleted=0 ORDER BY event_time_utc ASC")?;
-        let rows = stmt.query_map([], |r| Ok(PlanItem {
-            id: format!("ddl-day:{}", r.get::<_, String>(0)?),
-            source: "DDL-Manager".into(),
-            title: r.get(1)?,
-            note: r.get(2)?,
-            start_at: r.get(3)?,
-            due_at: r.get(3)?,
-            status: "important-day".into(),
-            tags: vec!["重要日".into()],
-            matched_session_ids: vec![],
-        }))?;
-        for row in rows { items.push(row?); }
-        Ok(items)
-    }
 }
 
 pub struct IcsAdapter {

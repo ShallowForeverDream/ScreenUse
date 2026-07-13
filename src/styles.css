@@ -689,6 +689,23 @@ h1, h2, h3, p { margin-top: 0; }
 .switch-label { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
 .switch-label input { width: 14px; height: 14px; }
 .timeline-list { display: grid; gap: 7px; }
+.filtered-gap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 24px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.filtered-gap::before,
+.filtered-gap::after {
+  content: '';
+  width: min(90px, 12vw);
+  height: 1px;
+  background: var(--line);
+}
+.filtered-gap b { color: var(--text-soft); font-weight: 600; }
 .session-row {
   position: relative;
   min-width: 0;

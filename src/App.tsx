@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useId,
@@ -1106,25 +1107,45 @@ function TimelineView({
         </div>
 
         <div className="timeline-list">
-          {filtered.map((session) => (
-            <SessionRow
-              key={session.id}
-              session={session}
-              selected={selected.has(session.id)}
-              onToggle={() => toggle(session.id)}
-              onEdit={() => editSession(session)}
-              onConfirm={() =>
-                void runAction(
-                  () =>
-                    api.updateSession(session.id, {
-                      confidence: Math.max(0.96, session.confidence),
-                      userConfirmed: true,
-                    }),
-                  '分类已确认',
-                )
-              }
-            />
-          ))}
+          {filtered.map((session, index) => {
+            const newer = index > 0 ? filtered[index - 1] : null;
+            const newerIndex = newer ? sessions.findIndex((item) => item.id === newer.id) : -1;
+            const currentIndex = sessions.findIndex((item) => item.id === session.id);
+            const hidden = newerIndex >= 0 && currentIndex > newerIndex + 1
+              ? sessions.slice(newerIndex + 1, currentIndex)
+              : [];
+            const hiddenApps = [...new Set(hidden.map(sessionApplication))];
+            const hiddenMinutes = hidden.reduce(
+              (total, item) => total + minutesBetween(item.startedAt, item.endedAt),
+              0,
+            );
+            return (
+              <Fragment key={session.id}>
+                {hidden.length > 0 && (
+                  <div className="filtered-gap">
+                    <span>中间切换至 {hiddenApps.slice(0, 2).join('、')}{hiddenApps.length > 2 ? ` 等 ${hiddenApps.length} 个应用` : ''}</span>
+                    <b>{formatDuration(hiddenMinutes)}</b>
+                  </div>
+                )}
+                <SessionRow
+                  session={session}
+                  selected={selected.has(session.id)}
+                  onToggle={() => toggle(session.id)}
+                  onEdit={() => editSession(session)}
+                  onConfirm={() =>
+                    void runAction(
+                      () =>
+                        api.updateSession(session.id, {
+                          confidence: Math.max(0.96, session.confidence),
+                          userConfirmed: true,
+                        }),
+                      '分类已确认',
+                    )
+                  }
+                />
+              </Fragment>
+            );
+          })}
           {!filtered.length && (
             <EmptyState
               title={reviewOnly ? '没有待复核记录' : '没有匹配的活动'}
@@ -1593,24 +1614,7 @@ function SettingsView({
       </section>
 
       <section className="panel settings-panel">
-        <PanelTitle title="外部线索" subtitle="可选导入计划，用于核对项目投入。" />
-        <Field label="DDL-Manager 数据库">
-          <input
-            value={settings.ddlManagerDbPath}
-            onChange={(event) => update('ddlManagerDbPath', event.target.value)}
-          />
-        </Field>
-        <button
-          onClick={() =>
-            void runAction(
-              () => api.importDdlManager(settings.ddlManagerDbPath),
-              '已只读导入 DDL-Manager',
-            )
-          }
-          type="button"
-        >
-          <Download size={16} />导入 DDL-Manager
-        </button>
+        <PanelTitle title="日历线索" subtitle="可选导入日历计划，用于核对项目投入。" />
         <Field label="ICS 文件路径">
           <input id="ics-path" placeholder="D:\\calendar.ics" />
         </Field>

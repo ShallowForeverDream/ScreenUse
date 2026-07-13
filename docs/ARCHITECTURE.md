@@ -13,7 +13,7 @@ flowchart LR
   R --> A[规则/AI 归因]
   Q --> A
   A --> S[work_sessions]
-  D[DDL-Manager/ICS/Google/Microsoft] --> P[plan_items]
+  D[ICS/Google/Microsoft] --> P[plan_items]
   S --> UI[时间轴/项目/报告]
   P --> UI
 ```
@@ -22,7 +22,7 @@ flowchart LR
 
 - 人工确认的 `work_sessions.user_confirmed=1` 永远优先，AI 重分析不得覆盖。
 - 原始媒体只作为临时分析材料，分析成功后删除；长期保存 AI 摘要、元数据、置信度、证据。
-- 外部集成先只读，DDL-Manager 不回写。
+- 外部日历集成只读，不回写来源文件。
 - 当前 Windows 实现先保证可用；Collector/Integration/Export trait 为 macOS/Linux 预留。
 
 ## 关键接口

@@ -21,7 +21,7 @@ mod secrets;
 
 use collectors::{CollectorAdapter, DesktopCollector};
 use db::AppDb;
-use integrations::{DdlManagerAdapter, IcsAdapter, IntegrationAdapter};
+use integrations::{IcsAdapter, IntegrationAdapter};
 use models::{AppSettings, DashboardData, SessionPatch};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -236,20 +236,6 @@ fn reveal_data_dir(state: State<AppState>) -> String {
 }
 
 #[tauri::command]
-fn import_ddl_manager(state: State<AppState>, db_path: Option<String>) -> Result<usize, String> {
-    let path = db_path.unwrap_or_else(|| {
-        state
-            .db
-            .get_settings()
-            .unwrap_or_default()
-            .ddl_manager_db_path
-    });
-    let adapter = DdlManagerAdapter { db_path: path };
-    let items = adapter.pull_plan_items().map_err(map_err)?;
-    state.db.upsert_plan_items(&items).map_err(map_err)
-}
-
-#[tauri::command]
 fn import_ics(state: State<AppState>, path: String) -> Result<usize, String> {
     let adapter = IcsAdapter { path };
     let items = adapter.pull_plan_items().map_err(map_err)?;
@@ -418,7 +404,6 @@ fn main() {
             export_data,
             backup_now,
             reveal_data_dir,
-            import_ddl_manager,
             import_ics,
             import_google_calendar_placeholder,
             import_microsoft_todo_placeholder,

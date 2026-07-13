@@ -67,7 +67,6 @@ export const api = {
   exportData: (format: 'csv' | 'excel' | 'markdown') => call<string>('export_data', { format }, `browser-preview.${format}`),
   backupNow: (targetDir?: string) => call<string>('backup_now', { targetDir }, 'browser-preview-backup.db'),
   revealDataDir: () => call<string>('reveal_data_dir', undefined, '浏览器预览模式'),
-  importDdlManager: (dbPath?: string) => call<number>('import_ddl_manager', { dbPath }, 0),
   importIcs: (path: string) => call<number>('import_ics', { path }, 0),
   saveSecret: (name: string, value: string) => call<string>('save_secret', { name, value }, `credential://ScreenUse/${name}`),
   testAiConfig: (settings: AppSettings, secretName: string) => call<string>('test_ai_config', { settings, secretName }, '浏览器预览：未调用真实模型'),

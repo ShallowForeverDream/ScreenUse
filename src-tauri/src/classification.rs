@@ -92,7 +92,7 @@ pub fn finalize_context(
         },
     )?;
     db.mark_session_awaiting_confirmation(&updated.id)?;
-    db.get_session(&updated.id)
+    db.coalesce_session_neighbors(&updated.id).map(Some)
 }
 
 fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) -> Result<Option<Assignment>> {
@@ -291,6 +291,9 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
         .unwrap_or("电脑活动")
         .trim_end_matches(".exe")
         .trim();
+    if app.eq_ignore_ascii_case("qq") && title == "图片查看器" {
+        return "QQ".into();
+    }
     cap(
         &if title.is_empty() || normalize(&title) == normalize(app) {
             app.to_string()
@@ -418,5 +421,10 @@ mod tests {
     #[test]
     fn strips_browser_suffix_from_title() {
         assert_eq!(clean_title("ScreenUse - GitHub - Google Chrome"), "ScreenUse - GitHub");
+    }
+
+    #[test]
+    fn qq_image_viewer_keeps_the_main_qq_summary() {
+        assert_eq!(summary_for_event(&event("QQ.exe", "图片查看器"), "杂务"), "QQ");
     }
 }

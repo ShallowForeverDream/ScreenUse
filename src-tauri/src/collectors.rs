@@ -309,14 +309,27 @@ fn context_signature(event: &RawActivityEvent, idle_threshold_seconds: u32) -> S
     if event.input_stats.idle_seconds >= idle_threshold_seconds as u64 {
         return "idle".into();
     }
+    let app = event.app.as_deref().unwrap_or_default().to_lowercase();
+    let window_title = signature_window_title(&app, event.window_title.as_deref());
     format!(
         "{}|{}|{}|{}|{}",
-        event.app.as_deref().unwrap_or_default().to_lowercase(),
-        event.window_title.as_deref().unwrap_or_default(),
+        app,
+        window_title,
         event.url.as_deref().unwrap_or_default(),
         event.file_path.as_deref().unwrap_or_default(),
         event.workspace.as_deref().unwrap_or_default(),
     )
+}
+
+fn signature_window_title<'a>(app: &str, title: Option<&'a str>) -> &'a str {
+    let title = title.unwrap_or_default();
+    if (app == "qq" || app == "qq.exe")
+        && matches!(title.trim(), "" | "QQ" | "图片查看器")
+    {
+        "qq-main"
+    } else {
+        title
+    }
 }
 
 fn sanitize_event(event: &mut RawActivityEvent) {
@@ -860,6 +873,28 @@ mod tests {
         let first = context_signature(&event, 180);
         event.app = Some("two.exe".into());
         assert_eq!(first, context_signature(&event, 180));
+    }
+
+    #[test]
+    fn qq_main_window_and_image_viewer_share_one_signature() {
+        let mut event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: String::new(),
+            app: Some("QQ.exe".into()),
+            window_title: Some("QQ".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        let main = context_signature(&event, 180);
+        event.window_title = Some("图片查看器".into());
+        assert_eq!(main, context_signature(&event, 180));
+
+        event.window_title = Some("QQ设置".into());
+        assert_ne!(main, context_signature(&event, 180));
     }
 
     #[test]

@@ -2,7 +2,6 @@ import type { DashboardData } from './types';
 
 const now = new Date();
 const iso = (minutesAgo: number) => new Date(now.getTime() - minutesAgo * 60_000).toISOString();
-const home = typeof navigator !== 'undefined' && navigator.platform.includes('Win') ? '%USERPROFILE%' : '~';
 
 export const fallbackDashboard: DashboardData = {
   collectorRunning: true,
@@ -34,7 +33,6 @@ export const fallbackDashboard: DashboardData = {
     aiModel: '',
     aiSecretRef: null,
     backupDir: null,
-    ddlManagerDbPath: `${home}\\.ddl-manager\\app.db`,
     captureScope: 'metadata-only',
     fps: 0,
     chunkMinutes: 0,
@@ -57,9 +55,7 @@ export const fallbackDashboard: DashboardData = {
     { id: 's3', startedAt: iso(68), endedAt: iso(39), projectId: 'p1', projectName: 'ScreenUse', taskId: 't1', taskTitle: '日常开发', category: '开发', summary: 'ScreenUse · App.tsx', confidence: 0.89, userConfirmed: true, source: 'collector-rule', evidence: [{ kind: 'file', label: '文件', value: 'src/App.tsx', weight: 0.8 }, { kind: 'app', label: '应用', value: 'Code.exe', weight: 0.5 }] },
     { id: 's4', startedAt: iso(32), endedAt: iso(8), projectId: null, projectName: null, taskId: null, taskTitle: null, category: '杂务', summary: 'Chrome · 新标签页', confidence: 0.56, userConfirmed: false, source: 'context-complete', evidence: [{ kind: 'window', label: '窗口', value: '新标签页', weight: 0.5 }, { kind: 'app', label: '应用', value: 'chrome.exe', weight: 0.5 }] },
   ],
-  planItems: [
-    { id: 'ddl-1', source: 'DDL-Manager', title: '完成 ScreenUse 低占用版本', note: '个人使用', startAt: null, dueAt: iso(-360), status: 'todo', tags: ['项目'], matchedSessionIds: ['s1', 's3'] },
-  ],
+  planItems: [],
   trends: [
     { label: 'ScreenUse', value: 91, group: '开发' },
     { label: '课程与论文', value: 42, group: '学习' },

@@ -127,7 +127,6 @@ export interface AppSettings {
   aiModel: string;
   aiSecretRef?: string | null;
   backupDir?: string | null;
-  ddlManagerDbPath: string;
 
   // Kept by the backend only to migrate v0.1 settings.
   captureScope: string;
