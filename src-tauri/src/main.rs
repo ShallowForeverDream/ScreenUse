@@ -30,7 +30,7 @@ use models::{
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State};
+use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 struct AppState {
     db: Arc<AppDb>,
@@ -39,6 +39,24 @@ struct AppState {
 
 fn map_err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn show_or_create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window("main") {
+        window
+    } else {
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("ScreenUse")
+            .inner_size(1180.0, 820.0)
+            .min_inner_size(760.0, 600.0)
+            .resizable(true)
+            .visible(true)
+            .build()?
+    };
+    window.show()?;
+    window.unminimize()?;
+    window.set_focus()?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -424,10 +442,7 @@ fn setup_tray(
         .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "tray-open" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                let _ = show_or_create_main_window(app);
             }
             "tray-start" => {
                 let _ = collector_for_tray.start(db_for_tray.clone());
@@ -453,18 +468,13 @@ fn main() {
             // Login startup and an already-running background process should stay
             // silent. A normal second launch brings the existing window forward.
             if !args.iter().any(|arg| arg == "--background") {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+                let _ = show_or_create_main_window(app);
             }
         }))
-        .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
                 api.prevent_close();
+                let _ = window.destroy();
             }
         })
         .setup(|app| {
@@ -487,17 +497,10 @@ fn main() {
             if settings.auto_start {
                 collector.start(db.clone()).map_err(tauri::Error::Anyhow)?;
             }
-            if let Some(window) = app.get_webview_window("main") {
-                if autostart::background_launch_requested() {
-                    let _ = window.hide();
-                } else {
-                    // The window starts hidden in tauri.conf.json so login startup
-                    // cannot flash before setup decides whether this is interactive.
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
             app.manage(AppState { db, collector });
+            if !autostart::background_launch_requested() {
+                show_or_create_main_window(app.handle())?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -542,6 +545,16 @@ fn main() {
             delete_secret,
             test_ai_config,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ScreenUse");
+        .build(tauri::generate_context!())
+        .expect("error while building ScreenUse")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                // Destroying the last dashboard window should return to the
+                // lightweight tray process. Explicit tray exits carry a code.
+                api.prevent_exit();
+            }
+        });
 }

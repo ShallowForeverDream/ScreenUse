@@ -44,7 +44,7 @@ Extension context expires after 120 seconds. A stale tab or editor cannot be att
 
 ## 3. Stable IDs and coalesced heartbeats
 
-A naive sampler creates a new row on every observation. ScreenUse observes every 10 seconds by default but does not persist samples that way.
+A naive sampler creates a new row on every observation. ScreenUse observes the foreground every second but does not persist samples that way.
 
 For each uninterrupted context, the collector generates one UUID. The UUID remains the same for:
 
@@ -52,7 +52,11 @@ For each uninterrupted context, the collector generates one UUID. The UUID remai
 - periodic heartbeat;
 - context end.
 
-`raw_events.id` is the primary key and the database uses `INSERT OR REPLACE`. Each 10-second update replaces one row and extends one session instead of appending another. A new row and time block are created only after app/title/URL/file/workspace or active/idle state produces a stable context change.
+`raw_events.id` is the primary key and the database uses `INSERT OR REPLACE`. Durable heartbeats are batched to a minimum five-second interval; each heartbeat replaces one row and extends one session in a single transaction instead of appending another. A new row and time block are created only after app/title/URL/file/workspace or active/idle state produces a stable context change.
+
+SQLite uses a small page cache, a 256-page automatic WAL checkpoint, and a 1 MiB journal size limit. Maintenance only scans recent session detail, rotates raw metadata, expires old AI prompt bodies, and bounds derived rule/tombstone/link collections so long-running installs do not accumulate unbounded housekeeping data.
+
+The Windows tray process also creates its WebView lazily. A `--background` launch runs the collector without Edge WebView2 children; opening the dashboard creates the UI, and closing it destroys those UI processes instead of leaving a hidden browser resident.
 
 This follows the event/heartbeat idea used by ActivityWatch, adapted to ScreenUse's existing SQLite schema.
 

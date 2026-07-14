@@ -19,7 +19,7 @@ export const fallbackDashboard: DashboardData = {
     language: 'zh-CN',
     theme: 'light',
     pollIntervalSeconds: 1,
-    heartbeatSeconds: 1,
+    heartbeatSeconds: 5,
     rawEventRetentionDays: 30,
     idleThresholdSeconds: 180,
     idleCategory: '无效',

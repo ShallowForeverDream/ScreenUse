@@ -237,7 +237,7 @@ impl Default for AppSettings {
             language: "zh-CN".into(),
             theme: "light".into(),
             poll_interval_seconds: 1,
-            heartbeat_seconds: 1,
+            heartbeat_seconds: 5,
             raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
             idle_category: "无效".into(),
@@ -273,7 +273,9 @@ impl AppSettings {
         }
         .into();
         self.poll_interval_seconds = self.poll_interval_seconds.clamp(1, 60);
-        self.heartbeat_seconds = self.poll_interval_seconds;
+        // Foreground changes are still observed every second, while durable
+        // heartbeats are batched to reduce SQLite and SSD write amplification.
+        self.heartbeat_seconds = self.heartbeat_seconds.clamp(5, 60);
         self.raw_event_retention_days = self.raw_event_retention_days.clamp(7, 3650);
         self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
         self.idle_category = clean_setting_label(&self.idle_category, "无效");
@@ -383,7 +385,14 @@ mod tests {
                 .expect("deserialize legacy sampling settings");
         let migrated = legacy.normalized();
         assert_eq!(migrated.poll_interval_seconds, 2);
-        assert_eq!(migrated.heartbeat_seconds, 2);
+        assert_eq!(migrated.heartbeat_seconds, 30);
+
+        let write_heavy = AppSettings {
+            poll_interval_seconds: 1,
+            heartbeat_seconds: 1,
+            ..AppSettings::default()
+        };
+        assert_eq!(write_heavy.normalized().heartbeat_seconds, 5);
     }
 }
 

@@ -1008,10 +1008,13 @@ function AiReviewView({
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(true), 4000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refresh(true);
+    }, 5000);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
+  const selectedStatus = jobs.find((job) => job.id === selectedId)?.status;
   useEffect(() => {
     if (!selectedId) {
       setDetail(null);
@@ -1023,12 +1026,17 @@ function AiReviewView({
       if (alive) setDetail(next);
     };
     void loadDetail();
-    const timer = window.setInterval(() => void loadDetail(), 4000);
+    const shouldPoll = selectedStatus === 'pending' || selectedStatus === 'running';
+    const timer = shouldPoll
+      ? window.setInterval(() => {
+          if (document.visibilityState === 'visible') void loadDetail();
+        }, 5000)
+      : null;
     return () => {
       alive = false;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearInterval(timer);
     };
-  }, [selectedId]);
+  }, [selectedId, selectedStatus]);
 
   const runAndRefresh = async (action: () => Promise<unknown>, message: string) => {
     setBusy(true);
@@ -1176,8 +1184,8 @@ function AiReviewView({
                 </div>
               </section>
 
-              <AiTraceBlock title="系统提示词" value={detail.systemPrompt} empty="任务运行后记录" />
-              <AiTraceBlock title="发送给 AI 的提示词" value={detail.userPrompt} empty="任务运行后记录" />
+              <AiTraceBlock title="系统提示词" value={detail.systemPrompt} empty={aiTraceEmptyText(detail)} />
+              <AiTraceBlock title="发送给 AI 的提示词" value={detail.userPrompt} empty={aiTraceEmptyText(detail)} />
               <AiTraceBlock title="AI 原始回复" value={detail.response} empty={detail.status === 'running' ? '正在等待回复' : '尚无回复'} />
             </>
           ) : (
@@ -1243,6 +1251,10 @@ function aiProviderLabel(provider: string) {
   if (provider === 'codex-account') return '当前 Codex 账号';
   if (provider === 'openai-compatible') return 'OpenAI 兼容接口';
   return provider || '尚未开始';
+}
+
+function aiTraceEmptyText(job: AnalysisJob) {
+  return job.completedAt ? '详细内容已按轻量保留策略自动清理' : '任务运行后记录';
 }
 
 function formatAiDateTime(value?: string | null) {

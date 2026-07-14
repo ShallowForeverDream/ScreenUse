@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
+const RECENT_MAINTENANCE_DAYS: i64 = 14;
+const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 
 struct AttributionDecision {
     project_id: Option<String>,
@@ -84,7 +86,7 @@ impl AppDb {
         fs::create_dir_all(data_dir.join("backups"))?;
         let db_path = data_dir.join("screenuse.db");
         let conn = Connection::open(&db_path)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        configure_connection(&conn)?;
         let db = Self {
             conn: Mutex::new(conn),
             data_dir,
@@ -419,7 +421,7 @@ impl AppDb {
             .is_some();
         if !migration_done {
             settings.poll_interval_seconds = 1;
-            settings.heartbeat_seconds = 1;
+            settings.heartbeat_seconds = 5;
         }
         if !migration_done || removed_ddl_manager_setting {
             let timestamp = now();
@@ -467,7 +469,11 @@ impl AppDb {
             params![project_id, settings.idle_project_name, settings.idle_category, color, timestamp],
         )?;
         tx.execute(
-            "UPDATE work_sessions SET project_id=?1,task_id=NULL,category=?2,source='collector-idle',updated_at=?3 WHERE user_confirmed=0 AND (source='collector-idle' OR (category='离开' AND summary='离开/空闲'))",
+            "UPDATE work_sessions
+             SET project_id=?1,task_id=NULL,category=?2,source='collector-idle',updated_at=?3
+             WHERE user_confirmed=0
+               AND (source='collector-idle' OR (category='离开' AND summary='离开/空闲'))
+               AND (project_id IS NOT ?1 OR task_id IS NOT NULL OR category<>?2 OR source<>'collector-idle')",
             params![project_id, settings.idle_category, timestamp],
         )?;
         tx.commit()?;
@@ -1857,8 +1863,9 @@ impl AppDb {
     pub fn heartbeat_raw_event(&self, event: &RawActivityEvent, session_id: &str) -> Result<()> {
         let input_stats = serde_json::to_string(&event.input_stats)?;
         let metadata = event.metadata.to_string();
-        let conn = self.conn.lock();
-        conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO raw_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 event.id,
@@ -1873,11 +1880,12 @@ impl AppDb {
                 metadata
             ],
         )?;
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE work_sessions SET ended_at=?1, updated_at=?2 WHERE id=?3",
             params![event.timestamp, now(), session_id],
         )?;
         anyhow::ensure!(changed == 1, "active session disappeared during heartbeat");
+        tx.commit()?;
         Ok(())
     }
 
@@ -2491,6 +2499,7 @@ impl AppDb {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let mut changed = 0_u32;
+        let recent_cutoff = format!("-{RECENT_MAINTENANCE_DAYS} days");
 
         // A task is the most specific assignment. Repair legacy rows produced
         // before hierarchy validation by deriving their project and category.
@@ -2547,9 +2556,14 @@ impl AppDb {
                  WHERE ws.user_confirmed=0
                    AND ws.source IN ('collector-rule','collector-idle','context-complete')
                    AND julianday(ws.ended_at)>julianday(ws.started_at)
-                 ORDER BY ws.started_at ASC,ws.ended_at ASC,ws.updated_at ASC",
+                   AND julianday(ws.ended_at)>=julianday('now',?1)
+                 ORDER BY ws.started_at ASC,ws.ended_at ASC,ws.updated_at ASC
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map([], map_work_session)?;
+            let rows = stmt.query_map(
+                params![recent_cutoff, MAX_RECENT_MAINTENANCE_SESSIONS],
+                map_work_session,
+            )?;
             collect_rows(rows)?
         };
 
@@ -2622,8 +2636,18 @@ impl AppDb {
     pub fn compact_sessions(&self) -> Result<u32> {
         let ids = {
             let conn = self.conn.lock();
-            let mut stmt = conn.prepare("SELECT id FROM work_sessions ORDER BY started_at ASC")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM (
+                   SELECT id,started_at FROM work_sessions
+                   WHERE julianday(ended_at)>=julianday('now',?1)
+                   ORDER BY started_at DESC LIMIT ?2
+                 ) ORDER BY started_at ASC",
+            )?;
+            let cutoff = format!("-{RECENT_MAINTENANCE_DAYS} days");
+            let rows = stmt.query_map(
+                params![cutoff, MAX_RECENT_MAINTENANCE_SESSIONS],
+                |row| row.get::<_, String>(0),
+            )?;
             collect_rows(rows)?
         };
         let mut changed = 0;
@@ -3106,6 +3130,20 @@ fn analysis_job_from_row(row: &Row<'_>) -> rusqlite::Result<AnalysisJob> {
             .map(|value| value.max(0) as u64),
         result_count: row.get::<_, i64>(17)?.max(0) as u32,
     })
+}
+
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA cache_size=-2000;
+         PRAGMA wal_autocheckpoint=256;
+         PRAGMA journal_size_limit=1048576;",
+    )?;
+    Ok(())
 }
 
 fn clean_name(value: &str, fallback: &str) -> String {
@@ -3667,7 +3705,7 @@ mod tests {
 
         let migrated = db.get_settings().expect("migrate settings");
         assert_eq!(migrated.poll_interval_seconds, 1);
-        assert_eq!(migrated.heartbeat_seconds, 1);
+        assert_eq!(migrated.heartbeat_seconds, 5);
 
         settings.poll_interval_seconds = 7;
         settings.heartbeat_seconds = 7;
@@ -4826,18 +4864,43 @@ mod tests {
         db.ingest_raw_event(event.clone()).expect("start context");
         let session = db.list_sessions(1).expect("load active session")[0].clone();
 
-        event.timestamp = fmt(base + Duration::seconds(10));
         event.metadata = serde_json::json!({"heartbeat": true});
-        db.heartbeat_raw_event(&event, &session.id)
-            .expect("extend known session");
+        for index in 1..=1000 {
+            event.timestamp = fmt(base + Duration::seconds(index * 5));
+            db.heartbeat_raw_event(&event, &session.id)
+                .expect("extend known session");
+        }
 
         let extended = db
             .get_session(&session.id)
             .expect("load session")
             .expect("session exists");
         assert_eq!(extended.started_at, fmt(base));
-        assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
+        assert_eq!(extended.ended_at, fmt(base + Duration::seconds(5000)));
         assert_eq!(extended.summary, session.summary);
+        let conn = db.conn.lock();
+        let raw_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE id='fast-stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_rows, 1);
+        assert_eq!(
+            conn.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            256
+        );
+        drop(conn);
+        let database_bytes = fs::metadata(data_dir.join("screenuse.db"))
+            .map(|item| item.len())
+            .unwrap_or_default();
+        let wal_bytes = fs::metadata(data_dir.join("screenuse.db-wal"))
+            .map(|item| item.len())
+            .unwrap_or_default();
+        assert!(database_bytes < 2 * 1024 * 1024);
+        assert!(wal_bytes <= 2 * 1024 * 1024);
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

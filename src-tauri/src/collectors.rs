@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
@@ -27,6 +27,8 @@ pub struct CollectorHealth {
 
 pub struct DesktopCollector {
     running: AtomicBool,
+    generation: AtomicU64,
+    lifecycle: Mutex<()>,
     last_event_at: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
 }
@@ -55,6 +57,8 @@ impl DesktopCollector {
     pub fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            lifecycle: Mutex::new(()),
             last_event_at: Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -71,9 +75,11 @@ impl DesktopCollector {
 
 impl CollectorAdapter for Arc<DesktopCollector> {
     fn start(&self, db: Arc<AppDb>) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let collector = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -84,7 +90,9 @@ impl CollectorAdapter for Arc<DesktopCollector> {
             let mut settings_loaded_at = Instant::now();
 
             loop {
-                if !collector.running.load(Ordering::SeqCst) {
+                if !collector.running.load(Ordering::SeqCst)
+                    || collector.generation.load(Ordering::SeqCst) != generation
+                {
                     if let Some(previous) = active.take() {
                         if let Err(error) = close_context(&collector, &db, previous) {
                             collector.set_error(error);
@@ -280,7 +288,9 @@ impl CollectorAdapter for Arc<DesktopCollector> {
     }
 
     fn stop(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
         self.running.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

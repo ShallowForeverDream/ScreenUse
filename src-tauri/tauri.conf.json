@@ -10,18 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "ScreenUse",
-        "width": 1180,
-        "height": 820,
-        "minWidth": 760,
-        "minHeight": 600,
-        "visible": false,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

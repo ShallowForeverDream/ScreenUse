@@ -8,7 +8,8 @@ use crate::secrets;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -16,6 +17,8 @@ const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD: f32 = 0.8;
 const MAX_REVIEW_BATCH: usize = 8;
 const CONTEXT_WINDOW_MINUTES: i64 = 30;
 const MAX_CONTEXT_SESSIONS_PER_TARGET: usize = 24;
+
+static AI_RUN_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 pub fn start_analysis_worker(db: Arc<AppDb>) {
     tauri::async_runtime::spawn(async move {
@@ -96,6 +99,10 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
 }
 
 pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
+    let lock = AI_RUN_LOCK.get_or_init(|| AsyncMutex::new(()));
+    let Ok(_guard) = lock.try_lock() else {
+        return Ok(false);
+    };
     let Some(job) = db.claim_next_analysis_job()? else {
         return Ok(false);
     };
