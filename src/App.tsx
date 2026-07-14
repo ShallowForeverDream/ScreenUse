@@ -1119,10 +1119,7 @@ function TodayView({
           sessions={sessions.filter((session) => session.category === selectedCategory)}
           selectedDate={selectedDate}
           onClose={() => setSelectedCategory(null)}
-          onEdit={(selectedSessions) => {
-            setSelectedCategory(null);
-            onEdit(selectedSessions);
-          }}
+          onEdit={onEdit}
         />
       )}
     </div>
@@ -1362,6 +1359,10 @@ function CategoryDetailModal({
     0,
   );
   const allSelected = sorted.length > 0 && selected.size === sorted.length;
+  const editSession = (session: WorkSession) => {
+    const belongsToSelection = selected.has(session.id);
+    onEdit(belongsToSelection && selectedSessions.length > 1 ? selectedSessions : [session]);
+  };
   const toggle = (id: string) => {
     setSelected((current) => {
       const next = new Set(current);
@@ -1417,7 +1418,7 @@ function CategoryDetailModal({
                   type="checkbox"
                 />
               </label>
-              <button className="category-session-open" onClick={() => onEdit([session])} type="button">
+              <button className="category-session-open" onClick={() => editSession(session)} type="button">
               <span className="category-session-time">
                   <strong>{formatTimelineClock(session.startedAt, true)}</strong>
                   <small>{formatTimelineClock(session.endedAt, true)}</small>
@@ -1491,7 +1492,8 @@ function TimelineView({
   };
 
   const editSession = (session: WorkSession) => {
-    onEdit(selectedSessions.length > 1 ? selectedSessions : [session]);
+    const belongsToSelection = selected.has(session.id);
+    onEdit(belongsToSelection && selectedSessions.length > 1 ? selectedSessions : [session]);
   };
 
   return (
@@ -1921,10 +1923,7 @@ function ProjectsView({
           sessions={detailSessions}
           selectedDate={selectedDate}
           onClose={() => setSessionDetail(null)}
-          onEdit={(selectedSessions) => {
-            setSessionDetail(null);
-            onEdit(selectedSessions);
-          }}
+          onEdit={onEdit}
         />
       )}
     </div>
@@ -2818,9 +2817,11 @@ function EditSessionModal({
       ...[...projectOptions]
         .sort((left, right) => {
           const priority = (project: Project) => {
-            if (projectId && project.id === projectId) return 0;
-            if (category && project.category === category) return 1;
-            return 2;
+            if (category) {
+              if (project.category !== category) return 2;
+              return projectId && project.id === projectId ? 0 : 1;
+            }
+            return projectId && project.id === projectId ? 0 : 1;
           };
           return priority(left) - priority(right)
             || left.name.localeCompare(right.name, 'zh-CN');
@@ -2841,11 +2842,17 @@ function EditSessionModal({
       ...[...taskOptions]
         .sort((left, right) => {
           const priority = (task: Task) => {
-            if (taskId && task.id === taskId) return 0;
-            if (projectId && task.projectId === projectId) return 1;
             const project = projectOptions.find((item) => item.id === task.projectId);
-            if (category && project?.category === category) return 2;
-            return 3;
+            if (projectId) {
+              if (task.projectId === projectId) return taskId && task.id === taskId ? 0 : 1;
+              if (category && project?.category === category) return 2;
+              return 3;
+            }
+            if (category) {
+              if (project?.category !== category) return 2;
+              return taskId && task.id === taskId ? 0 : 1;
+            }
+            return taskId && task.id === taskId ? 0 : 1;
           };
           return priority(left) - priority(right)
             || left.title.localeCompare(right.title, 'zh-CN');
