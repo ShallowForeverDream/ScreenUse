@@ -215,7 +215,11 @@ impl AppDb {
         )?;
         for category in DEFAULT_CATEGORIES {
             conn.execute(
-                "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at) VALUES(?1,?2,1,?3,?3)",
+                "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at)
+                 SELECT ?1,?2,1,?3,?3
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM sync_tombstones WHERE entity_kind='category' AND entity_id=?1
+                 )",
                 params![category, color_for_category(category), now()],
             )?;
         }
@@ -399,39 +403,127 @@ impl AppDb {
         })
     }
 
-    pub fn delete_category(&self, name: &str) -> Result<()> {
+    pub fn rename_category(&self, old_name: &str, new_name: &str) -> Result<CategoryOption> {
+        let old_name = clean_name(old_name, "");
+        let new_name = clean_name(new_name, "");
+        if old_name.is_empty() || new_name.is_empty() {
+            bail!("分类名称不能为空");
+        }
+        if old_name == "离开" {
+            bail!("“离开”是空闲状态，不能重命名");
+        }
+        let new_name: String = new_name.chars().take(24).collect();
+        if old_name == new_name {
+            return self
+                .list_categories()?
+                .into_iter()
+                .find(|item| item.name == old_name)
+                .context("分类不存在或已经删除");
+        }
+
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let builtin = tx
+        let (color, is_builtin, created_at) = tx
             .query_row(
-                "SELECT is_builtin FROM activity_categories WHERE name=?1",
+                "SELECT color,is_builtin,created_at FROM activity_categories WHERE name=?1",
+                params![old_name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("分类不存在或已经删除")?;
+        let duplicate = tx
+            .query_row(
+                "SELECT 1 FROM activity_categories WHERE name=?1",
+                params![new_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            bail!("同名分类已存在");
+        }
+        let changed_at = now();
+        tx.execute(
+            "INSERT INTO activity_categories(name,color,is_builtin,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",
+            params![new_name, color, is_builtin as i64, created_at, changed_at],
+        )?;
+        tx.execute(
+            "UPDATE projects SET category=?1,updated_at=?2 WHERE category=?3",
+            params![new_name, changed_at, old_name],
+        )?;
+        tx.execute(
+            "UPDATE work_sessions SET category=?1,updated_at=?2 WHERE category=?3",
+            params![new_name, changed_at, old_name],
+        )?;
+        tx.execute(
+            "UPDATE attribution_rules SET category=?1,updated_at=?2 WHERE category=?3",
+            params![new_name, changed_at, old_name],
+        )?;
+        record_tombstone(&tx, "category", &old_name)?;
+        tx.execute(
+            "DELETE FROM activity_categories WHERE name=?1",
+            params![old_name],
+        )?;
+        tx.commit()?;
+        Ok(CategoryOption {
+            name: new_name,
+            color,
+            is_builtin,
+        })
+    }
+
+    pub fn delete_category(&self, name: &str) -> Result<String> {
+        let name = clean_name(name, "");
+        if name == "离开" {
+            bail!("“离开”是空闲状态，不能删除");
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx
+            .query_row(
+                "SELECT 1 FROM activity_categories WHERE name=?1",
                 params![name],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
             .context("分类不存在或已经删除")?;
-        if builtin != 0 {
-            bail!("默认分类不能删除");
-        }
+        let (fallback_name, fallback_color) = tx
+            .query_row(
+                "SELECT name,color FROM activity_categories
+                 WHERE name<>?1 AND name<>'离开'
+                 ORDER BY CASE WHEN name='杂务' THEN 0 ELSE 1 END,is_builtin DESC,created_at ASC
+                 LIMIT 1",
+                params![name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .context("至少需要保留一个工作分类")?;
+        let changed_at = now();
         tx.execute(
-            "UPDATE projects SET category='杂务', color=?1, updated_at=?2 WHERE category=?3",
-            params![color_for_category("杂务"), now(), name],
+            "UPDATE projects SET category=?1,color=?2,updated_at=?3 WHERE category=?4",
+            params![fallback_name, fallback_color, changed_at, name],
         )?;
         tx.execute(
-            "UPDATE work_sessions SET category='杂务', updated_at=?1 WHERE category=?2",
-            params![now(), name],
+            "UPDATE work_sessions SET category=?1,updated_at=?2 WHERE category=?3",
+            params![fallback_name, changed_at, name],
         )?;
         tx.execute(
-            "UPDATE attribution_rules SET category='杂务',updated_at=?1 WHERE category=?2",
-            params![now(), name],
+            "UPDATE attribution_rules SET category=?1,updated_at=?2 WHERE category=?3",
+            params![fallback_name, changed_at, name],
         )?;
-        record_tombstone(&tx, "category", name)?;
+        record_tombstone(&tx, "category", &name)?;
         tx.execute(
             "DELETE FROM activity_categories WHERE name=?1",
             params![name],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(fallback_name)
     }
 
     fn backfill_idle_boundaries(&self) -> Result<u32> {
@@ -2833,15 +2925,54 @@ mod tests {
             .expect("list tasks")
             .iter()
             .any(|item| item.id == task.id));
-        db.delete_category(&category.name).expect("delete category");
+        let fallback = db.delete_category(&category.name).expect("delete category");
         let updated = db
             .list_projects()
             .expect("list projects")
             .into_iter()
             .find(|item| item.id == project.id)
             .expect("project remains");
-        assert_eq!(updated.category, "杂务");
+        assert_eq!(updated.category, fallback);
         drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn builtin_categories_can_be_renamed_and_deleted_durably() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-builtin-category-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let renamed = db
+            .rename_category("开发", "编程")
+            .expect("rename builtin category");
+        assert_eq!(renamed.name, "编程");
+        assert!(renamed.is_builtin);
+        assert!(db
+            .list_projects()
+            .expect("list projects")
+            .iter()
+            .any(|item| item.name == "ScreenUse 开发" && item.category == "编程"));
+
+        let fallback = db.delete_category("学习").expect("delete builtin category");
+        assert_ne!(fallback, "学习");
+        assert_ne!(fallback, "离开");
+        assert!(db.rename_category("离开", "休息").is_err());
+        assert!(db.delete_category("离开").is_err());
+        drop(db);
+
+        let reopened = AppDb::open_in(data_dir.clone()).expect("reopen test database");
+        let names = reopened
+            .list_categories()
+            .expect("list reopened categories")
+            .into_iter()
+            .map(|item| item.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "编程"));
+        assert!(!names.iter().any(|name| name == "开发"));
+        assert!(!names.iter().any(|name| name == "学习"));
+        drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }
 

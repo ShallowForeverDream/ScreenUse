@@ -65,9 +65,15 @@ export const api = {
   },
   createCategory: (name: string) =>
     call<CategoryOption>('create_category', { name }, { name, color: '#a855f7', isBuiltin: false }),
+  renameCategory: (oldName: string, newName: string) =>
+    call<CategoryOption>('rename_category', { oldName, newName }, {
+      name: newName,
+      color: '#a855f7',
+      isBuiltin: false,
+    }),
   deleteCategory: async (name: string) => {
-    if (!isTauri()) return;
-    await call<void>('delete_category', { name });
+    if (!isTauri()) return name === '杂务' ? '开发' : '杂务';
+    return call<string>('delete_category', { name });
   },
   createTask: (projectId: string, title: string) =>
     call<Task>('create_task', { projectId, title }, {

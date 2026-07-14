@@ -101,7 +101,19 @@ fn create_category(state: State<AppState>, name: String) -> Result<models::Categ
 }
 
 #[tauri::command]
-fn delete_category(state: State<AppState>, name: String) -> Result<(), String> {
+fn rename_category(
+    state: State<AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<models::CategoryOption, String> {
+    state
+        .db
+        .rename_category(&old_name, &new_name)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+fn delete_category(state: State<AppState>, name: String) -> Result<String, String> {
     state.db.delete_category(&name).map_err(map_err)
 }
 
@@ -443,6 +455,7 @@ fn main() {
             create_project,
             delete_project,
             create_category,
+            rename_category,
             delete_category,
             create_task,
             delete_task,

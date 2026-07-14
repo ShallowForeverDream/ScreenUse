@@ -133,6 +133,174 @@ function applyTheme(mode: ThemeMode) {
 
 applyTheme(readStoredTheme());
 
+interface ConfirmationOptions {
+  title: string;
+  detail: string;
+  confirmLabel?: string;
+}
+
+interface PendingConfirmation extends ConfirmationOptions {
+  resolve: (accepted: boolean) => void;
+}
+
+function ConfirmationDialog({
+  request,
+  onChoose,
+}: {
+  request: PendingConfirmation;
+  onChoose: (accepted: boolean) => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onChoose(false);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [onChoose]);
+
+  return createPortal(
+    <div
+      className="confirm-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        onChoose(false);
+      }}
+      role="presentation"
+    >
+      <section
+        aria-describedby="confirm-dialog-detail"
+        aria-labelledby="confirm-dialog-title"
+        aria-modal="true"
+        className="confirm-dialog"
+        data-confirm-dialog="true"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="alertdialog"
+      >
+        <div className="confirm-dialog-icon"><Trash2 size={19} /></div>
+        <div>
+          <h2 id="confirm-dialog-title">{request.title}</h2>
+          <p id="confirm-dialog-detail">{request.detail}</p>
+        </div>
+        <div className="confirm-dialog-actions">
+          <button className="confirm-cancel" onClick={() => onChoose(false)} ref={cancelRef} type="button">
+            取消
+          </button>
+          <button className="confirm-danger" onClick={() => onChoose(true)} type="button">
+            {request.confirmLabel || '确认删除'}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
+function useConfirmation() {
+  const [request, setRequest] = useState<PendingConfirmation | null>(null);
+  const requestRef = useRef<PendingConfirmation | null>(null);
+
+  useEffect(() => () => requestRef.current?.resolve(false), []);
+
+  const confirm = useCallback((options: ConfirmationOptions) => new Promise<boolean>((resolve) => {
+    const pending = { ...options, resolve };
+    requestRef.current = pending;
+    setRequest(pending);
+  }), []);
+
+  const choose = useCallback((accepted: boolean) => {
+    const current = requestRef.current;
+    requestRef.current = null;
+    setRequest(null);
+    current?.resolve(accepted);
+  }, []);
+
+  return {
+    confirm,
+    isOpen: Boolean(request),
+    dialog: request ? <ConfirmationDialog request={request} onChoose={choose} /> : null,
+  };
+}
+
+function RenameCategoryDialog({
+  currentName,
+  busy,
+  onCancel,
+  onRename,
+}: {
+  currentName: string;
+  busy: boolean;
+  onCancel: () => void;
+  onRename: (name: string) => void;
+}) {
+  const [name, setName] = useState(currentName);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const valid = Boolean(name.trim() && name.trim() !== currentName);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [onCancel]);
+
+  return createPortal(
+    <div
+      className="confirm-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        onCancel();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="rename-category-title"
+        aria-modal="true"
+        className="confirm-dialog rename-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-dialog-icon rename"><Pencil size={19} /></div>
+        <div>
+          <h2 id="rename-category-title">重命名分类</h2>
+          <p>项目、任务归属和历史会话会一起更新。</p>
+        </div>
+        <input
+          aria-label="新的分类名称"
+          disabled={busy}
+          onChange={(event) => setName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && valid && !busy) {
+              event.preventDefault();
+              onRename(name.trim());
+            }
+          }}
+          ref={inputRef}
+          value={name}
+        />
+        <div className="confirm-dialog-actions">
+          <button className="confirm-cancel" disabled={busy} onClick={onCancel} type="button">取消</button>
+          <button className="primary" disabled={!valid || busy} onClick={() => onRename(name.trim())} type="button">
+            保存名称
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [data, setData] = useState<DashboardData | null>(null);
@@ -1460,6 +1628,7 @@ function ProjectsView({
   const [query, setQuery] = useState('');
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
+  const confirmation = useConfirmation();
   const rows = projectBreakdown(sessions, selectedDate);
   const minutesByProject = new Map(rows.map((row) => [row.id, row.minutes]));
   const tasksByProject = groupBy(tasks, (task) => task.projectId);
@@ -1495,7 +1664,11 @@ function ProjectsView({
   };
 
   const deleteProject = async (project: Project) => {
-    if (!window.confirm(`删除项目“${project.name}”？\n\n相关任务会一并删除，历史会话仍保留但会取消项目归属。`)) return;
+    const accepted = await confirmation.confirm({
+      title: `删除项目“${project.name}”？`,
+      detail: '相关任务会一并删除；历史会话仍会保留，但会取消项目和任务归属。',
+    });
+    if (!accepted) return;
     setBusyProjectId(project.id);
     try {
       await runAction(() => api.deleteProject(project.id), `项目“${project.name}”已删除`);
@@ -1505,7 +1678,11 @@ function ProjectsView({
   };
 
   const deleteTask = async (task: Task) => {
-    if (!window.confirm(`删除任务“${task.title}”？历史会话会保留，但取消任务归属。`)) return;
+    const accepted = await confirmation.confirm({
+      title: `删除任务“${task.title}”？`,
+      detail: '历史会话会继续保留，但会取消这项任务的归属。',
+    });
+    if (!accepted) return;
     setBusyTaskId(task.id);
     try {
       await runAction(() => api.deleteTask(task.id), `任务“${task.title}”已删除`);
@@ -1644,6 +1821,7 @@ function ProjectsView({
           {!selectedProject && <EmptyState title="还没有项目" detail="创建项目后即可添加任务。" />}
         </div>
       </section>
+      {confirmation.dialog}
     </div>
   );
 }
@@ -2499,6 +2677,8 @@ function EditSessionModal({
   const [remember, setRemember] = useState(false);
   const [keyword, setKeyword] = useState('');
   const [pin, setPin] = useState(false);
+  const [renamingCategory, setRenamingCategory] = useState<CategoryOption | null>(null);
+  const confirmation = useConfirmation();
   const categorySearchOptions = useMemo<SearchSelectOption[]>(
     () => localCategories.map((item) => ({
       value: item.name,
@@ -2512,8 +2692,15 @@ function EditSessionModal({
     () => [
       { value: '', label: '暂不指定', meta: '不关联项目' },
       ...[...projectOptions]
-        .filter((project) => !category || project.category === category)
-        .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
+        .sort((left, right) => {
+          const priority = (project: Project) => {
+            if (projectId && project.id === projectId) return 0;
+            if (category && project.category === category) return 1;
+            return 2;
+          };
+          return priority(left) - priority(right)
+            || left.name.localeCompare(right.name, 'zh-CN');
+        })
         .map((project) => ({
           value: project.id,
           label: project.name,
@@ -2522,18 +2709,23 @@ function EditSessionModal({
           keywords: [project.category],
         })),
     ],
-    [category, projectOptions],
+    [category, projectId, projectOptions],
   );
   const taskSearchOptions = useMemo<SearchSelectOption[]>(
     () => [
       { value: '', label: '暂不指定', meta: '不关联任务' },
       ...[...taskOptions]
-        .filter((task) => {
-          if (projectId) return task.projectId === projectId;
-          if (!category) return true;
-          return projectOptions.find((project) => project.id === task.projectId)?.category === category;
+        .sort((left, right) => {
+          const priority = (task: Task) => {
+            if (taskId && task.id === taskId) return 0;
+            if (projectId && task.projectId === projectId) return 1;
+            const project = projectOptions.find((item) => item.id === task.projectId);
+            if (category && project?.category === category) return 2;
+            return 3;
+          };
+          return priority(left) - priority(right)
+            || left.title.localeCompare(right.title, 'zh-CN');
         })
-        .sort((left, right) => left.title.localeCompare(right.title, 'zh-CN'))
         .map((task) => {
           const project = projectOptions.find((item) => item.id === task.projectId);
           return {
@@ -2545,14 +2737,16 @@ function EditSessionModal({
           };
         }),
     ],
-    [category, projectId, projectOptions, taskOptions],
+    [category, projectId, projectOptions, taskId, taskOptions],
   );
   const selectedProject = projectOptions.find((project) => project.id === projectId);
-  const projectPlaceholder = category ? `搜索“${category}”中的项目` : '搜索全部项目';
+  const selectedCategory = localCategories.find((item) => item.name === category);
+  const categoryIsEditable = Boolean(selectedCategory && selectedCategory.name !== '离开');
+  const projectPlaceholder = category ? `搜索全部项目，“${category}”优先` : '搜索全部项目';
   const taskPlaceholder = selectedProject
-    ? `搜索“${selectedProject.name}”中的任务`
+    ? `搜索全部任务，“${selectedProject.name}”优先`
     : category
-      ? `搜索“${category}”项目中的任务`
+      ? `搜索全部任务，“${category}”优先`
       : '搜索全部项目中的任务';
 
   useEffect(() => setProjectOptions(projects), [projects]);
@@ -2561,11 +2755,11 @@ function EditSessionModal({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape' && !confirmation.isOpen && !renamingCategory) onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [confirmation.isOpen, onClose, renamingCategory]);
 
   const selectCategory = (name: string) => {
     setCategory(name);
@@ -2629,9 +2823,11 @@ function EditSessionModal({
   const deleteSelectedProject = async () => {
     const project = projectOptions.find((item) => item.id === projectId);
     if (!project || projectBusy) return;
-    if (!window.confirm(`删除项目“${project.name}”？\n\n相关任务会一并删除，历史会话会保留但取消项目归属。`)) {
-      return;
-    }
+    const accepted = await confirmation.confirm({
+      title: `删除项目“${project.name}”？`,
+      detail: '相关任务会一并删除；历史会话仍会保留，但会取消项目和任务归属。',
+    });
+    if (!accepted) return;
     setProjectBusy(true);
     try {
       await runAction(() => api.deleteProject(project.id), `项目“${project.name}”已删除`);
@@ -2665,23 +2861,52 @@ function EditSessionModal({
 
   const deleteSelectedCategory = async () => {
     const selected = localCategories.find((item) => item.name === category);
-    if (!selected || selected.isBuiltin || categoryBusy) return;
-    if (!window.confirm(`删除分类“${selected.name}”？使用它的项目和会话会改为“杂务”。`)) return;
+    if (!selected || selected.name === '离开' || categoryBusy) return;
+    const fallback = localCategories.find((item) => item.name === '杂务' && item.name !== selected.name)
+      || localCategories.find((item) => item.name !== selected.name && item.name !== '离开');
+    if (!fallback) return;
+    const accepted = await confirmation.confirm({
+      title: `删除分类“${selected.name}”？`,
+      detail: `使用它的项目、规则和历史会话会转到“${fallback.name}”。`,
+    });
+    if (!accepted) return;
     setCategoryBusy(true);
     try {
-      await runAction(() => api.deleteCategory(selected.name), `分类“${selected.name}”已删除`);
+      const fallbackName = (await runAction(
+        () => api.deleteCategory(selected.name),
+        `分类“${selected.name}”已删除`,
+      )) as string;
       setLocalCategories((current) => current.filter((item) => item.name !== selected.name));
       setProjectOptions((current) => current.map((project) => (
-        project.category === selected.name ? { ...project, category: '杂务' } : project
+        project.category === selected.name ? { ...project, category: fallbackName } : project
       )));
-      setCategory('杂务');
+      setCategory(fallbackName);
       setCategoryTouched(true);
-      if (projectId && projectOptions.find((project) => project.id === projectId)?.category === selected.name) {
-        setProjectId('');
-        setTaskId('');
-        setProjectTouched(true);
-        setTaskTouched(true);
+    } finally {
+      setCategoryBusy(false);
+    }
+  };
+
+  const renameSelectedCategory = async (newName: string) => {
+    const selected = renamingCategory;
+    if (!selected || categoryBusy) return;
+    setCategoryBusy(true);
+    try {
+      const renamed = (await runAction(
+        () => api.renameCategory(selected.name, newName),
+        `分类“${selected.name}”已重命名`,
+      )) as CategoryOption;
+      setLocalCategories((current) => current.map((item) => (
+        item.name === selected.name ? renamed : item
+      )));
+      setProjectOptions((current) => current.map((project) => (
+        project.category === selected.name ? { ...project, category: renamed.name } : project
+      )));
+      if (category === selected.name) {
+        setCategory(renamed.name);
+        setCategoryTouched(true);
       }
+      setRenamingCategory(null);
     } finally {
       setCategoryBusy(false);
     }
@@ -2706,7 +2931,11 @@ function EditSessionModal({
   const deleteSelectedTask = async () => {
     const task = taskOptions.find((item) => item.id === taskId);
     if (!task || taskBusy) return;
-    if (!window.confirm(`删除任务“${task.title}”？历史会话会保留，但取消任务归属。`)) return;
+    const accepted = await confirmation.confirm({
+      title: `删除任务“${task.title}”？`,
+      detail: '历史会话会继续保留，但会取消这项任务的归属。',
+    });
+    if (!accepted) return;
     setTaskBusy(true);
     try {
       await runAction(() => api.deleteTask(task.id), `任务“${task.title}”已删除`);
@@ -2777,11 +3006,20 @@ function EditSessionModal({
                 placeholder="输入分类名称"
                 value={category}
               />
-              <div className="project-picker-actions single">
+              <div className="project-picker-actions">
+                <button
+                  disabled={!categoryIsEditable || categoryBusy}
+                  onClick={() => selectedCategory && setRenamingCategory(selectedCategory)}
+                  title={selectedCategory?.name === '离开' ? '“离开”是系统空闲状态' : '重命名分类'}
+                  type="button"
+                >
+                  <Pencil size={15} />重命名
+                </button>
                 <button
                   className="danger-button"
-                  disabled={localCategories.find((item) => item.name === category)?.isBuiltin !== false || categoryBusy}
+                  disabled={!categoryIsEditable || categoryBusy}
                   onClick={() => void deleteSelectedCategory()}
+                  title={selectedCategory?.name === '离开' ? '“离开”是系统空闲状态' : '删除分类'}
                   type="button"
                 >
                   <Trash2 size={15} />删除
@@ -2920,6 +3158,17 @@ function EditSessionModal({
           </button>
         </div>
       </section>
+      {confirmation.dialog}
+      {renamingCategory && (
+        <RenameCategoryDialog
+          busy={categoryBusy}
+          currentName={renamingCategory.name}
+          onCancel={() => {
+            if (!categoryBusy) setRenamingCategory(null);
+          }}
+          onRename={(name) => void renameSelectedCategory(name)}
+        />
+      )}
     </div>
   );
 }

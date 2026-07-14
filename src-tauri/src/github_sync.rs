@@ -423,20 +423,31 @@ impl AppDb {
                     )?;
                 }
                 "category" => {
+                    let (fallback_name, fallback_color) = tx
+                        .query_row(
+                            "SELECT name,color FROM activity_categories
+                             WHERE name<>?1 AND name<>'离开'
+                             ORDER BY CASE WHEN name='杂务' THEN 0 ELSE 1 END,is_builtin DESC,created_at ASC
+                             LIMIT 1",
+                            params![tombstone.entity_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()?
+                        .context("同步删除分类时找不到可用的替代分类")?;
                     tx.execute(
-                        "UPDATE projects SET category='杂务',updated_at=?1 WHERE category=?2",
-                        params![tombstone.deleted_at, tombstone.entity_id],
+                        "UPDATE projects SET category=?1,color=?2,updated_at=?3 WHERE category=?4",
+                        params![fallback_name, fallback_color, tombstone.deleted_at, tombstone.entity_id],
                     )?;
                     tx.execute(
-                        "UPDATE work_sessions SET category='杂务',updated_at=?1 WHERE category=?2",
-                        params![tombstone.deleted_at, tombstone.entity_id],
+                        "UPDATE work_sessions SET category=?1,updated_at=?2 WHERE category=?3",
+                        params![fallback_name, tombstone.deleted_at, tombstone.entity_id],
                     )?;
                     tx.execute(
-                        "UPDATE attribution_rules SET category='杂务',updated_at=?1 WHERE category=?2",
-                        params![tombstone.deleted_at, tombstone.entity_id],
+                        "UPDATE attribution_rules SET category=?1,updated_at=?2 WHERE category=?3",
+                        params![fallback_name, tombstone.deleted_at, tombstone.entity_id],
                     )?;
                     tx.execute(
-                        "DELETE FROM activity_categories WHERE name=?1 AND is_builtin=0",
+                        "DELETE FROM activity_categories WHERE name=?1",
                         params![tombstone.entity_id],
                     )?;
                 }
@@ -892,9 +903,19 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
         |item| item.updated_at.as_str(),
     );
     categories.retain(|item| {
-        item.is_builtin || !is_deleted(&tombstone_map, "category", &item.name, &item.updated_at)
+        !is_deleted(&tombstone_map, "category", &item.name, &item.updated_at)
     });
     let category_names: HashSet<String> = categories.iter().map(|item| item.name.clone()).collect();
+    let fallback_category = if category_names.contains("杂务") {
+        "杂务".to_string()
+    } else {
+        categories
+            .iter()
+            .filter(|item| item.name != "离开")
+            .map(|item| item.name.clone())
+            .min()
+            .context("同步快照至少需要保留一个工作分类")?
+    };
 
     let mut projects = merge_latest(
         left.projects,
@@ -905,7 +926,7 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
     projects.retain(|item| !is_deleted(&tombstone_map, "project", &item.id, &item.updated_at));
     for item in &mut projects {
         if !category_names.contains(&item.category) {
-            item.category = "杂务".into();
+            item.category = fallback_category.clone();
         }
     }
     let project_ids: HashSet<String> = projects.iter().map(|item| item.id.clone()).collect();
@@ -956,7 +977,7 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
             item.session.task_title = None;
         }
         if !category_names.contains(&item.session.category) {
-            item.session.category = "杂务".into();
+            item.session.category = fallback_category.clone();
         }
     }
 
@@ -985,7 +1006,7 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
             item.rule.task_id = None;
         }
         if !category_names.contains(&item.rule.category) {
-            item.rule.category = "杂务".into();
+            item.rule.category = fallback_category.clone();
         }
     }
 
@@ -1164,6 +1185,39 @@ mod tests {
         });
         let merged = merge_snapshots(left, merged).expect("merge deletion");
         assert!(merged.projects.is_empty());
+    }
+
+    #[test]
+    fn builtin_category_tombstone_is_honored_with_a_valid_fallback() {
+        let mut left = empty_snapshot("device-a");
+        left.categories.push(SyncCategory {
+            name: "开发".into(),
+            color: "#60a5fa".into(),
+            is_builtin: true,
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            updated_at: "2026-01-01T00:00:00.000Z".into(),
+        });
+        left.projects.push(Project {
+            id: "p-category".into(),
+            name: "旧分类项目".into(),
+            category: "杂务".into(),
+            source: "manual".into(),
+            color: "#facc15".into(),
+            description: None,
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            updated_at: "2026-01-02T00:00:00.000Z".into(),
+        });
+        let mut right = empty_snapshot("device-b");
+        right.tombstones.push(SyncTombstone {
+            entity_kind: "category".into(),
+            entity_id: "杂务".into(),
+            deleted_at: "2026-01-03T00:00:00.000Z".into(),
+            device_id: "device-b".into(),
+        });
+
+        let merged = merge_snapshots(left, right).expect("merge builtin category deletion");
+        assert!(!merged.categories.iter().any(|item| item.name == "杂务"));
+        assert_eq!(merged.projects[0].category, "开发");
     }
 
     #[test]
