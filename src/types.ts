@@ -116,6 +116,8 @@ export interface AppSettings {
   heartbeatSeconds: number;
   rawEventRetentionDays: number;
   idleThresholdSeconds: number;
+  idleCategory: string;
+  idleProjectName: string;
   passiveContentCountsAsActive: boolean;
   autoMaintenance: boolean;
   autoStart: boolean;

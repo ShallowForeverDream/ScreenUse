@@ -230,7 +230,9 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                                 );
                             }
                         }
-                        let immediate = active_signature == "idle" || signature == "idle";
+                        // Enter idle immediately because its boundary is backdated. Leaving
+                        // idle still needs five continuous seconds, preventing tiny blocks.
+                        let immediate = signature == "idle";
                         let ready = if immediate {
                             pending = Some(PendingContext {
                                 signature: signature.clone(),
@@ -370,7 +372,9 @@ fn close_context_at(collector: &DesktopCollector, db: &AppDb, previous: ActiveCo
     event.timestamp = ended_at;
     mark_metadata(&mut event, "contextEnd", serde_json::Value::Bool(true));
     db.heartbeat_raw_event(&event, &previous.session_id)?;
-    classification::finalize_context(db, &event, &previous.session_id)?;
+    if let Some(session) = classification::finalize_context(db, &event, &previous.session_id)? {
+        db.absorb_short_auto_session(&session.id)?;
+    }
     *collector.last_event_at.lock() = Some(event.timestamp);
     Ok(())
 }

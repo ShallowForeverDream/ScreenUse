@@ -59,6 +59,16 @@ pub fn finalize_context(
     }
 
     let settings = db.get_settings()?.normalized();
+    if event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64 {
+        let project_id = db.configure_idle_target(&settings)?;
+        let updated = db.update_session(&session.id, SessionPatch {
+            summary: Some("离开/空闲".into()), project_id: Some(project_id), task_id: None,
+            clear_project: Some(false), clear_task: Some(true), category: Some(settings.idle_category),
+            confidence: Some(0.99), user_confirmed: Some(false),
+        })?;
+        db.mark_session_awaiting_confirmation(&updated.id)?;
+        return db.get_session(&updated.id);
+    }
     let (local_category, local_confidence) = classify_category(event, settings.idle_threshold_seconds);
     let mut category = if session.confidence >= 0.84 {
         session.category.clone()

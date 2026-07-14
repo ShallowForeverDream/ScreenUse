@@ -42,6 +42,8 @@ impl AppDb {
         db.migrate()?;
         db.seed_if_empty()?;
         db.backfill_idle_boundaries()?;
+        let settings = db.get_settings()?.normalized();
+        db.configure_idle_target(&settings)?;
         db.compact_sessions()?;
         Ok(db)
     }
@@ -350,10 +352,37 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn configure_idle_target(&self, settings: &AppSettings) -> Result<String> {
+        let settings = settings.clone().normalized();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let timestamp = now();
+        tx.execute(
+            "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at) VALUES(?1,'#94a3b8',0,?2,?2)",
+            params![settings.idle_category, timestamp],
+        )?;
+        let color: String = tx.query_row("SELECT color FROM activity_categories WHERE name=?1", params![settings.idle_category], |row| row.get(0))?;
+        let project_id = tx.query_row(
+            "SELECT id FROM projects WHERE name=?1 AND category=?2 LIMIT 1",
+            params![settings.idle_project_name, settings.idle_category],
+            |row| row.get::<_, String>(0),
+        ).optional()?.unwrap_or_else(|| Uuid::new_v4().to_string());
+        tx.execute(
+            "INSERT OR IGNORE INTO projects(id,name,category,source,color,description,created_at,updated_at) VALUES(?1,?2,?3,'system-idle',?4,'自动记录离开与空闲时间',?5,?5)",
+            params![project_id, settings.idle_project_name, settings.idle_category, color, timestamp],
+        )?;
+        tx.execute(
+            "UPDATE work_sessions SET project_id=?1,task_id=NULL,category=?2,source='collector-idle',updated_at=?3 WHERE user_confirmed=0 AND (source='collector-idle' OR (category='离开' AND summary='离开/空闲'))",
+            params![project_id, settings.idle_category, timestamp],
+        )?;
+        tx.commit()?;
+        Ok(project_id)
+    }
+
     pub fn dashboard(&self, collector_running: bool) -> Result<DashboardData> {
         Ok(DashboardData {
             settings: self.get_settings()?.normalized(),
-            sessions: self.list_sessions(80)?,
+            sessions: self.list_sessions(5000)?,
             projects: self.list_projects()?,
             tasks: self.list_tasks()?,
             category_options: self.list_categories()?,
@@ -409,9 +438,8 @@ impl AppDb {
         if old_name.is_empty() || new_name.is_empty() {
             bail!("分类名称不能为空");
         }
-        if old_name == "离开" {
-            bail!("“离开”是空闲状态，不能重命名");
-        }
+        let mut settings = self.get_settings()?.normalized();
+        let renames_idle_category = settings.idle_category == old_name;
         let new_name: String = new_name.chars().take(24).collect();
         if old_name == new_name {
             return self
@@ -465,6 +493,13 @@ impl AppDb {
             "UPDATE attribution_rules SET category=?1,updated_at=?2 WHERE category=?3",
             params![new_name, changed_at, old_name],
         )?;
+        if renames_idle_category {
+            settings.idle_category = new_name.clone();
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES('app_settings',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![serde_json::to_string(&settings)?, changed_at],
+            )?;
+        }
         record_tombstone(&tx, "category", &old_name)?;
         tx.execute(
             "DELETE FROM activity_categories WHERE name=?1",
@@ -480,8 +515,8 @@ impl AppDb {
 
     pub fn delete_category(&self, name: &str) -> Result<String> {
         let name = clean_name(name, "");
-        if name == "离开" {
-            bail!("“离开”是空闲状态，不能删除");
+        if self.get_settings()?.normalized().idle_category == name {
+            bail!("该分类正在接收离开时间，请先在设置中更换离开归属");
         }
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -496,7 +531,7 @@ impl AppDb {
         let (fallback_name, fallback_color) = tx
             .query_row(
                 "SELECT name,color FROM activity_categories
-                 WHERE name<>?1 AND name<>'离开'
+                 WHERE name<>?1
                  ORDER BY CASE WHEN name='杂务' THEN 0 ELSE 1 END,is_builtin DESC,created_at ASC
                  LIMIT 1",
                 params![name],
@@ -998,9 +1033,7 @@ impl AppDb {
     pub fn mark_session_awaiting_confirmation(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE work_sessions
-             SET source='context-complete', updated_at=?1
-             WHERE id=?2 AND user_confirmed=0",
+            "UPDATE work_sessions SET source=CASE WHEN source='collector-idle' THEN source ELSE 'context-complete' END, updated_at=?1 WHERE id=?2 AND user_confirmed=0",
             params![now(), id],
         )?;
         Ok(())
@@ -1032,6 +1065,26 @@ impl AppDb {
         };
         middle.push(current);
         self.merge_sessions_into(&anchor, &middle)
+    }
+
+    pub fn absorb_short_auto_session(&self, id: &str) -> Result<WorkSession> {
+        let current = self.get_session(id)?.context("session not found")?;
+        if current.user_confirmed
+            || session_duration_seconds(&current).map_or(true, |seconds| seconds >= 5)
+            || !is_auto_session_source(&current.source)
+        {
+            return Ok(current);
+        }
+        let previous_id = {
+            let conn = self.conn.lock();
+            conn.query_row("SELECT id FROM work_sessions WHERE started_at < ?1 ORDER BY started_at DESC LIMIT 1", params![current.started_at], |row| row.get::<_, String>(0)).optional()?
+        };
+        let Some(previous_id) = previous_id else { return Ok(current); };
+        let previous = self.get_session(&previous_id)?.context("previous session not found")?;
+        if previous.user_confirmed || !is_auto_session_source(&previous.source) || !within_gap_seconds(&previous.ended_at, &current.started_at, 5) {
+            return Ok(current);
+        }
+        self.merge_sessions_into(&previous, &[current])
     }
 
     fn find_short_detour_anchor(
@@ -1311,8 +1364,9 @@ impl AppDb {
     fn materialize_event_session(&self, event: &RawActivityEvent) -> Result<()> {
         let settings = self.get_settings()?;
         let is_idle = event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64;
+        let idle_project_id = if is_idle { Some(self.configure_idle_target(&settings)?) } else { None };
         let (project_id, task_id, category, summary, confidence) =
-            self.heuristic_attribution(event, is_idle)?;
+            self.heuristic_attribution(event, is_idle, &settings, idle_project_id)?;
         let page_title = event
             .metadata
             .get("activePageTitle")
@@ -1359,8 +1413,9 @@ impl AppDb {
                 return Ok(());
             }
         }
+        let source = if is_idle { "collector-idle" } else { "collector-rule" };
         conn.execute(
-            "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'collector-rule',?10)",
+            "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11)",
             params![
                 Uuid::new_v4().to_string(),
                 event.timestamp,
@@ -1371,6 +1426,7 @@ impl AppDb {
                 summary,
                 confidence,
                 serde_json::to_string(&evidence)?,
+                source,
                 now()
             ],
         )?;
@@ -1381,9 +1437,11 @@ impl AppDb {
         &self,
         event: &RawActivityEvent,
         is_idle: bool,
+        settings: &AppSettings,
+        idle_project_id: Option<String>,
     ) -> Result<(Option<String>, Option<String>, String, String, f32)> {
         if is_idle {
-            return Ok((None, None, "离开".into(), "离开/空闲".into(), 0.96));
+            return Ok((idle_project_id, None, settings.idle_category.clone(), "离开/空闲".into(), 0.96));
         }
         if let Some(pin) = self.active_context()? {
             return Ok((
@@ -1811,8 +1869,11 @@ impl AppDb {
         let mut changed = 0;
         for id in ids {
             if self.get_session(&id)?.is_some() {
-                let session = self.coalesce_session_neighbors(&id)?;
-                if session.id != id {
+                let absorbed = self.absorb_short_auto_session(&id)?;
+                if absorbed.id != id { changed += 1; }
+                let absorbed_id = absorbed.id;
+                let session = self.coalesce_session_neighbors(&absorbed_id)?;
+                if session.id != absorbed_id {
                     changed += 1;
                 }
             }
@@ -1976,7 +2037,7 @@ impl AppDb {
                    ROUND(SUM((julianday(ws.ended_at)-julianday(ws.started_at))*24*60), 1) AS minutes,
                    ws.category
             FROM work_sessions ws LEFT JOIN projects p ON p.id=ws.project_id
-            WHERE ws.category != '离开'
+            WHERE ws.category != '离开' AND NOT (ws.source='collector-idle' AND ws.user_confirmed=0)
             GROUP BY COALESCE(p.name, '未归类'), ws.category
             ORDER BY minutes DESC LIMIT 12
         "#)?;
@@ -2144,6 +2205,7 @@ fn color_for_category(category: &str) -> &'static str {
         "写作" => "#f0abfc",
         "沟通" => "#34d399",
         "娱乐" => "#fb7185",
+        "无效" => "#94a3b8",
         "离开" => "#94a3b8",
         _ => "#facc15",
     }
@@ -2161,10 +2223,14 @@ fn within_gap_seconds(left_end: &str, right_start: &str, max_seconds: i64) -> bo
 fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
     if left.user_confirmed
         || right.user_confirmed
-        || left.source != "context-complete"
-        || right.source != "context-complete"
-        || !within_gap_seconds(&left.ended_at, &right.started_at, 3)
+        || !within_gap_seconds(&left.ended_at, &right.started_at, 5)
     {
+        return false;
+    }
+    if left.source == "collector-idle" && right.source == "collector-idle" {
+        return left.project_id == right.project_id && left.category == right.category;
+    }
+    if left.source != "context-complete" || right.source != "context-complete" {
         return false;
     }
     if is_task_overlay_session(right) {
@@ -2228,6 +2294,10 @@ fn session_duration_seconds(session: &WorkSession) -> Option<i64> {
     let start = DateTime::parse_from_rfc3339(&session.started_at).ok()?;
     let end = DateTime::parse_from_rfc3339(&session.ended_at).ok()?;
     Some((end - start).num_seconds().max(0))
+}
+
+fn is_auto_session_source(source: &str) -> bool {
+    matches!(source, "collector-rule" | "collector-idle" | "context-complete")
 }
 
 fn is_task_overlay_session(session: &WorkSession) -> bool {
@@ -2467,6 +2537,7 @@ mod tests {
         settings.poll_interval_seconds = 10;
         settings.heartbeat_seconds = 10;
         db.save_settings(&settings).expect("save legacy settings");
+        db.conn.lock().execute("DELETE FROM settings WHERE key=?1", params![ONE_SECOND_SAMPLING_MIGRATION_KEY]).expect("reset migration marker");
 
         let migrated = db.get_settings().expect("migrate settings");
         assert_eq!(migrated.poll_interval_seconds, 1);
@@ -3222,6 +3293,94 @@ mod tests {
         assert_eq!(extended.ended_at, fmt(base + Duration::seconds(10)));
         assert_eq!(extended.summary, session.summary);
 
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn idle_sessions_use_the_configured_category_and_project() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-idle-target-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let mut event = RawActivityEvent {
+            id: "idle-target".into(), source: "windows-foreground".into(), timestamp: now(),
+            app: Some("QQ.exe".into()), window_title: Some("QQ".into()), url: None, file_path: None, workspace: None,
+            input_stats: InputStats { idle_seconds: 180, ..Default::default() },
+            metadata: serde_json::json!({ "contextStart": true }),
+        };
+        db.ingest_raw_event(event.clone()).expect("record idle session");
+        let first = db.list_sessions(1).expect("load idle session")[0].clone();
+        assert_eq!(first.category, "无效");
+        assert_eq!(first.project_name.as_deref(), Some("离开"));
+        assert_eq!(first.source, "collector-idle");
+
+        let mut settings = db.get_settings().expect("load settings");
+        settings.idle_category = "休息".into();
+        settings.idle_project_name = "暂离".into();
+        db.configure_idle_target(&settings).expect("configure custom idle target");
+        db.save_settings(&settings).expect("save custom idle target");
+        event.id = "idle-target-2".into();
+        event.timestamp = fmt(Utc::now() + Duration::seconds(10));
+        db.ingest_raw_event(event).expect("record custom idle session");
+        let latest = db.list_sessions(1).expect("load custom idle session")[0].clone();
+        assert_eq!(latest.category, "休息");
+        assert_eq!(latest.project_name.as_deref(), Some("暂离"));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn short_automatic_session_is_absorbed_without_a_gap() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-short-block-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::hours(1);
+        let evidence = serde_json::to_string(&Vec::<EvidenceItem>::new()).unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute("INSERT INTO work_sessions VALUES ('before',?1,?2,NULL,NULL,'杂务','前一个事务',0.8,?3,0,'context-complete',?4)", params![fmt(base), fmt(base + Duration::seconds(10)), evidence, now()]).expect("insert previous session");
+            conn.execute("INSERT INTO work_sessions VALUES ('short',?1,?2,NULL,NULL,'沟通','短暂切换',0.8,?3,0,'context-complete',?4)", params![fmt(base + Duration::seconds(10)), fmt(base + Duration::seconds(13)), evidence, now()]).expect("insert short session");
+        }
+        let absorbed = db.absorb_short_auto_session("short").expect("absorb short session");
+        assert_eq!(absorbed.id, "before");
+        assert_eq!(absorbed.ended_at, fmt(base + Duration::seconds(13)));
+        assert!(db.get_session("short").expect("load short session").is_none());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn nearby_idle_sessions_are_joined_across_a_five_second_sampling_gap() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-idle-gap-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let settings = db.get_settings().expect("load settings");
+        let project_id = db.configure_idle_target(&settings).expect("load idle project");
+        let base = Utc::now() + Duration::hours(1);
+        let evidence = serde_json::to_string(&Vec::<EvidenceItem>::new()).unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute("INSERT INTO work_sessions VALUES ('idle-a',?1,?2,?3,NULL,'无效','离开/空闲',0.99,?4,0,'collector-idle',?5)", params![fmt(base), fmt(base + Duration::seconds(30)), project_id, evidence, now()]).expect("insert first idle session");
+            conn.execute("INSERT INTO work_sessions VALUES ('idle-b',?1,?2,?3,NULL,'无效','离开/空闲',0.99,?4,0,'collector-idle',?5)", params![fmt(base + Duration::seconds(34)), fmt(base + Duration::seconds(60)), project_id, evidence, now()]).expect("insert second idle session");
+        }
+        db.compact_sessions().expect("compact idle sessions");
+        let merged = db.get_session("idle-a").expect("load idle session").expect("idle session exists");
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(60)));
+        assert!(db.get_session("idle-b").expect("load second idle session").is_none());
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn dashboard_keeps_more_than_eighty_daily_segments() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-dashboard-session-limit-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::hours(1);
+        let evidence = serde_json::to_string(&Vec::<EvidenceItem>::new()).unwrap();
+        let conn = db.conn.lock();
+        for index in 0..120 {
+            let start = base + Duration::seconds(index * 10);
+            conn.execute("INSERT INTO work_sessions VALUES (?1,?2,?3,NULL,NULL,'杂务',?4,0.8,?5,0,'context-complete',?6)", params![format!("many-{index}"), fmt(start), fmt(start + Duration::seconds(10)), format!("事务 {index}"), evidence, now()]).expect("insert dashboard session");
+        }
+        drop(conn);
+        assert!(db.dashboard(false).expect("load dashboard").sessions.len() >= 120);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

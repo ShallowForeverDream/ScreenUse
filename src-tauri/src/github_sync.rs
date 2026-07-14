@@ -426,7 +426,7 @@ impl AppDb {
                     let (fallback_name, fallback_color) = tx
                         .query_row(
                             "SELECT name,color FROM activity_categories
-                             WHERE name<>?1 AND name<>'离开'
+                             WHERE name<>?1
                              ORDER BY CASE WHEN name='杂务' THEN 0 ELSE 1 END,is_builtin DESC,created_at ASC
                              LIMIT 1",
                             params![tombstone.entity_id],
@@ -911,7 +911,6 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
     } else {
         categories
             .iter()
-            .filter(|item| item.name != "离开")
             .map(|item| item.name.clone())
             .min()
             .context("同步快照至少需要保留一个工作分类")?

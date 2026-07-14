@@ -235,6 +235,7 @@ fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), St
     if previous.launch_at_login != settings.launch_at_login {
         autostart::set_launch_at_login(settings.launch_at_login).map_err(map_err)?;
     }
+    state.db.configure_idle_target(&settings).map_err(map_err)?;
     state.db.save_settings(&settings).map_err(map_err)
 }
 

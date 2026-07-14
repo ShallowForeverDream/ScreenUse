@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "离开"];
+pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "无效"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +205,8 @@ pub struct AppSettings {
     pub heartbeat_seconds: u32,
     pub raw_event_retention_days: u32,
     pub idle_threshold_seconds: u32,
+    pub idle_category: String,
+    pub idle_project_name: String,
     pub passive_content_counts_as_active: bool,
     pub auto_maintenance: bool,
     pub auto_start: bool,
@@ -239,6 +241,8 @@ impl Default for AppSettings {
             heartbeat_seconds: 1,
             raw_event_retention_days: 30,
             idle_threshold_seconds: 180,
+            idle_category: "无效".into(),
+            idle_project_name: "离开".into(),
             passive_content_counts_as_active: true,
             auto_maintenance: true,
             auto_start: true,
@@ -272,6 +276,8 @@ impl AppSettings {
         self.heartbeat_seconds = self.poll_interval_seconds;
         self.raw_event_retention_days = self.raw_event_retention_days.clamp(7, 3650);
         self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
+        self.idle_category = clean_setting_label(&self.idle_category, "无效");
+        self.idle_project_name = clean_setting_label(&self.idle_project_name, "离开");
         self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(1, 240);
         self.ai_mode = match self.ai_mode.as_str() {
             "manual" => "manual",
@@ -292,6 +298,12 @@ impl AppSettings {
         self.temp_storage_limit_gb = 1;
         self
     }
+}
+
+fn clean_setting_label(value: &str, fallback: &str) -> String {
+    let value = value.trim().replace(['\r', '\n', '\t'], " ");
+    let value: String = value.chars().take(80).collect();
+    if value.is_empty() { fallback.into() } else { value }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

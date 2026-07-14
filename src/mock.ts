@@ -13,7 +13,7 @@ export const fallbackDashboard: DashboardData = {
     { name: '沟通', color: '#34d399', isBuiltin: true },
     { name: '娱乐', color: '#fb7185', isBuiltin: true },
     { name: '杂务', color: '#fbbf24', isBuiltin: true },
-    { name: '离开', color: '#94a3b8', isBuiltin: true },
+    { name: '无效', color: '#94a3b8', isBuiltin: true },
   ],
   settings: {
     language: 'zh-CN',
@@ -22,6 +22,8 @@ export const fallbackDashboard: DashboardData = {
     heartbeatSeconds: 1,
     rawEventRetentionDays: 30,
     idleThresholdSeconds: 180,
+    idleCategory: '无效',
+    idleProjectName: '离开',
     passiveContentCountsAsActive: true,
     autoMaintenance: true,
     autoStart: true,

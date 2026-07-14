@@ -84,6 +84,7 @@ const categoryColors: Record<string, string> = {
   沟通: '#34d399',
   娱乐: '#fb7185',
   杂务: '#fbbf24',
+  无效: '#94a3b8',
   离开: '#94a3b8',
 };
 
@@ -395,7 +396,7 @@ export default function App() {
   const daySessions = useMemo(
     () =>
       (data?.sessions || [])
-        .filter((session) => sessionMinutesOnDate(session, selectedDate) > 0)
+        .filter((session) => sessionSecondsOnDate(session, selectedDate) > 0)
         .sort(
           (left, right) =>
             new Date(right.startedAt).getTime() - new Date(left.startedAt).getTime(),
@@ -403,8 +404,8 @@ export default function App() {
     [data, selectedDate],
   );
   const stats = useMemo(
-    () => summarizeDay(daySessions, selectedDate),
-    [daySessions, selectedDate],
+    () => summarizeDay(daySessions, selectedDate, data?.settings),
+    [data?.settings, daySessions, selectedDate],
   );
 
   if (loading) {
@@ -591,7 +592,7 @@ export default function App() {
               icon={Tags}
               title="已归到项目"
               value={`${stats.classifiedPercent}%`}
-              hint={`${stats.classifiedMinutes} / ${stats.activeMinutes} 分钟`}
+              hint={`${formatDuration(stats.classifiedMinutes)} / ${formatDuration(stats.activeMinutes)}`}
             />
             <Kpi
               icon={Activity}
@@ -615,8 +616,13 @@ export default function App() {
             projects={data.projects}
             stats={stats}
             selectedDate={selectedDate}
-            onEdit={(session) => setEditing([session])}
+            idleCategory={data.settings.idleCategory}
+            onEdit={setEditing}
             onOpenTimeline={() => setActiveTab('timeline')}
+            onOpenProject={(projectId) => {
+              setProjectFocusId(projectId);
+              setActiveTab('projects');
+            }}
             planItems={data.planItems}
           />
         )}
@@ -640,6 +646,7 @@ export default function App() {
             runAction={runAction}
             categoryOptions={data.categoryOptions}
             focusProjectId={projectFocusId}
+            onEdit={setEditing}
           />
         )}
         {activeTab === 'settings' && (
@@ -888,16 +895,20 @@ function TodayView({
   projects,
   stats,
   selectedDate,
+  idleCategory,
   onEdit,
   onOpenTimeline,
+  onOpenProject,
   planItems,
 }: {
   sessions: WorkSession[];
   projects: Project[];
   stats: DayStats;
   selectedDate: string;
-  onEdit: (session: WorkSession) => void;
+  idleCategory: string;
+  onEdit: (sessions: WorkSession[]) => void;
   onOpenTimeline: () => void;
+  onOpenProject: (projectId: string) => void;
   planItems: DashboardData['planItems'];
 }) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
@@ -919,7 +930,7 @@ function TodayView({
           <>
             <div className="distribution-bar" aria-label="分类时间分布">
               {stats.categories
-                .filter((item) => item.minutes > 0 && item.category !== '离开')
+                .filter((item) => item.minutes > 0 && item.category !== '离开' && item.category !== idleCategory)
                 .map((item) => (
                   <button
                     key={item.category}
@@ -989,7 +1000,13 @@ function TodayView({
               const color = project?.color || categoryColor(row.category);
               const percent = Math.max(2, Math.round((row.minutes / Math.max(1, projectTotal)) * 100));
               return (
-                <div className="project-investment" key={row.id || row.name}>
+                <button
+                  className="project-investment"
+                  disabled={!row.id}
+                  key={row.id || row.name}
+                  onClick={() => row.id && onOpenProject(row.id)}
+                  type="button"
+                >
                   <div className="project-investment-head">
                     <span className="project-mark" style={{ '--project-color': color } as CSSProperties}>
                       <FolderKanban size={15} />
@@ -1006,7 +1023,7 @@ function TodayView({
                     </div>
                     <small>{percent}%</small>
                   </div>
-                </div>
+                </button>
               );
             })
           ) : (
@@ -1045,7 +1062,7 @@ function TodayView({
           selectedDate={selectedDate}
           zoom={timelineZoom}
           onZoomChange={setTimelineZoom}
-          onEdit={onEdit}
+          onEdit={(session) => onEdit([session])}
         />
       </section>
 
@@ -1063,7 +1080,7 @@ function TodayView({
         {review.length ? (
           <div className="review-list">
             {review.map((session) => (
-              <button key={session.id} onClick={() => onEdit(session)} type="button">
+              <button key={session.id} onClick={() => onEdit([session])} type="button">
                 <CircleAlert size={16} />
                 <span>
                   <strong>{session.summary}</strong>
@@ -1102,9 +1119,9 @@ function TodayView({
           sessions={sessions.filter((session) => session.category === selectedCategory)}
           selectedDate={selectedDate}
           onClose={() => setSelectedCategory(null)}
-          onEdit={(session) => {
+          onEdit={(selectedSessions) => {
             setSelectedCategory(null);
-            onEdit(session);
+            onEdit(selectedSessions);
           }}
         />
       )}
@@ -1272,9 +1289,8 @@ function DayActivityTimeline({
             {sorted.map((session) => {
               const bounds = sessionBoundsOnDate(session, selectedDate);
               const app = sessionApplication(session);
-              const blockWidth = Math.max(5, bounds.durationSeconds * pixelsPerSecond);
-              const showSeconds = scale.secondsPerGrid < 60;
-              const timeRange = `${formatTimelineClock(session.startedAt, showSeconds)}–${formatTimelineClock(session.endedAt, showSeconds)}`;
+              const blockWidth = Math.max(1, Math.max(5, bounds.durationSeconds) * pixelsPerSecond);
+              const timeRange = `${formatTimelineClock(session.startedAt, true)}–${formatTimelineClock(session.endedAt, true)}`;
               return (
                 <button
                   aria-label={`${timeRange}，${session.summary}，${app}，点击修正`}
@@ -1334,21 +1350,32 @@ function CategoryDetailModal({
   sessions: WorkSession[];
   selectedDate: string;
   onClose: () => void;
-  onEdit: (session: WorkSession) => void;
+  onEdit: (sessions: WorkSession[]) => void;
 }) {
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const sorted = [...sessions].sort(
     (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
   );
+  const selectedSessions = sorted.filter((session) => selected.has(session.id));
   const total = sorted.reduce(
     (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
     0,
   );
+  const allSelected = sorted.length > 0 && selected.size === sorted.length;
+  const toggle = (id: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
     }}>
       <section className="modal category-detail" role="dialog" aria-modal="true" aria-label={`${category}时间段`}>
-        <div className="modal-head">
+        <div className="modal-head category-detail-head">
           <div className="category-detail-title">
             <span style={{ background: categoryColor(category) }} />
             <div>
@@ -1356,16 +1383,44 @@ function CategoryDetailModal({
               <p>{formatDuration(total)} · {sorted.length} 个时间段</p>
             </div>
           </div>
+          <div className="category-detail-actions">
+            <label>
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={() => setSelected(allSelected ? new Set() : new Set(sorted.map((session) => session.id)))}
+              />
+              全选
+            </label>
+            <button
+              disabled={!selectedSessions.length}
+              onClick={() => onEdit(selectedSessions)}
+              type="button"
+            >
+              <Pencil size={15} />批量修正 {selectedSessions.length || ''}
+            </button>
+          </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
             <X size={17} />
           </button>
         </div>
         <div className="category-session-list">
+          {!sorted.length && (
+            <EmptyState title="当天没有时间段" detail="切换日期后可查看该项目或任务的其他记录。" />
+          )}
           {sorted.map((session) => (
-            <button key={session.id} onClick={() => onEdit(session)} type="button">
+            <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
+              <label className="category-session-check" aria-label={`选择 ${session.summary}`}>
+                <input
+                  checked={selected.has(session.id)}
+                  onChange={() => toggle(session.id)}
+                  type="checkbox"
+                />
+              </label>
+              <button className="category-session-open" onClick={() => onEdit([session])} type="button">
               <span className="category-session-time">
-                <strong>{formatClock(session.startedAt)}</strong>
-                <small>{formatClock(session.endedAt)}</small>
+                  <strong>{formatTimelineClock(session.startedAt, true)}</strong>
+                  <small>{formatTimelineClock(session.endedAt, true)}</small>
               </span>
               <span className="category-session-main">
                 <strong>{session.summary}</strong>
@@ -1373,7 +1428,8 @@ function CategoryDetailModal({
               </span>
               <span className="category-session-app">{sessionApplication(session)}</span>
               <Pencil size={15} />
-            </button>
+              </button>
+            </div>
           ))}
         </div>
       </section>
@@ -1612,6 +1668,7 @@ function ProjectsView({
   runAction,
   categoryOptions,
   focusProjectId,
+  onEdit,
 }: {
   projects: Project[];
   tasks: Task[];
@@ -1620,6 +1677,7 @@ function ProjectsView({
   runAction: ActionRunner;
   categoryOptions: CategoryOption[];
   focusProjectId: string;
+  onEdit: (sessions: WorkSession[]) => void;
 }) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
@@ -1629,6 +1687,9 @@ function ProjectsView({
   const [query, setQuery] = useState('');
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
+  const [sessionDetail, setSessionDetail] = useState<
+    { kind: 'project' | 'task'; id: string } | null
+  >(null);
   const confirmation = useConfirmation();
   const rows = projectBreakdown(sessions, selectedDate);
   const minutesByProject = new Map(rows.map((row) => [row.id, row.minutes]));
@@ -1642,6 +1703,19 @@ function ProjectsView({
   ].filter(Boolean).join(' ')).includes(needle));
   const selectedProject = projects.find((project) => project.id === selectedProjectId) || visibleProjects[0] || projects[0];
   const selectedTasks = selectedProject ? tasksByProject.get(selectedProject.id) || [] : [];
+  const detailTask = sessionDetail?.kind === 'task'
+    ? tasks.find((task) => task.id === sessionDetail.id)
+    : undefined;
+  const detailProject = sessionDetail?.kind === 'project'
+    ? projects.find((project) => project.id === sessionDetail.id)
+    : detailTask
+      ? projects.find((project) => project.id === detailTask.projectId)
+      : undefined;
+  const detailSessions = sessionDetail?.kind === 'task'
+    ? sessions.filter((session) => session.taskId === sessionDetail.id)
+    : sessionDetail?.kind === 'project'
+      ? sessions.filter((session) => session.projectId === sessionDetail.id)
+      : [];
 
   useEffect(() => {
     if (focusProjectId && projects.some((project) => project.id === focusProjectId)) {
@@ -1734,7 +1808,7 @@ function ProjectsView({
               autoFocus
             />
             <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="项目分类">
-              {categoryOptions.filter((item) => item.name !== '离开').map((item) => <option key={item.name}>{item.name}</option>)}
+              {categoryOptions.map((item) => <option key={item.name}>{item.name}</option>)}
             </select>
             <button className="primary" disabled={!name.trim()} onClick={() => void createProject()} type="button">
               <Check size={15} />创建
@@ -1781,7 +1855,18 @@ function ProjectsView({
       </section>
 
       <section className="panel project-detail-panel">
-        <PanelTitle title={selectedProject?.name || '项目任务'} subtitle={selectedProject ? `${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'} />
+        <PanelTitle
+          title={selectedProject?.name || '项目任务'}
+          subtitle={selectedProject ? `${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
+          action={selectedProject ? (
+            <button
+              onClick={() => setSessionDetail({ kind: 'project', id: selectedProject.id })}
+              type="button"
+            >
+              <Clock3 size={14} />时间段
+            </button>
+          ) : undefined}
+        />
         {selectedProject && (
           <div className="task-create-row">
             <input
@@ -1803,8 +1888,15 @@ function ProjectsView({
             <div className="task-group" key={selectedProject.id}>
               {selectedTasks.map((task) => (
                 <div className="task-row" key={task.id}>
-                  <TimerReset size={15} />
-                  <span>{task.title}</span>
+                  <button
+                    className="task-open"
+                    onClick={() => setSessionDetail({ kind: 'task', id: task.id })}
+                    type="button"
+                  >
+                    <TimerReset size={15} />
+                    <span>{task.title}</span>
+                    <small>{sessions.filter((session) => session.taskId === task.id).length} 段</small>
+                  </button>
                   <button
                     className="task-delete"
                     disabled={busyTaskId === task.id}
@@ -1823,6 +1915,18 @@ function ProjectsView({
         </div>
       </section>
       {confirmation.dialog}
+      {sessionDetail && detailProject && (
+        <CategoryDetailModal
+          category={detailTask ? detailTask.title : detailProject.name}
+          sessions={detailSessions}
+          selectedDate={selectedDate}
+          onClose={() => setSessionDetail(null)}
+          onEdit={(selectedSessions) => {
+            setSessionDetail(null);
+            onEdit(selectedSessions);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1919,6 +2023,25 @@ function SettingsView({
               suffix="秒"
               onChange={(value) => update('idleThresholdSeconds', value)}
             />
+          </Field>
+          <Field label="离开归属" hint="默认归入“无效 → 离开”，保存后会同步迁移自动离开记录。">
+            <div className="idle-target-fields">
+              <select
+                value={settings.idleCategory}
+                onChange={(event) => update('idleCategory', event.target.value)}
+                aria-label="离开记录分类"
+              >
+                {data.categoryOptions.map((item) => (
+                  <option key={item.name} value={item.name}>{item.name}</option>
+                ))}
+              </select>
+              <input
+                value={settings.idleProjectName}
+                onChange={(event) => update('idleProjectName', event.target.value)}
+                placeholder="离开项目名称"
+                aria-label="离开记录项目"
+              />
+            </div>
           </Field>
           <Field label="原始元数据保留" hint="汇总后的会话长期保留；原始事件自动清理。">
             <NumberInput
@@ -2742,7 +2865,7 @@ function EditSessionModal({
   );
   const selectedProject = projectOptions.find((project) => project.id === projectId);
   const selectedCategory = localCategories.find((item) => item.name === category);
-  const categoryIsEditable = Boolean(selectedCategory && selectedCategory.name !== '离开');
+  const categoryIsEditable = Boolean(selectedCategory);
   const projectPlaceholder = category ? `搜索全部项目，“${category}”优先` : '搜索全部项目';
   const taskPlaceholder = selectedProject
     ? `搜索全部任务，“${selectedProject.name}”优先`
@@ -2862,9 +2985,9 @@ function EditSessionModal({
 
   const deleteSelectedCategory = async () => {
     const selected = localCategories.find((item) => item.name === category);
-    if (!selected || selected.name === '离开' || categoryBusy) return;
+    if (!selected || categoryBusy) return;
     const fallback = localCategories.find((item) => item.name === '杂务' && item.name !== selected.name)
-      || localCategories.find((item) => item.name !== selected.name && item.name !== '离开');
+      || localCategories.find((item) => item.name !== selected.name);
     if (!fallback) return;
     const accepted = await confirmation.confirm({
       title: `删除分类“${selected.name}”？`,
@@ -3011,7 +3134,7 @@ function EditSessionModal({
                 <button
                   disabled={!categoryIsEditable || categoryBusy}
                   onClick={() => selectedCategory && setRenamingCategory(selectedCategory)}
-                  title={selectedCategory?.name === '离开' ? '“离开”是系统空闲状态' : '重命名分类'}
+                  title="重命名分类"
                   type="button"
                 >
                   <Pencil size={15} />重命名
@@ -3020,7 +3143,7 @@ function EditSessionModal({
                   className="danger-button"
                   disabled={!categoryIsEditable || categoryBusy}
                   onClick={() => void deleteSelectedCategory()}
-                  title={selectedCategory?.name === '离开' ? '“离开”是系统空闲状态' : '删除分类'}
+                  title="删除分类"
                   type="button"
                 >
                   <Trash2 size={15} />删除
@@ -3313,7 +3436,11 @@ type DayStats = {
   categories: { category: string; minutes: number }[];
 };
 
-function summarizeDay(sessions: WorkSession[], dateKey: string): DayStats {
+function summarizeDay(
+  sessions: WorkSession[],
+  dateKey: string,
+  settings?: AppSettings,
+): DayStats {
   const result = new Map<string, number>();
   let activeMinutes = 0;
   let idleMinutes = 0;
@@ -3324,7 +3451,7 @@ function summarizeDay(sessions: WorkSession[], dateKey: string): DayStats {
   for (const session of sessions) {
     const minutes = sessionMinutesOnDate(session, dateKey);
     result.set(session.category, (result.get(session.category) || 0) + minutes);
-    if (session.category === '离开') {
+    if (isIdleSession(session, settings)) {
       idleMinutes += minutes;
       continue;
     }
@@ -3341,7 +3468,7 @@ function summarizeDay(sessions: WorkSession[], dateKey: string): DayStats {
     classifiedPercent: activeMinutes
       ? Math.round((classifiedMinutes / activeMinutes) * 100)
       : 0,
-    contextCount: sessions.filter((session) => session.category !== '离开').length,
+    contextCount: sessions.filter((session) => !isIdleSession(session, settings)).length,
     reviewCount,
     longestMinutes,
     categories: [...result.entries()]
@@ -3353,7 +3480,6 @@ function summarizeDay(sessions: WorkSession[], dateKey: string): DayStats {
 function projectBreakdown(sessions: WorkSession[], dateKey: string) {
   const map = new Map<string, { id: string; name: string; category: string; minutes: number }>();
   for (const session of sessions) {
-    if (session.category === '离开') continue;
     const id = session.projectId || '';
     const name = session.projectName || '未归类';
     const key = id || `unclassified:${session.category}`;
@@ -3366,18 +3492,32 @@ function projectBreakdown(sessions: WorkSession[], dateKey: string) {
 
 function needsReview(session: WorkSession) {
   return (
-    session.category !== '离开' &&
+    !isIdleSession(session) &&
     !session.userConfirmed &&
     session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD
   );
 }
 
-function sessionMinutesOnDate(session: WorkSession, dateKey: string) {
+function isIdleSession(session: WorkSession, settings?: AppSettings) {
+  if (session.category === '离开') return true;
+  if (session.source === 'collector-idle' && !session.userConfirmed) return true;
+  return Boolean(
+    settings &&
+    session.category === settings.idleCategory &&
+    session.projectName === settings.idleProjectName,
+  );
+}
+
+function sessionSecondsOnDate(session: WorkSession, dateKey: string) {
   const dayStart = dateFromKey(dateKey).getTime();
   const dayEnd = dayStart + 24 * 60 * 60 * 1000;
   const start = Math.max(dayStart, new Date(session.startedAt).getTime());
   const end = Math.min(dayEnd, new Date(session.endedAt).getTime());
-  return Math.max(0, Math.round((end - start) / 60_000));
+  return Math.max(0, (end - start) / 1000);
+}
+
+function sessionMinutesOnDate(session: WorkSession, dateKey: string) {
+  return sessionSecondsOnDate(session, dateKey) / 60;
 }
 
 function sessionBoundsOnDate(session: WorkSession, dateKey: string) {
@@ -3401,22 +3541,27 @@ function sessionApplication(session: WorkSession) {
 function minutesBetween(start: string, end: string) {
   return Math.max(
     0,
-    Math.round((new Date(end).getTime() - new Date(start).getTime()) / 60_000),
+    (new Date(end).getTime() - new Date(start).getTime()) / 60_000,
   );
 }
 
 function formatDuration(minutes: number) {
-  const rounded = Math.max(0, Math.round(minutes));
-  if (rounded < 60) return `${rounded} 分钟`;
-  const hours = Math.floor(rounded / 60);
-  const rest = rounded % 60;
-  return rest ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
+  const totalSeconds = Math.max(0, Math.round((minutes * 60) / 5) * 5);
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutePart = Math.floor((totalSeconds % 3600) / 60);
+  const secondPart = totalSeconds % 60;
+  if (hours > 0) {
+    return minutePart ? `${hours} 小时 ${minutePart} 分钟` : `${hours} 小时`;
+  }
+  return secondPart ? `${minutePart} 分 ${secondPart} 秒` : `${minutePart} 分钟`;
 }
 
 function formatClock(value: string) {
   return new Date(value).toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
   });
 }
 
