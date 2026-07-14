@@ -1483,6 +1483,73 @@ kbd {
 .command-palette footer { padding: 8px 13px; display: flex; gap: 14px; border-top: 1px solid var(--border); color: var(--subtle); font-size: 10px; }
 .command-palette footer span { display: inline-flex; align-items: center; gap: 4px; }
 
+.ai-review-page { display: grid; gap: 14px; }
+.ai-review-summary {
+  padding: 13px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(86px, 120px)) minmax(280px, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 17px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.ai-review-summary > div:not(.ai-review-actions) { min-height: 52px; padding: 8px 12px; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; border-radius: 12px; background: var(--surface-subtle); }
+.ai-review-summary span { color: var(--muted); font-size: 11px; }
+.ai-review-summary strong { color: var(--text-strong); font-size: 20px; }
+.ai-review-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.ai-review-actions button { min-height: 38px; }
+.spin { animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.ai-review-workspace { min-height: 620px; display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 19px; background: var(--panel); box-shadow: var(--shadow); }
+.ai-job-browser { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--border); background: var(--panel-soft); }
+.ai-job-filters { padding: 10px; display: flex; gap: 4px; overflow-x: auto; border-bottom: 1px solid var(--border); }
+.ai-job-filters button { min-height: 30px; padding: 5px 9px; flex: 0 0 auto; border-color: transparent; border-radius: 9px; color: var(--muted); background: transparent; font-size: 11px; transform: none; }
+.ai-job-filters button:hover:not(:disabled), .ai-job-filters button.active { border-color: transparent; color: var(--text); background: var(--control-hover); transform: none; }
+.ai-job-list { max-height: 760px; padding: 8px; display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
+.ai-job-list > button { width: 100%; min-height: 82px; padding: 10px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 5px 8px; border-color: transparent; border-radius: 12px; background: transparent; text-align: left; transform: none; }
+.ai-job-list > button:hover:not(:disabled), .ai-job-list > button.active { border-color: transparent; background: var(--control-hover); transform: none; }
+.ai-job-list > button strong { min-width: 0; overflow: hidden; color: var(--text-strong); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ai-job-list > button small { grid-column: 1 / -1; min-width: 0; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.ai-job-list > button time { grid-column: 1 / -1; color: var(--subtle); font-size: 10px; }
+.ai-status { width: max-content; padding: 3px 7px; border-radius: 999px; color: var(--muted); background: var(--surface-subtle); font-size: 10px; font-weight: 750; white-space: nowrap; }
+.ai-status.pending { color: var(--amber); background: color-mix(in srgb, var(--amber) 11%, transparent); }
+.ai-status.running { color: var(--blue-strong); background: color-mix(in srgb, var(--blue-strong) 10%, transparent); }
+.ai-status.completed { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+.ai-status.failed, .ai-status.downgraded { color: var(--rose); background: color-mix(in srgb, var(--rose) 10%, transparent); }
+.ai-job-empty, .ai-detail-empty { min-height: 210px; padding: 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--subtle); text-align: center; }
+.ai-job-empty strong, .ai-detail-empty strong { color: var(--text); font-size: 13px; }
+.ai-job-empty span, .ai-detail-empty span { max-width: 300px; font-size: 11px; line-height: 1.6; }
+
+.ai-job-detail { min-width: 0; max-height: 760px; padding: 20px; overflow: auto; }
+.ai-job-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.ai-job-detail-head h2 { margin: 8px 0 4px; color: var(--text-strong); font-size: 19px; }
+.ai-job-detail-head p { margin: 0; color: var(--muted); font-size: 11px; }
+.ai-job-detail-head > code { padding: 5px 7px; border-radius: 7px; color: var(--subtle); background: var(--surface-subtle); font-size: 10px; }
+.ai-job-facts { margin-top: 17px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; }
+.ai-job-facts > div { min-width: 0; padding: 9px 10px; border-radius: 11px; background: var(--surface-subtle); }
+.ai-job-facts span, .ai-job-facts strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-job-facts span { color: var(--subtle); font-size: 9px; }
+.ai-job-facts strong { margin-top: 4px; color: var(--text); font-size: 11px; }
+.ai-job-error { margin-top: 12px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; border-radius: 11px; color: var(--rose); background: color-mix(in srgb, var(--rose) 7%, var(--surface-subtle)); font-size: 11px; line-height: 1.55; }
+.ai-job-error svg { flex: 0 0 auto; }
+.ai-targets { margin-top: 18px; }
+.ai-targets h3 { margin: 0 0 8px; color: var(--text); font-size: 12px; }
+.ai-targets > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.ai-targets article { min-width: 0; padding: 9px 10px; display: grid; grid-template-columns: 94px minmax(0, 1fr); gap: 9px; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: var(--panel-soft); }
+.ai-targets time { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.ai-targets article span, .ai-targets article strong, .ai-targets article small { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-targets article strong { color: var(--text); font-size: 11px; }
+.ai-targets article small { margin-top: 3px; color: var(--subtle); font-size: 9px; }
+.ai-trace { margin-top: 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-soft); }
+.ai-trace summary { min-height: 42px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; list-style: none; color: var(--text); font-size: 12px; font-weight: 750; }
+.ai-trace summary::-webkit-details-marker { display: none; }
+.ai-trace summary button { min-height: 28px; padding: 4px 8px; display: inline-flex; align-items: center; gap: 5px; border-color: transparent; color: var(--muted); background: var(--control); font-size: 10px; transform: none; }
+.ai-trace pre { max-height: 430px; margin: 0; padding: 13px; overflow: auto; border-top: 1px solid var(--border); color: var(--text-secondary); background: var(--code-bg); font: 10.5px/1.65 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-trace > p { margin: 0; padding: 13px; border-top: 1px solid var(--border); color: var(--subtle); font-size: 11px; }
+
 @media (max-width: 760px) {
   .app-shell { display: block; }
   .sidebar {
@@ -1499,7 +1566,7 @@ kbd {
   .brand { padding: 0; border: 0; }
   .brand > div:last-child, .collector-card, .sidebar-foot { display: none; }
   .brand-mark { width: 36px; height: 36px; border-radius: 11px; }
-  .primary-nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; }
+  .primary-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; }
   .primary-nav button { min-height: 36px; justify-content: center; padding: 7px; }
   .primary-nav button span { display: none; }
   .nav-badge { position: absolute; margin: -20px 0 0 20px; }
@@ -1538,6 +1605,17 @@ kbd {
   .command-shortcuts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .command-palette footer { display: none; }
   .review-panel .review-list { grid-template-columns: 1fr; }
+  .ai-review-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .ai-review-summary > div:not(.ai-review-actions) { min-height: 48px; padding: 7px; flex-direction: column; gap: 2px; }
+  .ai-review-summary strong { font-size: 17px; }
+  .ai-review-actions { grid-column: 1 / -1; justify-content: stretch; }
+  .ai-review-actions button { flex: 1; }
+  .ai-review-workspace { min-height: 0; grid-template-columns: 1fr; overflow: visible; }
+  .ai-job-browser { max-height: 390px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .ai-job-list, .ai-job-detail { max-height: none; }
+  .ai-job-detail { padding: 14px; }
+  .ai-job-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ai-targets > div { grid-template-columns: 1fr; }
   .review-panel .all-clear { grid-template-columns: auto minmax(0, 1fr); }
   .review-panel .all-clear span { grid-column: 2; }
   .modal-backdrop { padding: 10px; }

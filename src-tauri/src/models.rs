@@ -38,9 +38,19 @@ pub struct AnalysisJob {
     pub chunk_ids: Vec<String>,
     pub metadata_range: TimeRange,
     pub mode: String,
+    pub provider: String,
+    pub model: String,
     pub retry_count: u32,
     pub status: String,
     pub error: Option<String>,
+    pub system_prompt: Option<String>,
+    pub user_prompt: Option<String>,
+    pub response: Option<String>,
+    pub queued_at: String,
+    pub processing_started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub result_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

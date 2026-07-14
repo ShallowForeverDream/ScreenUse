@@ -1,7 +1,8 @@
 use crate::ai::{
-    analyze_with_codex_account, AiAttributionBatch, AiReviewInput, OpenAiCompatibleClient,
+    parse_and_validate, request_with_codex_account, review_instructions, review_prompt,
+    AiAttributionBatch, AiReviewInput, OpenAiCompatibleClient,
 };
-use crate::db::AppDb;
+use crate::db::{now, AppDb};
 use crate::models::{AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession};
 use crate::secrets;
 use anyhow::{anyhow, Context, Result};
@@ -77,9 +78,19 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
             ended_at,
         },
         mode: "metadata-context-review".into(),
+        provider: settings.ai_provider.clone(),
+        model: settings.ai_model.clone(),
         retry_count: 0,
         status: "pending".into(),
         error: None,
+        system_prompt: None,
+        user_prompt: None,
+        response: None,
+        queued_at: now(),
+        processing_started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        result_count: 0,
     })?;
     Ok(true)
 }
@@ -111,7 +122,23 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
         tasks: &tasks,
     };
 
-    match maybe_ai(&settings, &input).await {
+    let review_result: Result<AiAttributionBatch> = async {
+        let system_prompt = review_instructions().to_string();
+        let user_prompt = review_prompt(&input)?;
+        db.record_analysis_job_request(
+            &job.id,
+            &settings.ai_provider,
+            &settings.ai_model,
+            &system_prompt,
+            &user_prompt,
+        )?;
+        let response = maybe_ai(&settings, &system_prompt, &user_prompt).await?;
+        db.record_analysis_job_response(&job.id, &response)?;
+        parse_and_validate(&response, &input)
+    }
+    .await;
+
+    match review_result {
         Ok(result) => {
             persist_results(&db, &job, &targets, &events, result)?;
             Ok(true)
@@ -231,10 +258,11 @@ fn load_job_targets(db: &AppDb, job: &AnalysisJob) -> Result<Vec<WorkSession>> {
 
 async fn maybe_ai(
     settings: &crate::models::AppSettings,
-    input: &AiReviewInput<'_>,
-) -> Result<AiAttributionBatch> {
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String> {
     if settings.ai_provider == "codex-account" {
-        return analyze_with_codex_account(settings, input).await;
+        return request_with_codex_account(settings, system_prompt, user_prompt).await;
     }
     let secret_name = settings.ai_secret_ref.as_deref().unwrap_or_default().trim();
     if secret_name.is_empty() {
@@ -245,7 +273,7 @@ async fn maybe_ai(
         return Err(anyhow!("AI 凭据为空；本地分类不受影响"));
     }
     OpenAiCompatibleClient::new(settings, api_key)
-        .analyze_review(input)
+        .request_review(system_prompt, user_prompt)
         .await
 }
 
@@ -256,6 +284,7 @@ fn persist_results(
     events: &[RawActivityEvent],
     batch: AiAttributionBatch,
 ) -> Result<()> {
+    let result_count = batch.results.len() as u32;
     for result in batch.results {
         let target = targets
             .iter()
@@ -286,6 +315,7 @@ fn persist_results(
             evidence,
         )?;
     }
+    db.set_analysis_job_result_count(&job.id, result_count)?;
     db.mark_analysis_job_status(&job.id, "completed", None, None)?;
     Ok(())
 }

@@ -196,7 +196,17 @@ impl AppDb {
               mode TEXT NOT NULL,
               retry_count INTEGER NOT NULL,
               status TEXT NOT NULL,
-              error TEXT
+              error TEXT,
+              provider TEXT NOT NULL DEFAULT '',
+              model TEXT NOT NULL DEFAULT '',
+              system_prompt TEXT,
+              user_prompt TEXT,
+              response TEXT,
+              queued_at TEXT NOT NULL DEFAULT '',
+              processing_started_at TEXT,
+              completed_at TEXT,
+              duration_ms INTEGER,
+              result_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS attribution_rules (
               id TEXT PRIMARY KEY,
@@ -263,6 +273,26 @@ impl AppDb {
             "updated_at",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(&conn, "analysis_jobs", "provider", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "analysis_jobs", "model", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "analysis_jobs", "system_prompt", "TEXT")?;
+        ensure_column(&conn, "analysis_jobs", "user_prompt", "TEXT")?;
+        ensure_column(&conn, "analysis_jobs", "response", "TEXT")?;
+        ensure_column(
+            &conn,
+            "analysis_jobs",
+            "queued_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(&conn, "analysis_jobs", "processing_started_at", "TEXT")?;
+        ensure_column(&conn, "analysis_jobs", "completed_at", "TEXT")?;
+        ensure_column(&conn, "analysis_jobs", "duration_ms", "INTEGER")?;
+        ensure_column(
+            &conn,
+            "analysis_jobs",
+            "result_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         conn.execute(
             "UPDATE activity_categories SET updated_at=created_at WHERE updated_at=''",
             [],
@@ -270,6 +300,18 @@ impl AppDb {
         conn.execute(
             "UPDATE attribution_rules SET updated_at=?1 WHERE updated_at=''",
             params![now()],
+        )?;
+        conn.execute(
+            "UPDATE analysis_jobs SET queued_at=ended_at WHERE queued_at=''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE analysis_jobs
+             SET status='pending', processing_started_at=NULL,
+                 completed_at=NULL, duration_ms=NULL,
+                 error=COALESCE(error, '应用重启后重新排队')
+             WHERE status='running'",
+            [],
         )?;
         for category in DEFAULT_CATEGORIES {
             conn.execute(
@@ -2122,7 +2164,11 @@ impl AppDb {
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO analysis_jobs VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT OR REPLACE INTO analysis_jobs(
+               id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
+               provider,model,system_prompt,user_prompt,response,queued_at,
+               processing_started_at,completed_at,duration_ms,result_count
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 job.id,
                 serde_json::to_string(&job.chunk_ids)?,
@@ -2131,8 +2177,82 @@ impl AppDb {
                 job.mode,
                 job.retry_count,
                 job.status,
-                job.error
+                job.error,
+                job.provider,
+                job.model,
+                job.system_prompt,
+                job.user_prompt,
+                job.response,
+                job.queued_at,
+                job.processing_started_at,
+                job.completed_at,
+                job.duration_ms.map(|value| value as i64),
+                job.result_count as i64,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_analysis_jobs(&self, limit: u32) -> Result<Vec<AnalysisJob>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
+                    provider,model,NULL,NULL,NULL,queued_at,processing_started_at,
+                    completed_at,duration_ms,result_count
+             FROM analysis_jobs
+             ORDER BY queued_at DESC, started_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![i64::from(limit.clamp(1, 500))], analysis_job_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_analysis_job(&self, id: &str) -> Result<Option<AnalysisJob>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
+                    provider,model,system_prompt,user_prompt,response,queued_at,
+                    processing_started_at,completed_at,duration_ms,result_count
+             FROM analysis_jobs WHERE id=?1",
+            params![id],
+            analysis_job_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn record_analysis_job_request(
+        &self,
+        id: &str,
+        provider: &str,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE analysis_jobs
+             SET provider=?1,model=?2,system_prompt=?3,user_prompt=?4,response=NULL,result_count=0
+             WHERE id=?5",
+            params![provider, model, system_prompt, user_prompt, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_analysis_job_response(&self, id: &str, response: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE analysis_jobs SET response=?1 WHERE id=?2",
+            params![response, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_analysis_job_result_count(&self, id: &str, result_count: u32) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE analysis_jobs SET result_count=?1 WHERE id=?2",
+            params![i64::from(result_count), id],
         )?;
         Ok(())
     }
@@ -2154,34 +2274,31 @@ impl AppDb {
     pub fn claim_next_analysis_job(&self) -> Result<Option<AnalysisJob>> {
         let conn = self.conn.lock();
         let job = conn.query_row(
-            "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error FROM analysis_jobs WHERE status='pending' ORDER BY started_at ASC LIMIT 1",
+            "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
+                    provider,model,system_prompt,user_prompt,response,queued_at,
+                    processing_started_at,completed_at,duration_ms,result_count
+             FROM analysis_jobs WHERE status='pending'
+             ORDER BY queued_at ASC, started_at ASC LIMIT 1",
             [],
-            |row| {
-                let chunk_ids_json: String = row.get(1)?;
-                Ok(AnalysisJob {
-                    id: row.get(0)?,
-                    chunk_ids: parse_json(&chunk_ids_json),
-                    metadata_range: TimeRange {
-                        started_at: row.get(2)?,
-                        ended_at: row.get(3)?,
-                    },
-                    mode: row.get(4)?,
-                    retry_count: row.get::<_, i64>(5)? as u32,
-                    status: row.get(6)?,
-                    error: row.get(7)?,
-                })
-            },
+            analysis_job_from_row,
         ).optional()?;
         let Some(mut job) = job else { return Ok(None) };
+        let processing_started_at = now();
         let claimed = conn.execute(
-            "UPDATE analysis_jobs SET status='running', error=NULL WHERE id=?1 AND status='pending'",
-            params![job.id],
+            "UPDATE analysis_jobs
+             SET status='running', error=NULL, processing_started_at=?1,
+                 completed_at=NULL, duration_ms=NULL
+             WHERE id=?2 AND status='pending'",
+            params![processing_started_at, job.id],
         )?;
         if claimed == 0 {
             return Ok(None);
         }
         job.status = "running".into();
         job.error = None;
+        job.processing_started_at = Some(processing_started_at);
+        job.completed_at = None;
+        job.duration_ms = None;
         Ok(Some(job))
     }
 
@@ -2193,9 +2310,27 @@ impl AppDb {
         error: Option<String>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        let terminal = matches!(status, "completed" | "failed" | "downgraded");
+        let completed_at = terminal.then(now);
         conn.execute(
-            "UPDATE analysis_jobs SET status=?1, retry_count=COALESCE(?2,retry_count), error=?3 WHERE id=?4",
-            params![status, retry_count.map(|v| v as i64), error, id],
+            "UPDATE analysis_jobs
+             SET status=?1,
+                 retry_count=COALESCE(?2,retry_count),
+                 error=?3,
+                 processing_started_at=CASE WHEN ?1='pending' THEN NULL ELSE processing_started_at END,
+                 completed_at=?5,
+                 duration_ms=CASE
+                   WHEN ?5 IS NULL THEN NULL
+                   ELSE MAX(0, CAST((julianday(?5)-julianday(COALESCE(processing_started_at,queued_at)))*86400000 AS INTEGER))
+                 END
+             WHERE id=?4",
+            params![
+                status,
+                retry_count.map(i64::from),
+                error,
+                id,
+                completed_at
+            ],
         )?;
         Ok(())
     }
@@ -2739,7 +2874,13 @@ impl AppDb {
 
     pub fn retry_failed_jobs(&self) -> Result<u32> {
         let conn = self.conn.lock();
-        let changed = conn.execute("UPDATE analysis_jobs SET status='pending', error=NULL WHERE status IN ('failed','downgraded')", [])?;
+        let changed = conn.execute(
+            "UPDATE analysis_jobs
+             SET status='pending', error=NULL, processing_started_at=NULL,
+                 completed_at=NULL, duration_ms=NULL, response=NULL, result_count=0
+             WHERE status IN ('failed','downgraded')",
+            [],
+        )?;
         Ok(changed as u32)
     }
 
@@ -2937,6 +3078,34 @@ fn fmt(t: chrono::DateTime<Utc>) -> String {
 
 fn parse_json<T: DeserializeOwned + Default>(s: &str) -> T {
     serde_json::from_str(s).unwrap_or_default()
+}
+
+fn analysis_job_from_row(row: &Row<'_>) -> rusqlite::Result<AnalysisJob> {
+    let chunk_ids_json: String = row.get(1)?;
+    Ok(AnalysisJob {
+        id: row.get(0)?,
+        chunk_ids: parse_json(&chunk_ids_json),
+        metadata_range: TimeRange {
+            started_at: row.get(2)?,
+            ended_at: row.get(3)?,
+        },
+        mode: row.get(4)?,
+        retry_count: row.get::<_, i64>(5)?.max(0) as u32,
+        status: row.get(6)?,
+        error: row.get(7)?,
+        provider: row.get(8)?,
+        model: row.get(9)?,
+        system_prompt: row.get(10)?,
+        user_prompt: row.get(11)?,
+        response: row.get(12)?,
+        queued_at: row.get(13)?,
+        processing_started_at: row.get(14)?,
+        completed_at: row.get(15)?,
+        duration_ms: row
+            .get::<_, Option<i64>>(16)?
+            .map(|value| value.max(0) as u64),
+        result_count: row.get::<_, i64>(17)?.max(0) as u32,
+    })
 }
 
 fn clean_name(value: &str, fallback: &str) -> String {
@@ -5037,6 +5206,82 @@ mod tests {
             .get_session("split-source")
             .expect("load removed source")
             .is_none());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn analysis_job_keeps_a_complete_ai_audit_trail() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-job-audit-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let queued_at = now();
+        db.create_analysis_job(&AnalysisJob {
+            id: "audit-job".into(),
+            chunk_ids: vec!["session-a".into(), "session-b".into()],
+            metadata_range: TimeRange {
+                started_at: "2026-07-14T10:00:00Z".into(),
+                ended_at: "2026-07-14T10:02:00Z".into(),
+            },
+            mode: "metadata-context-review".into(),
+            provider: "codex-account".into(),
+            model: "gpt-5.4".into(),
+            retry_count: 0,
+            status: "pending".into(),
+            error: None,
+            system_prompt: None,
+            user_prompt: None,
+            response: None,
+            queued_at,
+            processing_started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            result_count: 0,
+        })
+        .expect("create job");
+
+        let summaries = db.list_analysis_jobs(20).expect("list jobs");
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].system_prompt.is_none());
+        assert!(summaries[0].response.is_none());
+
+        let claimed = db
+            .claim_next_analysis_job()
+            .expect("claim job")
+            .expect("pending job");
+        assert_eq!(claimed.status, "running");
+        assert!(claimed.processing_started_at.is_some());
+        db.record_analysis_job_request(
+            &claimed.id,
+            "codex-account",
+            "gpt-5.4",
+            "system prompt",
+            "user prompt",
+        )
+        .expect("record request");
+        db.record_analysis_job_response(&claimed.id, "{\"results\":[]}")
+            .expect("record response");
+        db.set_analysis_job_result_count(&claimed.id, 2)
+            .expect("record result count");
+        db.mark_analysis_job_status(&claimed.id, "completed", None, None)
+            .expect("complete job");
+
+        let detail = db
+            .get_analysis_job(&claimed.id)
+            .expect("load job")
+            .expect("saved job");
+        assert_eq!(detail.status, "completed");
+        assert_eq!(detail.provider, "codex-account");
+        assert_eq!(detail.model, "gpt-5.4");
+        assert_eq!(detail.system_prompt.as_deref(), Some("system prompt"));
+        assert_eq!(detail.user_prompt.as_deref(), Some("user prompt"));
+        assert_eq!(detail.response.as_deref(), Some("{\"results\":[]}"));
+        assert_eq!(detail.result_count, 2);
+        assert!(detail.completed_at.is_some());
+        assert!(detail.duration_ms.is_some());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

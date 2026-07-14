@@ -24,7 +24,8 @@ use collectors::{CollectorAdapter, DesktopCollector};
 use db::AppDb;
 use integrations::{IcsAdapter, IntegrationAdapter};
 use models::{
-    AppSettings, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, SessionPatch,
+    AnalysisJob, AppSettings, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus,
+    SessionPatch,
 };
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -211,6 +212,25 @@ fn split_session(
 #[tauri::command]
 fn retry_failed_jobs(state: State<AppState>) -> Result<u32, String> {
     state.db.retry_failed_jobs().map_err(map_err)
+}
+
+#[tauri::command]
+fn list_analysis_jobs(
+    state: State<AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<AnalysisJob>, String> {
+    state
+        .db
+        .list_analysis_jobs(limit.unwrap_or(200))
+        .map_err(map_err)
+}
+
+#[tauri::command]
+fn get_analysis_job(
+    state: State<AppState>,
+    id: String,
+) -> Result<Option<AnalysisJob>, String> {
+    state.db.get_analysis_job(&id).map_err(map_err)
 }
 
 #[tauri::command]
@@ -500,6 +520,8 @@ fn main() {
             merge_sessions,
             split_session,
             retry_failed_jobs,
+            list_analysis_jobs,
+            get_analysis_job,
             run_analysis_once,
             compact_sessions,
             learn_rule_from_session,

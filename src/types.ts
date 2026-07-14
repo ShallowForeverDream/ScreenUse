@@ -139,6 +139,29 @@ export interface AppSettings {
   tempStorageLimitGb: number;
 }
 
+export interface AnalysisJob {
+  id: string;
+  chunkIds: string[];
+  metadataRange: {
+    startedAt: string;
+    endedAt: string;
+  };
+  mode: string;
+  provider: string;
+  model: string;
+  retryCount: number;
+  status: string;
+  error?: string | null;
+  systemPrompt?: string | null;
+  userPrompt?: string | null;
+  response?: string | null;
+  queuedAt: string;
+  processingStartedAt?: string | null;
+  completedAt?: string | null;
+  durationMs?: number | null;
+  resultCount: number;
+}
+
 export interface GithubSyncConfig {
   enabled: boolean;
   owner: string;

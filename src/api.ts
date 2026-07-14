@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, WorkSession } from './types';
+import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -106,6 +106,8 @@ export const api = {
   mergeSessions: (ids: string[], summary?: string) => call<WorkSession>('merge_sessions', { ids, summary }),
   splitSession: (id: string, splitAt: string) => call<WorkSession[]>('split_session', { id, splitAt }),
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),
+  listAnalysisJobs: (limit = 200) => call<AnalysisJob[]>('list_analysis_jobs', { limit }, []),
+  getAnalysisJob: (id: string) => call<AnalysisJob | null>('get_analysis_job', { id }, null),
   runAnalysisOnce: () => call<boolean>('run_analysis_once', undefined, false),
   compactSessions: () => call<number>('compact_sessions', undefined, 0),
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),

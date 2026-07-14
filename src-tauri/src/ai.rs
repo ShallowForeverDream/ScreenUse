@@ -76,14 +76,21 @@ impl OpenAiCompatibleClient {
         if input.targets.is_empty() {
             return Err(anyhow!("no sessions to analyze"));
         }
+        let system_prompt = review_instructions();
+        let user_prompt = review_prompt(input)?;
+        let content = self.request_review(system_prompt, &user_prompt).await?;
+        parse_and_validate(&content, input)
+    }
+
+    pub async fn request_review(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         if self.model.is_empty() {
             return Err(anyhow!("AI model is empty"));
         }
         let body = json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": review_instructions()},
-                {"role": "user", "content": review_prompt(input)?}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             "temperature": 0.1,
             "max_tokens": 1800,
@@ -109,7 +116,7 @@ impl OpenAiCompatibleClient {
         let content = value["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| anyhow!("missing AI response content"))?;
-        parse_and_validate(content, input)
+        Ok(content.to_string())
     }
 }
 
@@ -120,6 +127,17 @@ pub async fn analyze_with_codex_account(
     if input.targets.is_empty() {
         return Err(anyhow!("no sessions to analyze"));
     }
+    let system_prompt = review_instructions();
+    let user_prompt = review_prompt(input)?;
+    let content = request_with_codex_account(settings, system_prompt, &user_prompt).await?;
+    parse_and_validate(&content, input)
+}
+
+pub async fn request_with_codex_account(
+    settings: &AppSettings,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String> {
     let model = settings.ai_model.trim();
     if model.is_empty() {
         return Err(anyhow!("Codex model is empty"));
@@ -130,7 +148,6 @@ pub async fn analyze_with_codex_account(
     let schema_path = work_dir.join("result.schema.json");
     let output_path = work_dir.join("result.json");
     fs::write(&schema_path, serde_json::to_vec(&review_schema())?)?;
-    let prompt = review_prompt(input)?;
 
     let mut command = codex_command();
     command
@@ -166,9 +183,9 @@ pub async fn analyze_with_codex_account(
             .spawn()
             .context("无法启动 Codex CLI；请先安装 Codex 并运行 codex login")?;
         let mut stdin = child.stdin.take().context("cannot open Codex stdin")?;
-        stdin.write_all(review_instructions().as_bytes()).await?;
+        stdin.write_all(system_prompt.as_bytes()).await?;
         stdin.write_all(b"\n\n").await?;
-        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.write_all(user_prompt.as_bytes()).await?;
         stdin.shutdown().await?;
         drop(stdin);
         let output = timeout(
@@ -185,7 +202,7 @@ pub async fn analyze_with_codex_account(
             ));
         }
         let content = fs::read_to_string(&output_path).context("Codex 未生成结构化复核结果")?;
-        parse_and_validate(&content, input)
+        Ok(content)
     }
     .await;
     let _ = fs::remove_dir_all(&work_dir);
@@ -259,7 +276,7 @@ fn hide_console(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_console(_command: &mut Command) {}
 
-fn review_instructions() -> &'static str {
+pub(crate) fn review_instructions() -> &'static str {
     "你是个人电脑时间账本的复核器。不要调用工具、不要读取文件、不要联网，只分析输入 JSON。\
 必须为 reviewItems 中每个 targetSession.sessionId 返回且只返回一个结果。只能选择 catalog 中现有的 category、projectId、taskId；\
 taskId 必须属于 projectId，projectId 必须属于 category。不合适时 projectId 和 taskId 返回 null，禁止创造新名称。\
@@ -268,7 +285,7 @@ taskId 必须属于 projectId，projectId 必须属于 category。不合适时 p
 confidence 为 0 到 0.98；evidence 最多 3 项。只输出符合给定 JSON Schema 的 JSON。"
 }
 
-fn review_prompt(input: &AiReviewInput<'_>) -> Result<String> {
+pub(crate) fn review_prompt(input: &AiReviewInput<'_>) -> Result<String> {
     Ok(format!(
         "复核以下目标会话。前后上下文窗口为目标前后 30 分钟；catalog 包含当前全部分类、项目和任务。输入：{}",
         serde_json::to_string(&review_payload(input))?
@@ -439,7 +456,10 @@ fn review_schema() -> Value {
     })
 }
 
-fn parse_and_validate(content: &str, input: &AiReviewInput<'_>) -> Result<AiAttributionBatch> {
+pub(crate) fn parse_and_validate(
+    content: &str,
+    input: &AiReviewInput<'_>,
+) -> Result<AiAttributionBatch> {
     let mut parsed: AiAttributionBatch = serde_json::from_str(content).or_else(|_| {
         extract_json_object(content)
             .and_then(|json| serde_json::from_str(&json).map_err(anyhow::Error::from))

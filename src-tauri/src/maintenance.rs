@@ -61,9 +61,7 @@ pub fn optimize_storage(db: &AppDb, aggressive: bool) -> Result<u32> {
         params![retention],
     )? as u32;
 
-    // v0.1 created screenshot-backed jobs and sample sessions. The metadata-first
-    // runtime never needs those rows or files.
-    removed += conn.execute("DELETE FROM analysis_jobs WHERE chunk_ids_json <> '[]'", [])? as u32;
+    // v0.1 media chunks are obsolete. Current metadata AI jobs remain as an audit trail.
     removed += conn.execute("DELETE FROM media_chunks", [])? as u32;
     removed += conn.execute("DELETE FROM work_sessions WHERE source='seed'", [])? as u32;
 

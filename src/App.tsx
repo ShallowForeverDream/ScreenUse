@@ -55,6 +55,7 @@ import {
 } from 'lucide-react';
 import { api } from './api';
 import type {
+  AnalysisJob,
   AppSettings,
   CategoryOption,
   DashboardData,
@@ -72,6 +73,7 @@ const tabs = [
   { id: 'today', label: '今日', icon: LayoutDashboard },
   { id: 'timeline', label: '时间轴', icon: Activity },
   { id: 'projects', label: '项目', icon: FolderKanban },
+  { id: 'ai', label: 'AI复核', icon: WandSparkles },
   { id: 'settings', label: '设置', icon: Settings },
 ] as const;
 
@@ -760,7 +762,7 @@ export default function App() {
             >
               <Search size={15} /><span>搜索</span><kbd>Ctrl K</kbd>
             </button>
-            {activeTab !== 'settings' && (
+            {activeTab !== 'settings' && activeTab !== 'ai' && (
               <DateNavigator
                 value={selectedDate}
                 onChange={setSelectedDate}
@@ -801,7 +803,7 @@ export default function App() {
           </div>
         </header>
 
-        {activeTab !== 'settings' && (
+        {activeTab !== 'settings' && activeTab !== 'ai' && (
           <section className="kpi-grid">
             <Kpi
               icon={Clock3}
@@ -869,6 +871,9 @@ export default function App() {
             focusProjectId={projectFocusId}
             onEdit={setEditing}
           />
+        )}
+        {activeTab === 'ai' && (
+          <AiReviewView sessions={data.sessions} runAction={runAction} />
         )}
         {activeTab === 'settings' && (
           <SettingsView data={data} runAction={runAction} onThemeChange={setThemeMode} />
@@ -962,6 +967,294 @@ function DateNavigator({
       )}
     </div>
   );
+}
+
+type AiJobFilter = 'all' | 'pending' | 'running' | 'completed' | 'failed';
+
+const aiJobFilters: { id: AiJobFilter; label: string }[] = [
+  { id: 'all', label: '全部' },
+  { id: 'pending', label: '排队' },
+  { id: 'running', label: '运行中' },
+  { id: 'completed', label: '已复核' },
+  { id: 'failed', label: '失败' },
+];
+
+function AiReviewView({
+  sessions,
+  runAction,
+}: {
+  sessions: WorkSession[];
+  runAction: ActionRunner;
+}) {
+  const [jobs, setJobs] = useState<AnalysisJob[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<AnalysisJob | null>(null);
+  const [filter, setFilter] = useState<AiJobFilter>('all');
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      const next = await api.listAnalysisJobs(300);
+      setJobs(next);
+      setSelectedId((current) => current && next.some((job) => job.id === current)
+        ? current
+        : next[0]?.id || null);
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(true), 4000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setDetail(null);
+      return undefined;
+    }
+    let alive = true;
+    const loadDetail = async () => {
+      const next = await api.getAnalysisJob(selectedId);
+      if (alive) setDetail(next);
+    };
+    void loadDetail();
+    const timer = window.setInterval(() => void loadDetail(), 4000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [selectedId]);
+
+  const runAndRefresh = async (action: () => Promise<unknown>, message: string) => {
+    setBusy(true);
+    try {
+      await runAction(action, message);
+      await refresh(true);
+      if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
+    } catch {
+      // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const visibleJobs = useMemo(() => jobs.filter((job) => {
+    if (filter === 'all') return true;
+    if (filter === 'failed') return job.status === 'failed' || job.status === 'downgraded';
+    return job.status === filter;
+  }), [filter, jobs]);
+  const counts = useMemo(() => ({
+    pending: jobs.filter((job) => job.status === 'pending').length,
+    running: jobs.filter((job) => job.status === 'running').length,
+    completed: jobs.filter((job) => job.status === 'completed').length,
+    failed: jobs.filter((job) => job.status === 'failed' || job.status === 'downgraded').length,
+  }), [jobs]);
+  const sessionsById = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session])),
+    [sessions],
+  );
+
+  return (
+    <div className="ai-review-page">
+      <section className="ai-review-summary">
+        <div><span>排队</span><strong>{counts.pending}</strong></div>
+        <div><span>运行中</span><strong>{counts.running}</strong></div>
+        <div><span>已复核</span><strong>{counts.completed}</strong></div>
+        <div><span>失败</span><strong>{counts.failed}</strong></div>
+        <div className="ai-review-actions">
+          <button
+            className="primary"
+            disabled={busy}
+            onClick={() => void runAndRefresh(api.runAnalysisOnce, 'AI 复核已完成')}
+            type="button"
+          >
+            <WandSparkles size={15} />立即复核
+          </button>
+          <button
+            disabled={busy || counts.failed === 0}
+            onClick={() => void runAndRefresh(api.retryFailedJobs, '失败任务已重新排队')}
+            type="button"
+          >
+            <RefreshCw size={15} />重试失败
+          </button>
+          <button disabled={loading} onClick={() => void refresh()} type="button" title="刷新列表">
+            <RefreshCw className={loading ? 'spin' : ''} size={15} />刷新
+          </button>
+        </div>
+      </section>
+
+      <section className="ai-review-workspace">
+        <aside className="ai-job-browser">
+          <div className="ai-job-filters" role="tablist" aria-label="复核状态">
+            {aiJobFilters.map((item) => (
+              <button
+                aria-selected={filter === item.id}
+                className={filter === item.id ? 'active' : ''}
+                key={item.id}
+                onClick={() => setFilter(item.id)}
+                role="tab"
+                type="button"
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className="ai-job-list">
+            {visibleJobs.map((job) => (
+              <button
+                className={selectedId === job.id ? 'active' : ''}
+                key={job.id}
+                onClick={() => setSelectedId(job.id)}
+                type="button"
+              >
+                <span className={`ai-status ${job.status}`}>{aiJobStatusLabel(job.status)}</span>
+                <strong>{job.chunkIds.length} 个时间段</strong>
+                <small>{job.model || '等待读取模型'}</small>
+                <time>{formatAiDateTime(job.queuedAt)}</time>
+              </button>
+            ))}
+            {!loading && visibleJobs.length === 0 && (
+              <div className="ai-job-empty">
+                <WandSparkles size={22} />
+                <strong>这里还没有记录</strong>
+                <span>低于 80% 且达到最小时长的会话会进入复核。</span>
+              </div>
+            )}
+          </div>
+        </aside>
+
+        <div className="ai-job-detail">
+          {detail ? (
+            <>
+              <header className="ai-job-detail-head">
+                <div>
+                  <span className={`ai-status ${detail.status}`}>{aiJobStatusLabel(detail.status)}</span>
+                  <h2>{detail.chunkIds.length} 个时间段的上下文复核</h2>
+                  <p>{formatAiDateTime(detail.metadataRange.startedAt)} — {formatAiDateTime(detail.metadataRange.endedAt)}</p>
+                </div>
+                <code>{detail.id.slice(0, 8)}</code>
+              </header>
+
+              <div className="ai-job-facts">
+                <AiFact label="提供方" value={aiProviderLabel(detail.provider)} />
+                <AiFact label="模型" value={detail.model || '尚未开始'} />
+                <AiFact label="模式" value={detail.mode} />
+                <AiFact label="结果" value={`${detail.resultCount} 条`} />
+                <AiFact label="排队" value={formatAiDateTime(detail.queuedAt)} />
+                <AiFact label="开始" value={formatAiDateTime(detail.processingStartedAt)} />
+                <AiFact label="完成" value={formatAiDateTime(detail.completedAt)} />
+                <AiFact label="耗时" value={formatAiDuration(detail.durationMs)} />
+                <AiFact label="重试" value={`${detail.retryCount} 次`} />
+              </div>
+
+              {detail.error && <div className="ai-job-error"><CircleAlert size={16} />{detail.error}</div>}
+
+              <section className="ai-targets">
+                <h3>待复核时间段</h3>
+                <div>
+                  {detail.chunkIds.map((id) => {
+                    const session = sessionsById.get(id);
+                    return (
+                      <article key={id}>
+                        <time>{session
+                          ? `${formatTimelineClock(session.startedAt, true)}–${formatTimelineClock(session.endedAt, true)}`
+                          : id.slice(0, 8)}</time>
+                        <span>
+                          <strong>{session?.summary || '时间段已被整理或删除'}</strong>
+                          <small>{session
+                            ? [session.category, session.projectName, session.taskTitle].filter(Boolean).join(' · ')
+                            : '仍保留原始复核记录'}</small>
+                        </span>
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <AiTraceBlock title="系统提示词" value={detail.systemPrompt} empty="任务运行后记录" />
+              <AiTraceBlock title="发送给 AI 的提示词" value={detail.userPrompt} empty="任务运行后记录" />
+              <AiTraceBlock title="AI 原始回复" value={detail.response} empty={detail.status === 'running' ? '正在等待回复' : '尚无回复'} />
+            </>
+          ) : (
+            <div className="ai-detail-empty">
+              <WandSparkles size={28} />
+              <strong>选择一条复核记录</strong>
+              <span>可查看模型、完整提示词、原始回复和运行状态。</span>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function AiFact({ label, value }: { label: string; value: string }) {
+  return <div><span>{label}</span><strong title={value}>{value}</strong></div>;
+}
+
+function AiTraceBlock({
+  title,
+  value,
+  empty,
+}: {
+  title: string;
+  value?: string | null;
+  empty: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  };
+  return (
+    <details className="ai-trace" open={title === 'AI 原始回复' && Boolean(value)}>
+      <summary>
+        <span>{title}</span>
+        {value && (
+          <button onClick={(event) => { event.preventDefault(); void copy(); }} type="button">
+            {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? '已复制' : '复制'}
+          </button>
+        )}
+      </summary>
+      {value ? <pre>{value}</pre> : <p>{empty}</p>}
+    </details>
+  );
+}
+
+function aiJobStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    pending: '排队中',
+    running: '运行中',
+    completed: '已复核',
+    failed: '失败',
+    downgraded: '已降级',
+  };
+  return labels[status] || status;
+}
+
+function aiProviderLabel(provider: string) {
+  if (provider === 'codex-account') return '当前 Codex 账号';
+  if (provider === 'openai-compatible') return 'OpenAI 兼容接口';
+  return provider || '尚未开始';
+}
+
+function formatAiDateTime(value?: string | null) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : formatDateTime(value);
+}
+
+function formatAiDuration(value?: number | null) {
+  if (value == null) return '—';
+  if (value < 1000) return `${value} ms`;
+  return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} 秒`;
 }
 
 type GlobalSearchResult =
@@ -4240,6 +4533,7 @@ function pageDescription(tab: TabId) {
     today: '今天的时间去向',
     timeline: '查看并修正记录',
     projects: '项目与任务投入',
+    ai: '复核队列与完整运行记录',
     settings: '记录、主题与数据',
   };
   return descriptions[tab];
