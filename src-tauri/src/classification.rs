@@ -19,7 +19,11 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
         return Ok(Some(session));
     }
 
-    let Some(assignment) = resolve_project_task(db, event, &session.category)? else {
+    let assignment = match resolve_project_task(db, event, &session.category)? {
+        Some(assignment) => Some(assignment),
+        None => recent_task_assignment(db, &session)?,
+    };
+    let Some(assignment) = assignment else {
         return Ok(Some(session));
     };
     if session.project_id.as_deref() == Some(assignment.project_id.as_str())
@@ -44,6 +48,30 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
         },
     )?;
     Ok(Some(updated))
+}
+
+fn recent_task_assignment(db: &AppDb, session: &WorkSession) -> Result<Option<Assignment>> {
+    let Some(context) = db.recent_task_context(&session.id, &session.started_at)? else {
+        return Ok(None);
+    };
+    let (Some(project_id), Some(task_id)) = (context.project_id, context.task_id) else {
+        return Ok(None);
+    };
+    if context.source == "collector-idle" || (!context.user_confirmed && context.confidence < 0.84) {
+        return Ok(None);
+    }
+    let started = chrono::DateTime::parse_from_rfc3339(&session.started_at)?;
+    let previous_end = chrono::DateTime::parse_from_rfc3339(&context.ended_at)?;
+    let gap_seconds = (started - previous_end).num_seconds().max(0);
+    if gap_seconds > 30 {
+        return Ok(None);
+    }
+    Ok(Some(Assignment {
+        project_id,
+        task_id: Some(task_id),
+        category: context.category,
+        confidence: if context.user_confirmed { 0.92 } else { 0.90 },
+    }))
 }
 
 pub fn finalize_context(

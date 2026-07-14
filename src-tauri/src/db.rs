@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -28,6 +29,28 @@ struct LastSessionAttribution {
     task_id: Option<String>,
     summary: String,
     category: String,
+    user_confirmed: bool,
+    source: String,
+}
+
+pub(crate) struct RecentTaskContext {
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub category: String,
+    pub confidence: f32,
+    pub user_confirmed: bool,
+    pub source: String,
+    pub ended_at: String,
+}
+
+#[derive(Clone)]
+struct ContextPropagationRow {
+    id: String,
+    started_at: String,
+    ended_at: String,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    confidence: f32,
     user_confirmed: bool,
     source: String,
 }
@@ -68,6 +91,7 @@ impl AppDb {
         };
         db.migrate()?;
         db.seed_if_empty()?;
+        db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
         db.configure_idle_target(&settings)?;
@@ -1131,6 +1155,139 @@ impl AppDb {
             updated.push(self.update_session(id, patch.clone())?);
         }
         Ok(updated)
+    }
+
+    pub fn propagate_context_from_sessions(&self, anchor_ids: &[String]) -> Result<u32> {
+        let mut changed_ids = HashSet::new();
+        for anchor_id in anchor_ids {
+            let Some(anchor) = self.get_session(anchor_id)? else {
+                continue;
+            };
+            let (Some(project_id), Some(task_id)) =
+                (anchor.project_id.as_deref(), anchor.task_id.as_deref())
+            else {
+                continue;
+            };
+            if !anchor.user_confirmed {
+                continue;
+            }
+            let anchor_start = DateTime::parse_from_rfc3339(&anchor.started_at)
+                .context("invalid anchor start")?
+                .with_timezone(&Utc);
+            let anchor_end = DateTime::parse_from_rfc3339(&anchor.ended_at)
+                .context("invalid anchor end")?
+                .with_timezone(&Utc);
+            let range_start = fmt(anchor_start - Duration::hours(4));
+            let range_end = fmt(anchor_end + Duration::hours(4));
+            let rows = {
+                let conn = self.conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT id,started_at,ended_at,project_id,task_id,confidence,user_confirmed,source
+                     FROM work_sessions
+                     WHERE started_at<=?2 AND ended_at>=?1
+                     ORDER BY started_at ASC,ended_at ASC",
+                )?;
+                let mapped = stmt.query_map(params![range_start, range_end], |row| {
+                    Ok(ContextPropagationRow {
+                        id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        ended_at: row.get(2)?,
+                        project_id: row.get(3)?,
+                        task_id: row.get(4)?,
+                        confidence: row.get(5)?,
+                        user_confirmed: row.get::<_, i64>(6)? != 0,
+                        source: row.get(7)?,
+                    })
+                })?;
+                collect_rows(mapped)?
+            };
+            let Some(anchor_index) = rows.iter().position(|row| row.id == anchor.id) else {
+                continue;
+            };
+
+            let same_assignment = |row: &ContextPropagationRow| {
+                row.project_id.as_deref() == Some(project_id)
+                    && row.task_id.as_deref() == Some(task_id)
+            };
+            let should_stop = |row: &ContextPropagationRow| {
+                row.source == "collector-idle"
+                    || (row.user_confirmed && !same_assignment(row))
+                    || (!row.user_confirmed
+                        && row.task_id.is_some()
+                        && !same_assignment(row)
+                        && row.confidence >= 0.90)
+                    || (!row.user_confirmed
+                        && !is_auto_session_source(&row.source)
+                        && !same_assignment(row))
+            };
+            let mut update_row = |row: &ContextPropagationRow| -> Result<()> {
+                if same_assignment(row) || row.user_confirmed || changed_ids.contains(&row.id) {
+                    return Ok(());
+                }
+                self.conn.lock().execute(
+                    "UPDATE work_sessions
+                     SET project_id=?1,task_id=?2,category=?3,confidence=MAX(confidence,0.90),updated_at=?4
+                     WHERE id=?5 AND user_confirmed=0",
+                    params![project_id, task_id, anchor.category, now(), row.id],
+                )?;
+                changed_ids.insert(row.id.clone());
+                Ok(())
+            };
+
+            let mut cursor_start = anchor.started_at.clone();
+            for row in rows[..anchor_index].iter().rev() {
+                if context_is_disconnected(&row.ended_at, &cursor_start, 30) {
+                    break;
+                }
+                if should_stop(row) {
+                    break;
+                }
+                update_row(row)?;
+                cursor_start = row.started_at.clone();
+            }
+
+            let mut cursor_end = anchor.ended_at.clone();
+            for row in rows.iter().skip(anchor_index + 1) {
+                if context_is_disconnected(&cursor_end, &row.started_at, 30) {
+                    break;
+                }
+                if should_stop(row) {
+                    break;
+                }
+                update_row(row)?;
+                cursor_end = row.ended_at.clone();
+            }
+        }
+        Ok(changed_ids.len() as u32)
+    }
+
+    pub(crate) fn recent_task_context(
+        &self,
+        current_session_id: &str,
+        started_at: &str,
+    ) -> Result<Option<RecentTaskContext>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT project_id,task_id,category,confidence,user_confirmed,source,ended_at
+             FROM work_sessions
+             WHERE id<>?1 AND started_at<=?2
+             ORDER BY ended_at DESC,updated_at DESC
+             LIMIT 1",
+            params![current_session_id, started_at],
+            |row| {
+                Ok(RecentTaskContext {
+                    project_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    category: row.get(2)?,
+                    confidence: row.get(3)?,
+                    user_confirmed: row.get::<_, i64>(4)? != 0,
+                    source: row.get(5)?,
+                    ended_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<WorkSession>> {
@@ -2258,6 +2415,137 @@ impl AppDb {
         Ok(changed)
     }
 
+    fn normalize_correction_rules(&self) -> Result<u32> {
+        let context_memory = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT project_id,task_id,category,evidence_json
+                 FROM work_sessions
+                 WHERE user_confirmed=1 AND project_id IS NOT NULL AND task_id IS NOT NULL
+                 ORDER BY updated_at DESC
+                 LIMIT 2000",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut memory: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                let (project_id, task_id, category, evidence_json) = row?;
+                let key =
+                    context_assignment_key(project_id.as_deref(), task_id.as_deref(), &category);
+                let labels = memory.entry(key).or_default();
+                for item in parse_json::<Vec<EvidenceItem>>(&evidence_json) {
+                    if !matches!(item.kind.as_str(), "page" | "window") {
+                        continue;
+                    }
+                    let Some(keyword) = context_memory_keyword(&item.value) else {
+                        continue;
+                    };
+                    if !labels
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(&keyword))
+                    {
+                        labels.push(keyword);
+                    }
+                    if labels.len() >= 24 {
+                        break;
+                    }
+                }
+            }
+            memory
+        };
+
+        let rules = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id,matcher_json,project_id,task_id,category
+                 FROM attribution_rules
+                 WHERE created_from_correction=1 AND enabled=1
+                 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            collect_rows(rows)?
+        };
+
+        let mut seen = HashSet::new();
+        let mut changed = 0_u32;
+        let conn = self.conn.lock();
+        for (id, original_matcher, project_id, task_id, category) in rules {
+            let mut matcher: serde_json::Value =
+                serde_json::from_str(&original_matcher).unwrap_or_else(|_| serde_json::json!({}));
+            let mut keywords = matcher
+                .get("keywords")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .filter(|value| !is_context_memory_noise(value))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if let Some(keyword) = matcher
+                .get("keyword")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                keywords.push(keyword.to_string());
+            }
+            if task_id.is_some() {
+                if let Some(object) = matcher.as_object_mut() {
+                    object.remove("app");
+                }
+                let key =
+                    context_assignment_key(project_id.as_deref(), task_id.as_deref(), &category);
+                if let Some(remembered) = context_memory.get(&key) {
+                    keywords.extend(remembered.iter().cloned());
+                }
+            }
+            let mut normalized = HashSet::new();
+            keywords.retain(|keyword| normalized.insert(keyword.to_lowercase()));
+            keywords.sort_by_key(|keyword| keyword.to_lowercase());
+            keywords.truncate(32);
+            if let Some(object) = matcher.as_object_mut() {
+                object.remove("keyword");
+                object.insert("keywords".into(), serde_json::json!(keywords));
+            }
+            let matcher_json = matcher.to_string();
+            let identity = serde_json::to_string(&(
+                &matcher_json,
+                project_id.as_deref(),
+                task_id.as_deref(),
+                &category,
+            ))?;
+            if !seen.insert(identity) {
+                conn.execute("DELETE FROM attribution_rules WHERE id=?1", params![id])?;
+                changed += 1;
+                continue;
+            }
+            if matcher_json != original_matcher {
+                conn.execute(
+                    "UPDATE attribution_rules SET matcher_json=?1,updated_at=?2 WHERE id=?3",
+                    params![matcher_json, now(), id],
+                )?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn learn_rule_from_session(
         &self,
         id: &str,
@@ -2273,7 +2561,7 @@ impl AppDb {
         let window = session
             .evidence
             .iter()
-            .find(|item| item.kind == "window")
+            .find(|item| matches!(item.kind.as_str(), "page" | "window"))
             .map(|item| item.value.trim().to_string())
             .unwrap_or_default();
         let mut keywords = Vec::new();
@@ -2310,10 +2598,10 @@ impl AppDb {
             bail!("当前窗口没有可区分线索，请填写识别词或固定当前事务");
         }
         let mut matcher = serde_json::json!({ "keywords": keywords });
-        if !app.is_empty() {
+        if !app.is_empty() && session.task_id.is_none() {
             matcher["app"] = serde_json::Value::String(app);
         }
-        let rule = AttributionRule {
+        let mut rule = AttributionRule {
             id: Uuid::new_v4().to_string(),
             name: format!(
                 "自动学习：{}",
@@ -2328,10 +2616,32 @@ impl AppDb {
             enabled: true,
         };
         let conn = self.conn.lock();
+        let matcher_json = rule.matcher.to_string();
+        if let Some(existing_id) = conn
+            .query_row(
+                "SELECT id FROM attribution_rules
+                 WHERE created_from_correction=1 AND enabled=1
+                   AND matcher_json=?1
+                   AND COALESCE(project_id,'')=COALESCE(?2,'')
+                   AND COALESCE(task_id,'')=COALESCE(?3,'')
+                   AND category=?4
+                 LIMIT 1",
+                params![matcher_json, rule.project_id, rule.task_id, rule.category],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            conn.execute(
+                "UPDATE attribution_rules SET name=?1,priority=?2,updated_at=?3 WHERE id=?4",
+                params![rule.name, rule.priority, now(), existing_id],
+            )?;
+            rule.id = existing_id;
+            return Ok(rule);
+        }
         conn.execute(
             "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,1,1,?8)",
-            params![rule.id, rule.name, rule.priority, rule.matcher.to_string(), rule.project_id, rule.task_id, rule.category, now()],
+            params![rule.id, rule.name, rule.priority, matcher_json, rule.project_id, rule.task_id, rule.category, now()],
         )?;
         Ok(rule)
     }
@@ -2593,6 +2903,23 @@ fn within_gap_seconds(left_end: &str, right_start: &str, max_seconds: i64) -> bo
     }
 }
 
+fn context_gap_seconds(left_end: &str, right_start: &str) -> Option<i64> {
+    let left = DateTime::parse_from_rfc3339(left_end)
+        .ok()?
+        .with_timezone(&Utc);
+    let right = DateTime::parse_from_rfc3339(right_start)
+        .ok()?
+        .with_timezone(&Utc);
+    Some((right - left).num_seconds().max(0))
+}
+
+fn context_is_disconnected(left_end: &str, right_start: &str, max_seconds: i64) -> bool {
+    match context_gap_seconds(left_end, right_start) {
+        Some(gap) => gap > max_seconds,
+        None => true,
+    }
+}
+
 fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
     if left.user_confirmed
         || right.user_confirmed
@@ -2805,6 +3132,50 @@ fn custom_category_color(name: &str) -> &'static str {
     COLORS[hash % COLORS.len()]
 }
 
+fn context_assignment_key(
+    project_id: Option<&str>,
+    task_id: Option<&str>,
+    category: &str,
+) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        project_id.unwrap_or_default(),
+        task_id.unwrap_or_default(),
+        category
+    )
+}
+
+fn context_memory_keyword(value: &str) -> Option<String> {
+    let value = value.replace(['\r', '\n', '\t'], " ").trim().to_string();
+    let normalized = value.to_lowercase();
+    if value.chars().count() < 3
+        || value.chars().count() > 160
+        || is_generic_context_label(&normalized)
+        || is_transient_summary(&normalized)
+        || is_context_memory_noise(&normalized)
+    {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_context_memory_noise(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "program manager" | "task switching" | "desktop"
+    ) || [
+        "系统托盘溢出窗口",
+        "任务视图",
+        "任务切换",
+        "程序管理器",
+        "桌面",
+    ]
+    .iter()
+    .any(|label| normalized.contains(label))
+}
+
 fn is_generic_context_label(value: &str) -> bool {
     matches!(
         value.trim().trim_end_matches(".exe"),
@@ -2814,6 +3185,12 @@ fn is_generic_context_label(value: &str) -> bool {
             | "msedge"
             | "firefox"
             | "brave"
+            | "qq"
+            | "wechat"
+            | "weixin"
+            | "wps"
+            | "explorer"
+            | "screenuse"
             | "new tab"
             | "新标签页"
             | "电脑活动"
@@ -2879,6 +3256,26 @@ mod tests {
             source: "windows-foreground".into(),
             timestamp: now(),
             app: Some("ChatGPT.exe".into()),
+            window_title: Some(title.into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({ "contextStart": true }),
+        }
+    }
+
+    fn context_event(
+        id: &str,
+        app: &str,
+        title: &str,
+        timestamp: DateTime<Utc>,
+    ) -> RawActivityEvent {
+        RawActivityEvent {
+            id: id.into(),
+            source: "windows-foreground".into(),
+            timestamp: fmt(timestamp),
+            app: Some(app.into()),
             window_title: Some(title.into()),
             url: None,
             file_path: None,
@@ -3592,6 +3989,354 @@ mod tests {
         assert_eq!(second.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(second.task_id.as_deref(), Some(task.id.as_str()));
         assert_eq!(second.category, "开发");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn confirmed_task_context_follows_across_apps_but_yields_to_strong_context() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-cross-app-context-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let other_project = db
+            .create_project("ScreenUse 专项", "开发")
+            .expect("create other project");
+        let other_task = db
+            .create_task(&other_project.id, "开发与测试")
+            .expect("create other task");
+        let base = Utc::now() + Duration::minutes(5);
+
+        let first = classification::ingest_event(
+            &db,
+            &context_event("context-anchor", "chrome.exe", "教务系统", base),
+        )
+        .expect("ingest anchor")
+        .expect("anchor session");
+        db.update_session(
+            &first.id,
+            SessionPatch {
+                summary: Some("预推免成果填报".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct anchor");
+
+        let qq = classification::ingest_event(
+            &db,
+            &context_event("context-qq", "QQ.exe", "QQ", base + Duration::seconds(10)),
+        )
+        .expect("ingest qq")
+        .expect("qq session");
+        assert_eq!(qq.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(qq.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(qq.category, category.name);
+
+        let wps = classification::ingest_event(
+            &db,
+            &context_event(
+                "context-wps",
+                "wps.exe",
+                "证明材料.pdf",
+                base + Duration::seconds(20),
+            ),
+        )
+        .expect("ingest wps")
+        .expect("wps session");
+        assert_eq!(wps.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(wps.task_id.as_deref(), Some(task.id.as_str()));
+
+        let strong = classification::ingest_event(
+            &db,
+            &context_event(
+                "context-strong",
+                "ChatGPT.exe",
+                "ScreenUse 专项",
+                base + Duration::seconds(30),
+            ),
+        )
+        .expect("ingest strong context")
+        .expect("strong session");
+        assert_eq!(
+            strong.project_id.as_deref(),
+            Some(other_project.id.as_str())
+        );
+        assert_eq!(strong.task_id.as_deref(), Some(other_task.id.as_str()));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn one_manual_correction_repairs_adjacent_weak_sessions_until_idle() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-context-propagation-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let base = Utc::now() + Duration::minutes(10);
+        let first = classification::ingest_event(
+            &db,
+            &context_event("repair-explorer", "explorer.exe", "材料", base),
+        )
+        .expect("ingest explorer")
+        .expect("explorer session");
+        let anchor = classification::ingest_event(
+            &db,
+            &context_event(
+                "repair-chrome",
+                "chrome.exe",
+                "教务系统",
+                base + Duration::seconds(10),
+            ),
+        )
+        .expect("ingest chrome")
+        .expect("chrome session");
+        let third = classification::ingest_event(
+            &db,
+            &context_event("repair-qq", "QQ.exe", "QQ", base + Duration::seconds(20)),
+        )
+        .expect("ingest qq")
+        .expect("qq session");
+        let wrong_project = db
+            .create_project("日常沟通", "沟通")
+            .expect("create wrong project");
+        let wrong_task = db
+            .create_task(&wrong_project.id, "QQ")
+            .expect("create wrong task");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions
+                 SET project_id=?1,task_id=?2,category='沟通',confidence=0.88,source='context-complete'
+                 WHERE id=?3",
+                params![wrong_project.id, wrong_task.id, third.id],
+            )
+            .expect("assign weak wrong task");
+        let mut idle_event =
+            context_event("repair-idle", "QQ.exe", "QQ", base + Duration::seconds(30));
+        idle_event.input_stats.idle_seconds = 180;
+        classification::ingest_event(&db, &idle_event).expect("ingest idle");
+        let after_idle = classification::ingest_event(
+            &db,
+            &context_event(
+                "repair-after-idle",
+                "QQ.exe",
+                "QQ",
+                base + Duration::seconds(40),
+            ),
+        )
+        .expect("ingest after idle")
+        .expect("after idle session");
+
+        db.update_session(
+            &anchor.id,
+            SessionPatch {
+                summary: Some("预推免成果填报".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct anchor");
+        let changed = db
+            .propagate_context_from_sessions(&[anchor.id])
+            .expect("propagate correction");
+        assert_eq!(changed, 2);
+        for id in [&first.id, &third.id] {
+            let repaired = db.get_session(id).expect("load repaired").expect("session");
+            assert_eq!(repaired.project_id.as_deref(), Some(project.id.as_str()));
+            assert_eq!(repaired.task_id.as_deref(), Some(task.id.as_str()));
+            assert!(!repaired.user_confirmed);
+        }
+        let untouched = db
+            .get_session(&after_idle.id)
+            .expect("load after idle")
+            .expect("after idle");
+        assert_ne!(untouched.task_id.as_deref(), Some(task.id.as_str()));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn learned_task_rule_uses_page_title_across_apps_and_is_upserted() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-cross-app-rule-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let base = Utc::now() + Duration::minutes(15);
+        let mut first_event = context_event(
+            "rule-page",
+            "chrome.exe",
+            "湖北大学楚才学院 - Google Chrome",
+            base,
+        );
+        first_event.metadata["activePageTitle"] =
+            serde_json::Value::String("预推免成果填报".into());
+        let first = classification::ingest_event(&db, &first_event)
+            .expect("ingest page")
+            .expect("page session");
+        db.update_session(
+            &first.id,
+            SessionPatch {
+                summary: Some("预推免成果填报".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct page");
+        let learned = db
+            .learn_rule_from_session(&first.id, Some("成果填报,预推免"))
+            .expect("learn rule");
+        let learned_again = db
+            .learn_rule_from_session(&first.id, Some("成果填报,预推免"))
+            .expect("upsert rule");
+        assert_eq!(learned.id, learned_again.id);
+        assert!(learned.matcher.get("app").is_none());
+        assert!(learned
+            .matcher
+            .get("keywords")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|keywords| keywords.iter().any(|value| value == "预推免成果填报")));
+
+        let wps = classification::ingest_event(
+            &db,
+            &context_event(
+                "rule-wps",
+                "wps.exe",
+                "成果填报证明材料.pdf",
+                base + Duration::minutes(10),
+            ),
+        )
+        .expect("ingest cross app rule")
+        .expect("wps session");
+        assert_eq!(wps.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(wps.task_id.as_deref(), Some(task.id.as_str()));
+        let count = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM attribution_rules WHERE project_id=?1 AND task_id=?2 AND created_from_correction=1",
+                params![project.id, task.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count rules");
+        assert_eq!(count, 1);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn correction_rule_normalization_merges_app_duplicates_and_keeps_page_memory() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-rule-normalization-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        assert!(context_memory_keyword("Program Manager").is_none());
+        assert!(context_memory_keyword("任务切换").is_none());
+        let base = Utc::now() + Duration::minutes(20);
+        let pages = [
+            ("memory-chrome", "chrome.exe", "湖北大学推免填报系统"),
+            ("memory-wps", "wps.exe", "推免成果证明材料.pdf"),
+        ];
+        for (offset, (id, app, page)) in pages.iter().enumerate() {
+            let mut event =
+                context_event(id, app, page, base + Duration::seconds(offset as i64 * 60));
+            event.metadata["activePageTitle"] = serde_json::Value::String((*page).into());
+            let session = classification::ingest_event(&db, &event)
+                .expect("ingest memory page")
+                .expect("memory session");
+            db.update_session(
+                &session.id,
+                SessionPatch {
+                    summary: Some("预推免成果填报".into()),
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some(category.name.clone()),
+                    confidence: Some(0.98),
+                    user_confirmed: Some(true),
+                },
+            )
+            .expect("correct memory page");
+            db.learn_rule_from_session(&session.id, Some("成果填报,预推免"))
+                .expect("learn memory rule");
+        }
+        let before = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM attribution_rules WHERE project_id=?1 AND task_id=?2 AND created_from_correction=1",
+                params![project.id, task.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count rules before normalization");
+        assert_eq!(before, 2);
+        assert!(db.normalize_correction_rules().expect("normalize rules") >= 2);
+        let conn = db.conn.lock();
+        let (after, matcher_json) = conn
+            .query_row(
+                "SELECT COUNT(*),MAX(matcher_json) FROM attribution_rules WHERE project_id=?1 AND task_id=?2 AND created_from_correction=1",
+                params![project.id, task.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("load normalized rule");
+        assert_eq!(after, 1);
+        let matcher: serde_json::Value =
+            serde_json::from_str(&matcher_json).expect("parse normalized matcher");
+        assert!(matcher.get("app").is_none());
+        let keywords = matcher
+            .get("keywords")
+            .and_then(serde_json::Value::as_array)
+            .expect("normalized keywords");
+        assert!(pages
+            .iter()
+            .all(|(_, _, page)| keywords.iter().any(|value| value == page)));
+        drop(conn);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

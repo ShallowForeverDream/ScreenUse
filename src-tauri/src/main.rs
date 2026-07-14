@@ -78,7 +78,15 @@ fn update_sessions(
     ids: Vec<String>,
     patch: SessionPatch,
 ) -> Result<Vec<models::WorkSession>, String> {
-    state.db.update_sessions(&ids, patch).map_err(map_err)
+    let follow_context = patch.user_confirmed == Some(true);
+    let updated = state.db.update_sessions(&ids, patch).map_err(map_err)?;
+    if follow_context {
+        state
+            .db
+            .propagate_context_from_sessions(&ids)
+            .map_err(map_err)?;
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
