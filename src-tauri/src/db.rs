@@ -751,17 +751,14 @@ impl AppDb {
         let name: String = name.chars().take(80).collect();
         let category = category.trim();
         let conn = self.conn.lock();
-        let category_exists = conn
+        let category_color = conn
             .query_row(
-                "SELECT 1 FROM activity_categories WHERE name=?1 LIMIT 1",
+                "SELECT color FROM activity_categories WHERE name=?1 LIMIT 1",
                 params![category],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
-            .is_some();
-        if !category_exists {
-            bail!("不支持的项目分类：{category}");
-        }
+            .with_context(|| format!("不支持的项目分类：{category}"))?;
         let duplicate = conn
             .query_row(
                 "SELECT 1 FROM projects WHERE name=?1 AND category=?2 LIMIT 1",
@@ -780,7 +777,7 @@ impl AppDb {
             name,
             category: category.to_string(),
             source: "manual".into(),
-            color: color_for_category(category).into(),
+            color: category_color,
             description: Some("在修正归类时手动创建".into()),
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -798,6 +795,94 @@ impl AppDb {
                 project.updated_at,
             ],
         )?;
+        Ok(project)
+    }
+
+    pub fn update_project(&self, id: &str, name: &str, category: &str) -> Result<Project> {
+        let name = name.trim().replace(['\r', '\n', '\t'], " ");
+        if name.is_empty() {
+            bail!("项目名称不能为空");
+        }
+        let name: String = name.chars().take(80).collect();
+        let category = category.trim();
+        let mut settings = self.get_settings()?.normalized();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut project = tx
+            .query_row(
+                "SELECT id,name,category,source,color,description,created_at,updated_at FROM projects WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        category: row.get(2)?,
+                        source: row.get(3)?,
+                        color: row.get(4)?,
+                        description: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?
+            .context("项目不存在或已经删除")?;
+        let category_color = tx
+            .query_row(
+                "SELECT color FROM activity_categories WHERE name=?1 LIMIT 1",
+                params![category],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("不支持的项目分类：{category}"))?;
+        let duplicate = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE name=?1 AND category=?2 AND id<>?3 LIMIT 1",
+                params![name, category, id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            bail!("该分类下已有同名项目");
+        }
+
+        let updates_idle_target = settings.idle_project_name == project.name
+            && settings.idle_category == project.category;
+        let changed_at = now();
+        tx.execute(
+            "UPDATE projects SET name=?1,category=?2,color=?3,updated_at=?4 WHERE id=?5",
+            params![name, category, category_color, changed_at, id],
+        )?;
+        tx.execute(
+            "UPDATE work_sessions
+             SET category=?1,updated_at=?2
+             WHERE project_id=?3
+                OR task_id IN (SELECT id FROM tasks WHERE project_id=?3)",
+            params![category, changed_at, id],
+        )?;
+        tx.execute(
+            "UPDATE attribution_rules
+             SET category=?1,updated_at=?2
+             WHERE project_id=?3
+                OR task_id IN (SELECT id FROM tasks WHERE project_id=?3)",
+            params![category, changed_at, id],
+        )?;
+        if updates_idle_target {
+            settings.idle_project_name = name.clone();
+            settings.idle_category = category.to_string();
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES('app_settings',?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![serde_json::to_string(&settings)?, changed_at],
+            )?;
+        }
+        tx.commit()?;
+
+        project.name = name;
+        project.category = category.to_string();
+        project.color = category_color;
+        project.updated_at = changed_at;
         Ok(project)
     }
 
@@ -3841,6 +3926,78 @@ mod tests {
             .iter()
             .any(|item| item.id == project.id));
 
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn updating_a_project_renames_it_and_moves_related_assignments() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-update-project-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("旧项目", "杂务")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let session_id = db.list_sessions(1).expect("list sessions")[0].id.clone();
+        db.update_session(
+            &session_id,
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: None,
+                confidence: None,
+                user_confirmed: None,
+            },
+        )
+        .expect("assign session");
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES('move-project-rule','成果填报',100,'{}',?1,?2,'杂务',1,1,?3)",
+                params![project.id, task.id, now()],
+            )
+            .expect("insert rule");
+
+        let updated = db
+            .update_project(&project.id, "预推免", &category.name)
+            .expect("update project");
+        assert_eq!(updated.name, "预推免");
+        assert_eq!(updated.category, "保研");
+        assert_eq!(updated.color, category.color);
+        let session = db
+            .get_session(&session_id)
+            .expect("load session")
+            .expect("session remains");
+        assert_eq!(session.project_name.as_deref(), Some("预推免"));
+        assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(session.category, "保研");
+        let rule_category: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT category FROM attribution_rules WHERE id='move-project-rule'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load rule");
+        assert_eq!(rule_category, "保研");
+
+        db.create_project("重复项目", "保研")
+            .expect("create duplicate target");
+        assert!(db
+            .update_project(&project.id, "重复项目", "保研")
+            .is_err());
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

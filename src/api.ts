@@ -59,6 +59,17 @@ export const api = {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }),
+  updateProject: (id: string, name: string, category: string) =>
+    call<Project>('update_project', { id, name, category }, {
+      id,
+      name,
+      category,
+      source: 'manual',
+      color: '#a78bfa',
+      description: '在项目账本中修改',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }),
   deleteProject: async (id: string) => {
     if (!isTauri()) return;
     await call<void>('delete_project', { id });

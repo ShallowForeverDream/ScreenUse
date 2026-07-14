@@ -303,6 +303,100 @@ function RenameCategoryDialog({
   );
 }
 
+function EditProjectDialog({
+  project,
+  categoryOptions,
+  busy,
+  onCancel,
+  onSave,
+}: {
+  project: Project;
+  categoryOptions: CategoryOption[];
+  busy: boolean;
+  onCancel: () => void;
+  onSave: (name: string, category: string) => void;
+}) {
+  const [name, setName] = useState(project.name);
+  const [category, setCategory] = useState(project.category);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const normalizedName = name.trim();
+  const valid = Boolean(normalizedName)
+    && (normalizedName !== project.name || category !== project.category);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || busy) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [busy, onCancel]);
+
+  return createPortal(
+    <div
+      className="confirm-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (!busy) onCancel();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="edit-project-title"
+        aria-modal="true"
+        className="confirm-dialog project-edit-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-dialog-icon rename"><FolderKanban size={19} /></div>
+        <div>
+          <h2 id="edit-project-title">编辑项目</h2>
+          <p>改名或移动到其他分类，已有任务和时间段会一起保留。</p>
+        </div>
+        <div className="project-edit-fields">
+          <label>
+            <span>项目名称</span>
+            <input
+              disabled={busy}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && valid && !busy) {
+                  event.preventDefault();
+                  onSave(normalizedName, category);
+                }
+              }}
+              ref={inputRef}
+              value={name}
+            />
+          </label>
+          <label>
+            <span>所属分类</span>
+            <select
+              aria-label="项目所属分类"
+              disabled={busy}
+              onChange={(event) => setCategory(event.target.value)}
+              value={category}
+            >
+              {categoryOptions.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="confirm-dialog-actions">
+          <button className="confirm-cancel" disabled={busy} onClick={onCancel} type="button">取消</button>
+          <button className="primary" disabled={!valid || busy} onClick={() => onSave(normalizedName, category)} type="button">
+            {busy ? '保存中…' : '保存修改'}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function TextInputDialog({
   title,
   detail,
@@ -1956,12 +2050,13 @@ function ProjectsView({
   const [name, setName] = useState('');
   const [category, setCategory] = useState('开发');
   const [busyProjectId, setBusyProjectId] = useState('');
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [busyTaskId, setBusyTaskId] = useState('');
   const [query, setQuery] = useState('');
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
   const [sessionDetail, setSessionDetail] = useState<
-    { kind: 'project' | 'task'; id: string } | null
+    { kind: 'project' | 'task' | 'unassigned'; id: string } | null
   >(null);
   const confirmation = useConfirmation();
   const rows = projectBreakdown(sessions, selectedDate);
@@ -1974,18 +2069,44 @@ function ProjectsView({
     project.description,
     ...(tasksByProject.get(project.id) || []).map((task) => task.title),
   ].filter(Boolean).join(' ')).includes(needle));
+  const categoryOrder = new Map(categoryOptions.map((item, index) => [item.name, index]));
+  const projectGroups = [...groupBy(visibleProjects, (project) => project.category).entries()]
+    .map(([groupCategory, groupProjects]) => ({
+      category: groupCategory,
+      color: categoryOptions.find((item) => item.name === groupCategory)?.color
+        || categoryColor(groupCategory),
+      projects: groupProjects,
+      minutes: groupProjects.reduce(
+        (sum, project) => sum + (minutesByProject.get(project.id) || 0),
+        0,
+      ),
+    }))
+    .sort((left, right) => (
+      (categoryOrder.get(left.category) ?? Number.MAX_SAFE_INTEGER)
+      - (categoryOrder.get(right.category) ?? Number.MAX_SAFE_INTEGER)
+      || left.category.localeCompare(right.category, 'zh-CN')
+    ));
   const selectedProject = projects.find((project) => project.id === selectedProjectId) || visibleProjects[0] || projects[0];
   const selectedTasks = selectedProject ? tasksByProject.get(selectedProject.id) || [] : [];
+  const unassignedSessions = selectedProject
+    ? sessions.filter((session) => session.projectId === selectedProject.id && !session.taskId)
+    : [];
+  const unassignedMinutes = unassignedSessions.reduce(
+    (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
+    0,
+  );
   const detailTask = sessionDetail?.kind === 'task'
     ? tasks.find((task) => task.id === sessionDetail.id)
     : undefined;
-  const detailProject = sessionDetail?.kind === 'project'
+  const detailProject = sessionDetail?.kind === 'project' || sessionDetail?.kind === 'unassigned'
     ? projects.find((project) => project.id === sessionDetail.id)
     : detailTask
       ? projects.find((project) => project.id === detailTask.projectId)
       : undefined;
   const detailSessions = sessionDetail?.kind === 'task'
     ? sessions.filter((session) => session.taskId === sessionDetail.id)
+    : sessionDetail?.kind === 'unassigned'
+      ? sessions.filter((session) => session.projectId === sessionDetail.id && !session.taskId)
     : sessionDetail?.kind === 'project'
       ? sessions.filter((session) => session.projectId === sessionDetail.id)
       : [];
@@ -2009,6 +2130,19 @@ function ProjectsView({
     await runAction(() => api.createProject(projectName, category), `项目“${projectName}”已创建`);
     setName('');
     setCreating(false);
+  };
+
+  const saveProject = async (project: Project, projectName: string, projectCategory: string) => {
+    setBusyProjectId(project.id);
+    try {
+      await runAction(
+        () => api.updateProject(project.id, projectName, projectCategory),
+        `项目“${projectName}”已更新`,
+      );
+      setEditingProject(null);
+    } finally {
+      setBusyProjectId('');
+    }
   };
 
   const deleteProject = async (project: Project) => {
@@ -2088,39 +2222,62 @@ function ProjectsView({
             </button>
           </div>
         )}
-        <div className="project-grid">
-          {visibleProjects.map((project) => {
-            const minutes = minutesByProject.get(project.id) || 0;
-            return (
-              <article
-                className={`project-card ${selectedProject?.id === project.id ? 'active' : ''}`}
-                key={project.id}
-                style={{ '--project-color': project.color || categoryColor(project.category) } as CSSProperties}
-              >
-                <div className="project-card-head">
-                  <span>{project.category}</span>
-                  <div>
-                    <b>{formatDuration(minutes)}</b>
-                    <button
-                      className="project-delete"
-                      disabled={busyProjectId === project.id}
-                      onClick={() => void deleteProject(project)}
-                      type="button"
-                      aria-label={`删除项目 ${project.name}`}
-                      title="删除项目"
+        <div className="project-category-groups">
+          {projectGroups.map((group) => (
+            <section className="project-category-group" key={group.category}>
+              <header>
+                <span className="project-category-name">
+                  <i style={{ background: group.color }} />
+                  <strong>{group.category}</strong>
+                </span>
+                <small>{group.projects.length} 个项目 · {formatDuration(group.minutes)}</small>
+              </header>
+              <div className="project-grid">
+                {group.projects.map((project) => {
+                  const minutes = minutesByProject.get(project.id) || 0;
+                  return (
+                    <article
+                      className={`project-card ${selectedProject?.id === project.id ? 'active' : ''}`}
+                      key={project.id}
+                      style={{ '--project-color': project.color || group.color } as CSSProperties}
                     >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-                <button className="project-card-main" onClick={() => setSelectedProjectId(project.id)} type="button">
-                  <span><strong>{project.name}</strong><small>{(tasksByProject.get(project.id) || []).length} 个任务</small></span>
-                  <ChevronRight size={16} />
-                </button>
-                <div className="project-progress"><span style={{ width: `${Math.min(100, Math.max(4, (minutes / Math.max(1, rows[0]?.minutes || 1)) * 100))}%` }} /></div>
-              </article>
-            );
-          })}
+                      <button className="project-card-main" onClick={() => setSelectedProjectId(project.id)} type="button">
+                        <span><strong>{project.name}</strong><small>{project.description || '个人项目'}</small></span>
+                        <ChevronRight size={16} />
+                      </button>
+                      <div className="project-card-head">
+                        <span>{(tasksByProject.get(project.id) || []).length} 个任务</span>
+                        <div>
+                          <b>{formatDuration(minutes)}</b>
+                          <button
+                            className="project-edit"
+                            disabled={busyProjectId === project.id}
+                            onClick={() => setEditingProject(project)}
+                            type="button"
+                            aria-label={`编辑项目 ${project.name}`}
+                            title="改名或更换分类"
+                          >
+                            <Pencil size={13} />
+                          </button>
+                          <button
+                            className="project-delete"
+                            disabled={busyProjectId === project.id}
+                            onClick={() => void deleteProject(project)}
+                            type="button"
+                            aria-label={`删除项目 ${project.name}`}
+                            title="删除项目"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="project-progress"><span style={{ width: `${Math.min(100, Math.max(4, (minutes / Math.max(1, rows[0]?.minutes || 1)) * 100))}%` }} /></div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
           {!visibleProjects.length && (
             <EmptyState title={projects.length ? '没有匹配项目' : '还没有项目'} detail={projects.length ? '换个项目名、分类或任务名试试。' : '打开一个代码工作区或修正一条会话即可自动建立。'} />
           )}
@@ -2132,12 +2289,21 @@ function ProjectsView({
           title={selectedProject?.name || '项目任务'}
           subtitle={selectedProject ? `${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
           action={selectedProject ? (
-            <button
-              onClick={() => setSessionDetail({ kind: 'project', id: selectedProject.id })}
-              type="button"
-            >
-              <Clock3 size={14} />时间段
-            </button>
+            <div className="project-detail-actions">
+              <button
+                onClick={() => setEditingProject(selectedProject)}
+                type="button"
+                title="改名或更换分类"
+              >
+                <Pencil size={14} />编辑
+              </button>
+              <button
+                onClick={() => setSessionDetail({ kind: 'project', id: selectedProject.id })}
+                type="button"
+              >
+                <Clock3 size={14} />时间段
+              </button>
+            </div>
           ) : undefined}
         />
         {selectedProject && (
@@ -2159,6 +2325,21 @@ function ProjectsView({
         <div className="task-list">
           {selectedProject && (
             <div className="task-group" key={selectedProject.id}>
+              {unassignedSessions.length > 0 && (
+                <button
+                  className="unassigned-task-card"
+                  onClick={() => setSessionDetail({ kind: 'unassigned', id: selectedProject.id })}
+                  type="button"
+                >
+                  <span className="unassigned-task-icon"><TimerReset size={16} /></span>
+                  <span>
+                    <strong>未归属任务</strong>
+                    <small>{unassignedSessions.length} 个时间段</small>
+                  </span>
+                  <b>{formatDuration(unassignedMinutes)}</b>
+                  <ChevronRight size={15} />
+                </button>
+              )}
               {selectedTasks.map((task) => (
                 <div className="task-row" key={task.id}>
                   <button
@@ -2181,16 +2362,31 @@ function ProjectsView({
                   </button>
                 </div>
               ))}
-              {!selectedTasks.length && <EmptyState title="还没有任务" detail="直接在上方输入任务名并按 Enter。" />}
+              {!selectedTasks.length && !unassignedSessions.length && <EmptyState title="还没有任务" detail="直接在上方输入任务名并按 Enter。" />}
             </div>
           )}
           {!selectedProject && <EmptyState title="还没有项目" detail="创建项目后即可添加任务。" />}
         </div>
       </section>
       {confirmation.dialog}
+      {editingProject && (
+        <EditProjectDialog
+          project={editingProject}
+          categoryOptions={categoryOptions}
+          busy={busyProjectId === editingProject.id}
+          onCancel={() => setEditingProject(null)}
+          onSave={(projectName, projectCategory) => {
+            void saveProject(editingProject, projectName, projectCategory);
+          }}
+        />
+      )}
       {sessionDetail && detailProject && (
         <CategoryDetailModal
-          category={detailTask ? detailTask.title : detailProject.name}
+          category={detailTask
+            ? detailTask.title
+            : sessionDetail.kind === 'unassigned'
+              ? '未归属任务'
+              : detailProject.name}
           sessions={detailSessions}
           selectedDate={selectedDate}
           onClose={() => setSessionDetail(null)}

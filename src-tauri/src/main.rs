@@ -99,6 +99,19 @@ fn create_project(
 }
 
 #[tauri::command]
+fn update_project(
+    state: State<AppState>,
+    id: String,
+    name: String,
+    category: String,
+) -> Result<models::Project, String> {
+    state
+        .db
+        .update_project(&id, &name, &category)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 fn delete_project(state: State<AppState>, id: String) -> Result<(), String> {
     state.db.delete_project(&id).map_err(map_err)
 }
@@ -475,6 +488,7 @@ fn main() {
             update_session,
             update_sessions,
             create_project,
+            update_project,
             delete_project,
             create_category,
             rename_category,
