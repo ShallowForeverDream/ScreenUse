@@ -1,6 +1,8 @@
 use crate::ai::{AiAttributionResult, OpenAiCompatibleClient};
 use crate::db::AppDb;
-use crate::models::{AnalysisJob, EvidenceItem, RawActivityEvent, TimeRange};
+use crate::models::{
+    AnalysisJob, AttributionSessionInput, EvidenceItem, RawActivityEvent, TimeRange,
+};
 use crate::secrets;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -128,16 +130,16 @@ fn persist_result(
     };
     let mut evidence = result.evidence;
     evidence.extend(metadata_evidence(events));
-    db.materialize_attribution_session(
-        &job.metadata_range,
+    db.materialize_attribution_session(AttributionSessionInput {
+        range: job.metadata_range.clone(),
         project_id,
         task_id,
-        result.category,
-        result.summary,
-        result.confidence,
+        category: result.category,
+        summary: result.summary,
+        confidence: result.confidence,
         evidence,
-        "ai-review",
-    )?;
+        source: "ai-review".into(),
+    })?;
     db.mark_analysis_job_status(&job.id, "completed", None, None)?;
     Ok(())
 }

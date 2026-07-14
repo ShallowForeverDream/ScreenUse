@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 
 use std::fs;
@@ -14,9 +14,37 @@ use uuid::Uuid;
 const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 
+struct AttributionDecision {
+    project_id: Option<String>,
+    task_id: Option<String>,
+    category: String,
+    summary: String,
+    confidence: f32,
+}
+
+struct LastSessionAttribution {
+    id: String,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    summary: String,
+    category: String,
+    user_confirmed: bool,
+    source: String,
+}
+
+struct SeedSession<'a> {
+    id: &'a str,
+    project_id: &'a str,
+    task_id: &'a str,
+    category: &'a str,
+    summary: &'a str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    confidence: f32,
+}
+
 pub struct AppDb {
     pub(crate) conn: Mutex<Connection>,
-    db_path: PathBuf,
     data_dir: PathBuf,
 }
 
@@ -36,7 +64,6 @@ impl AppDb {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Mutex::new(conn),
-            db_path,
             data_dir,
         };
         db.migrate()?;
@@ -44,6 +71,7 @@ impl AppDb {
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
         db.configure_idle_target(&settings)?;
+        db.repair_session_timeline()?;
         db.compact_sessions()?;
         Ok(db)
     }
@@ -192,7 +220,11 @@ impl AppDb {
               PRIMARY KEY(entity_kind, entity_id)
             );
             CREATE INDEX IF NOT EXISTS idx_work_sessions_time ON work_sessions(started_at, ended_at);
+            CREATE INDEX IF NOT EXISTS idx_work_sessions_project_time ON work_sessions(project_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_work_sessions_task_time ON work_sessions(task_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_work_sessions_review ON work_sessions(user_confirmed, confidence, started_at);
             CREATE INDEX IF NOT EXISTS idx_raw_events_time ON raw_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_raw_events_source_time ON raw_events(source, timestamp);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs(status);
         "#)?;
         ensure_column(
@@ -262,39 +294,36 @@ impl AppDb {
         let s2 = Uuid::new_v4().to_string();
         let s3 = Uuid::new_v4().to_string();
         let base = Utc::now() - Duration::hours(4);
-        insert_seed_session(
-            &conn,
-            &s1,
-            &p1,
-            &t1,
-            "开发",
-            "搭建 ScreenUse v1 项目骨架",
-            base,
-            base + Duration::minutes(75),
-            0.86,
-        )?;
-        insert_seed_session(
-            &conn,
-            &s2,
-            &p2,
-            &t2,
-            "学习",
-            "阅读竞品与时间追踪资料",
-            base + Duration::minutes(90),
-            base + Duration::minutes(145),
-            0.79,
-        )?;
-        insert_seed_session(
-            &conn,
-            &s3,
-            &p1,
-            &t1,
-            "开发",
-            "设计 AI 队列与失败重试策略",
-            base + Duration::minutes(165),
-            base + Duration::minutes(220),
-            0.82,
-        )?;
+        insert_seed_session(&conn, SeedSession {
+            id: &s1,
+            project_id: &p1,
+            task_id: &t1,
+            category: "开发",
+            summary: "搭建 ScreenUse v1 项目骨架",
+            start: base,
+            end: base + Duration::minutes(75),
+            confidence: 0.86,
+        })?;
+        insert_seed_session(&conn, SeedSession {
+            id: &s2,
+            project_id: &p2,
+            task_id: &t2,
+            category: "学习",
+            summary: "阅读竞品与时间追踪资料",
+            start: base + Duration::minutes(90),
+            end: base + Duration::minutes(145),
+            confidence: 0.79,
+        })?;
+        insert_seed_session(&conn, SeedSession {
+            id: &s3,
+            project_id: &p1,
+            task_id: &t1,
+            category: "开发",
+            summary: "设计 AI 队列与失败重试策略",
+            start: base + Duration::minutes(165),
+            end: base + Duration::minutes(220),
+            confidence: 0.82,
+        })?;
         Ok(())
     }
 
@@ -967,31 +996,112 @@ impl AppDb {
 
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
+        let project_was_explicit = patch.project_id.is_some();
+        let task_was_explicit = patch.task_id.is_some();
+        let category_was_explicit = patch.category.is_some();
+        let classification_edited = patch.summary.is_some()
+            || project_was_explicit
+            || task_was_explicit
+            || patch.clear_project.unwrap_or(false)
+            || patch.clear_task.unwrap_or(false)
+            || category_was_explicit;
         let clear_project = patch.clear_project.unwrap_or(false);
         let clear_task = patch.clear_task.unwrap_or(false) || clear_project;
-        let project_id = if clear_project {
+        let mut project_id = if clear_project {
             None
         } else {
-            patch.project_id.or(current.project_id.clone())
+            patch.project_id.clone().or(current.project_id.clone())
         };
         let project_changed = project_id != current.project_id;
-        let task_id = if clear_task {
+        let mut task_id = if clear_task {
             None
-        } else if patch.task_id.is_some() {
-            patch.task_id
+        } else if task_was_explicit {
+            patch.task_id.clone()
         } else if project_changed {
             None
         } else {
-            current.task_id
+            current.task_id.clone()
         };
-        let summary = patch.summary.unwrap_or(current.summary);
-        let category = patch.category.unwrap_or(current.category);
+        let summary = match patch.summary {
+            Some(value) => {
+                let value = clean_name(&value, "");
+                if value.is_empty() {
+                    bail!("会话摘要不能为空");
+                }
+                value.chars().take(160).collect()
+            }
+            None => current.summary.clone(),
+        };
+        let mut category = patch
+            .category
+            .as_deref()
+            .map(|value| clean_name(value, ""))
+            .unwrap_or_else(|| current.category.clone());
+        if category.is_empty() {
+            bail!("分类不能为空");
+        }
         let confidence = patch.confidence.unwrap_or(current.confidence);
+        if !confidence.is_finite() {
+            bail!("置信度必须是有效数字");
+        }
+        let confidence = confidence.clamp(0.0, 1.0);
         let confirmed = patch.user_confirmed.unwrap_or(true);
         let conn = self.conn.lock();
+
+        // A direct category change means the old project/task no longer applies
+        // unless the caller explicitly selected a replacement in the same patch.
+        if category_was_explicit
+            && !project_was_explicit
+            && !task_was_explicit
+            && category != current.category
+        {
+            project_id = None;
+            task_id = None;
+        }
+
+        // Keep category -> project -> task as one canonical hierarchy. Selecting
+        // a task is the strongest signal, followed by an explicitly selected project.
+        if let Some(selected_task_id) = task_id.as_deref() {
+            let assignment = conn
+                .query_row(
+                    "SELECT t.project_id,p.category FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1",
+                    params![selected_task_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .context("任务不存在或已经删除")?;
+            project_id = Some(assignment.0);
+            category = assignment.1;
+        } else if let Some(selected_project_id) = project_id.as_deref() {
+            let project_category = conn
+                .query_row(
+                    "SELECT category FROM projects WHERE id=?1",
+                    params![selected_project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .context("项目不存在或已经删除")?;
+            if category_was_explicit && !project_was_explicit && category != project_category {
+                project_id = None;
+            } else {
+                category = project_category;
+            }
+        }
+
+        let category_exists = conn
+            .query_row(
+                "SELECT 1 FROM activity_categories WHERE name=?1 LIMIT 1",
+                params![category],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !category_exists {
+            bail!("分类不存在或已经删除：{category}");
+        }
         conn.execute(
-            "UPDATE work_sessions SET project_id=?1, task_id=?2, summary=?3, category=?4, confidence=?5, user_confirmed=?6, updated_at=?7 WHERE id=?8",
-            params![project_id, task_id, summary, category, confidence, if confirmed {1} else {0}, now(), id],
+            "UPDATE work_sessions SET project_id=?1, task_id=?2, summary=?3, category=?4, confidence=?5, user_confirmed=?6, source=CASE WHEN ?7 THEN 'manual-correction' ELSE source END, updated_at=?8 WHERE id=?9",
+            params![project_id, task_id, summary, category, confidence, if confirmed {1} else {0}, classification_edited, now(), id],
         )?;
         drop(conn);
         self.get_session(id)?
@@ -1005,8 +1115,19 @@ impl AppDb {
         if ids.len() > 500 {
             bail!("单次最多修正 500 条会话");
         }
-        let mut updated = Vec::with_capacity(ids.len());
+        let mut unique_ids = Vec::with_capacity(ids.len());
         for id in ids {
+            if !unique_ids.contains(id) {
+                unique_ids.push(id.clone());
+            }
+        }
+        for id in &unique_ids {
+            if self.get_session(id)?.is_none() {
+                bail!("会话不存在或已经删除：{id}");
+            }
+        }
+        let mut updated = Vec::with_capacity(unique_ids.len());
+        for id in &unique_ids {
             updated.push(self.update_session(id, patch.clone())?);
         }
         Ok(updated)
@@ -1144,26 +1265,30 @@ impl AppDb {
         anchor: &WorkSession,
         following: &[WorkSession],
     ) -> Result<WorkSession> {
-        let Some(last) = following.last() else {
+        if following.is_empty() {
             return Ok(anchor.clone());
-        };
+        }
         let mut summary = anchor.summary.clone();
         let mut evidence = anchor.evidence.clone();
         let mut confidence = anchor.confidence;
+        let mut merged_end = anchor.ended_at.clone();
         for session in following {
             summary = preferred_coalesced_summary(&summary, &session.summary);
             evidence = merge_evidence(&evidence, &session.evidence);
             confidence = confidence.max(session.confidence);
+            if timestamp_is_after(&session.ended_at, &merged_end) {
+                merged_end = session.ended_at.clone();
+            }
         }
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE work_sessions SET ended_at=?1,summary=?2,confidence=?3,evidence_json=?4,updated_at=?5 WHERE id=?6",
-            params![last.ended_at, summary, confidence, serde_json::to_string(&evidence)?, now(), anchor.id],
+            params![merged_end, summary, confidence, serde_json::to_string(&evidence)?, now(), anchor.id],
         )?;
         conn.execute(
             "UPDATE activities SET ended_at=?1,summary=?2,evidence_json=?3 WHERE session_id=?4",
             params![
-                last.ended_at,
+                merged_end,
                 summary,
                 serde_json::to_string(&evidence)?,
                 anchor.id
@@ -1211,68 +1336,157 @@ impl AppDb {
     }
 
     pub fn merge_sessions(&self, ids: &[String], summary: Option<String>) -> Result<WorkSession> {
-        anyhow::ensure!(!ids.is_empty(), "no session ids provided");
-        let conn = self.conn.lock();
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT MIN(started_at), MAX(ended_at), project_id, task_id, category, GROUP_CONCAT(summary, ' / '), AVG(confidence), GROUP_CONCAT(evidence_json, '||') FROM work_sessions WHERE id IN ({})", placeholders);
-        let row = {
-            let mut stmt = conn.prepare(&sql)?;
-            stmt.query_row(rusqlite::params_from_iter(ids), |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, f32>(6)?,
-                    r.get::<_, String>(7)?,
-                ))
-            })?
+        let mut unique_ids = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique_ids.contains(id) {
+                unique_ids.push(id.clone());
+            }
+        }
+        anyhow::ensure!(unique_ids.len() >= 2, "请至少选择两条不同的会话");
+        anyhow::ensure!(unique_ids.len() <= 500, "单次最多合并 500 条会话");
+
+        let mut sessions = Vec::with_capacity(unique_ids.len());
+        for id in &unique_ids {
+            sessions.push(
+                self.get_session(id)?
+                    .with_context(|| format!("会话不存在或已经删除：{id}"))?,
+            );
+        }
+        sessions.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        let anchor = sessions.first().context("no sessions to merge")?;
+        for session in &sessions[1..] {
+            anyhow::ensure!(
+                session.project_id == anchor.project_id
+                    && session.task_id == anchor.task_id
+                    && session.category == anchor.category,
+                "只能合并分类、项目和任务一致的会话；请先批量修正归类"
+            );
+        }
+        for pair in sessions.windows(2) {
+            anyhow::ensure!(
+                touch_or_overlap_within(&pair[0].ended_at, &pair[1].started_at, 5),
+                "只能合并连续会话，相邻记录之间最多允许 5 秒采样间隔"
+            );
+        }
+
+        let started_at = anchor.started_at.clone();
+        let mut ended_at = anchor.ended_at.clone();
+        let mut evidence = Vec::<EvidenceItem>::new();
+        let mut confidence = 0.0_f32;
+        let mut summaries = Vec::<String>::new();
+        for session in &sessions {
+            if timestamp_is_after(&session.ended_at, &ended_at) {
+                ended_at = session.ended_at.clone();
+            }
+            evidence = merge_evidence(&evidence, &session.evidence);
+            confidence = confidence.max(session.confidence);
+            if !summaries.contains(&session.summary) {
+                summaries.push(session.summary.clone());
+            }
+        }
+        let merged_summary = clean_name(
+            summary.as_deref().unwrap_or(&summaries.join(" / ")),
+            "连续工作会话",
+        );
+
+        let mut conn = self.conn.lock();
+        let overlapping_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM work_sessions
+                 WHERE julianday(ended_at)>julianday(started_at)
+                   AND julianday(started_at)<julianday(?1)
+                   AND julianday(ended_at)>julianday(?2)",
+            )?;
+            let rows = stmt.query_map(params![ended_at, started_at], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
         };
+        anyhow::ensure!(
+            overlapping_ids.iter().all(|id| unique_ids.contains(id)),
+            "所选会话之间还有未选择的时间段，请一并选择或先修正时间轴"
+        );
+
+        let tx = conn.transaction()?;
         let new_id = Uuid::new_v4().to_string();
-        let evidence = merge_evidence_blobs(&row.7);
-        conn.execute(
+        tx.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-merge',?10)",
             params![
                 new_id,
-                row.0,
-                row.1,
-                row.2,
-                row.3,
-                row.4,
-                summary.unwrap_or(row.5),
-                row.6,
+                started_at,
+                ended_at,
+                anchor.project_id,
+                anchor.task_id,
+                anchor.category,
+                merged_summary,
+                confidence,
                 serde_json::to_string(&evidence)?,
                 now()
             ],
         )?;
-        for id in ids {
-            record_tombstone(&conn, "session", id)?;
-            conn.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
+
+        let plan_updates = {
+            let mut stmt = tx.prepare("SELECT id,matched_session_ids_json FROM plan_items")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (plan_id, matched_json) = row?;
+                let mut matched: Vec<String> = parse_json(&matched_json);
+                if matched.iter().any(|id| unique_ids.contains(id)) {
+                    matched.retain(|id| !unique_ids.contains(id));
+                    matched.push(new_id.clone());
+                    matched.sort();
+                    matched.dedup();
+                    updates.push((plan_id, serde_json::to_string(&matched)?));
+                }
+            }
+            updates
+        };
+        for (plan_id, matched_json) in plan_updates {
+            tx.execute(
+                "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
+                params![matched_json, now(), plan_id],
+            )?;
         }
+        for id in &unique_ids {
+            record_tombstone(&tx, "session", id)?;
+            tx.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
+        }
+        tx.commit()?;
         drop(conn);
         self.get_session(&new_id)?.context("merged session missing")
     }
 
     pub fn split_session(&self, id: &str, split_at: &str) -> Result<Vec<WorkSession>> {
         let session = self.get_session(id)?.context("session not found")?;
+        let started_at = DateTime::parse_from_rfc3339(&session.started_at)
+            .context("invalid session start time")?
+            .with_timezone(&Utc);
+        let ended_at = DateTime::parse_from_rfc3339(&session.ended_at)
+            .context("invalid session end time")?
+            .with_timezone(&Utc);
+        let split_at = DateTime::parse_from_rfc3339(split_at)
+            .context("invalid split time")?
+            .with_timezone(&Utc);
         anyhow::ensure!(
-            split_at > session.started_at.as_str() && split_at < session.ended_at.as_str(),
-            "split_at must be inside session range"
+            split_at - started_at >= Duration::seconds(5)
+                && ended_at - split_at >= Duration::seconds(5),
+            "拆分后的两段都必须至少保留 5 秒"
         );
+        let split_at = fmt(split_at);
         let first_id = Uuid::new_v4().to_string();
         let second_id = Uuid::new_v4().to_string();
         let evidence_json = serde_json::to_string(&session.evidence)?;
-        let conn = self.conn.lock();
-        record_tombstone(&conn, "session", id)?;
-        conn.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
-        conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        record_tombstone(&tx, "session", id)?;
+        tx.execute("DELETE FROM work_sessions WHERE id=?1", params![id])?;
+        tx.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
             params![
                 first_id,
                 session.started_at,
-                split_at,
+                &split_at,
                 session.project_id,
                 session.task_id,
                 session.category,
@@ -1283,11 +1497,11 @@ impl AppDb {
             ],
         )?;
         let evidence_json2 = serde_json::to_string(&session.evidence)?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-split',?10)",
             params![
                 second_id,
-                split_at,
+                &split_at,
                 session.ended_at,
                 session.project_id,
                 session.task_id,
@@ -1298,6 +1512,7 @@ impl AppDb {
                 now()
             ],
         )?;
+        tx.commit()?;
         drop(conn);
         Ok(vec![
             self.get_session(&first_id)?.unwrap(),
@@ -1365,7 +1580,7 @@ impl AppDb {
         let settings = self.get_settings()?;
         let is_idle = event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64;
         let idle_project_id = if is_idle { Some(self.configure_idle_target(&settings)?) } else { None };
-        let (project_id, task_id, category, summary, confidence) =
+        let attribution =
             self.heuristic_attribution(event, is_idle, &settings, idle_project_id)?;
         let page_title = event
             .metadata
@@ -1397,35 +1612,60 @@ impl AppDb {
                 weight: 0.5,
             },
         ];
+        let evidence_json = serde_json::to_string(&evidence)?;
+        let source = if is_idle { "collector-idle" } else { "collector-rule" };
         let conn = self.conn.lock();
-        let last: Option<(String, String, String, String, i64)> = conn.query_row(
-            "SELECT id, summary, category, ended_at, user_confirmed FROM work_sessions ORDER BY ended_at DESC LIMIT 1",
+        let last = conn.query_row(
+            "SELECT id,project_id,task_id,summary,category,user_confirmed,source
+             FROM work_sessions ORDER BY ended_at DESC, updated_at DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |row| Ok(LastSessionAttribution {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                task_id: row.get(2)?,
+                summary: row.get(3)?,
+                category: row.get(4)?,
+                user_confirmed: row.get::<_, i64>(5)? != 0,
+                source: row.get(6)?,
+            }),
         ).optional()?;
-        if let Some((id, last_summary, last_category, _last_end, confirmed)) = last {
+        if let Some(last) = last {
             if !starts_new_context(event)
-                && confirmed == 0
-                && last_summary == summary
-                && last_category == category
+                && !last.user_confirmed
+                && last.source == source
+                && last.project_id == attribution.project_id
+                && last.task_id == attribution.task_id
+                && last.summary == attribution.summary
+                && last.category == attribution.category
             {
-                conn.execute("UPDATE work_sessions SET ended_at=?1, confidence=MAX(confidence, ?2), evidence_json=?3, updated_at=?4 WHERE id=?5", params![event.timestamp, confidence, serde_json::to_string(&evidence)?, now(), id])?;
+                conn.execute(
+                    "UPDATE work_sessions
+                     SET ended_at=MAX(ended_at, ?1), confidence=MAX(confidence, ?2),
+                         evidence_json=?3, updated_at=?4
+                     WHERE id=?5",
+                    params![
+                        event.timestamp,
+                        attribution.confidence,
+                        evidence_json,
+                        now(),
+                        last.id
+                    ],
+                )?;
                 return Ok(());
             }
         }
-        let source = if is_idle { "collector-idle" } else { "collector-rule" };
         conn.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11)",
             params![
                 Uuid::new_v4().to_string(),
                 event.timestamp,
                 event.timestamp,
-                project_id,
-                task_id,
-                category,
-                summary,
-                confidence,
-                serde_json::to_string(&evidence)?,
+                attribution.project_id,
+                attribution.task_id,
+                attribution.category,
+                attribution.summary,
+                attribution.confidence,
+                evidence_json,
                 source,
                 now()
             ],
@@ -1439,18 +1679,24 @@ impl AppDb {
         is_idle: bool,
         settings: &AppSettings,
         idle_project_id: Option<String>,
-    ) -> Result<(Option<String>, Option<String>, String, String, f32)> {
+    ) -> Result<AttributionDecision> {
         if is_idle {
-            return Ok((idle_project_id, None, settings.idle_category.clone(), "离开/空闲".into(), 0.96));
+            return Ok(AttributionDecision {
+                project_id: idle_project_id,
+                task_id: None,
+                category: settings.idle_category.clone(),
+                summary: "离开/空闲".into(),
+                confidence: 0.96,
+            });
         }
         if let Some(pin) = self.active_context()? {
-            return Ok((
-                Some(pin.project_id),
-                pin.task_id,
-                pin.category.clone(),
-                classification::summary_for_event(event, &pin.category),
-                0.98,
-            ));
+            return Ok(AttributionDecision {
+                project_id: Some(pin.project_id),
+                task_id: pin.task_id,
+                category: pin.category.clone(),
+                summary: classification::summary_for_event(event, &pin.category),
+                confidence: 0.98,
+            });
         }
         let hay = format!(
             "{} {} {} {}",
@@ -1534,13 +1780,13 @@ impl AppDb {
                         .to_lowercase()
                         .contains(&workspace));
             if hit {
-                return Ok((
+                return Ok(AttributionDecision {
                     project_id,
                     task_id,
-                    category.clone(),
-                    classification::summary_for_event(event, &category),
-                    0.84,
-                ));
+                    category: category.clone(),
+                    summary: classification::summary_for_event(event, &category),
+                    confidence: 0.84,
+                });
             }
         }
         let category = if hay.contains("code")
@@ -1581,13 +1827,13 @@ impl AppDb {
         } else {
             "杂务"
         };
-        Ok((
-            None,
-            None,
-            category.into(),
-            classification::summary_for_event(event, category),
-            0.55,
-        ))
+        Ok(AttributionDecision {
+            project_id: None,
+            task_id: None,
+            category: category.into(),
+            summary: classification::summary_for_event(event, category),
+            confidence: 0.55,
+        })
     }
 
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
@@ -1610,30 +1856,36 @@ impl AppDb {
 
     pub fn claim_next_analysis_job(&self) -> Result<Option<AnalysisJob>> {
         let conn = self.conn.lock();
-        let row: Option<(String, String, String, String, String, u32, String, Option<String>)> = conn.query_row(
+        let job = conn.query_row(
             "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error FROM analysis_jobs WHERE status='pending' ORDER BY started_at ASC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? as u32, r.get(6)?, r.get(7)?)),
+            |row| {
+                let chunk_ids_json: String = row.get(1)?;
+                Ok(AnalysisJob {
+                    id: row.get(0)?,
+                    chunk_ids: parse_json(&chunk_ids_json),
+                    metadata_range: TimeRange {
+                        started_at: row.get(2)?,
+                        ended_at: row.get(3)?,
+                    },
+                    mode: row.get(4)?,
+                    retry_count: row.get::<_, i64>(5)? as u32,
+                    status: row.get(6)?,
+                    error: row.get(7)?,
+                })
+            },
         ).optional()?;
-        if let Some((id, chunk_ids_json, started_at, ended_at, mode, retry_count, _status, error)) =
-            row
-        {
-            conn.execute("UPDATE analysis_jobs SET status='running', error=NULL WHERE id=?1 AND status='pending'", params![id])?;
-            Ok(Some(AnalysisJob {
-                id,
-                chunk_ids: parse_json(&chunk_ids_json),
-                metadata_range: TimeRange {
-                    started_at,
-                    ended_at,
-                },
-                mode,
-                retry_count,
-                status: "running".into(),
-                error,
-            }))
-        } else {
-            Ok(None)
+        let Some(mut job) = job else { return Ok(None) };
+        let claimed = conn.execute(
+            "UPDATE analysis_jobs SET status='running', error=NULL WHERE id=?1 AND status='pending'",
+            params![job.id],
+        )?;
+        if claimed == 0 {
+            return Ok(None);
         }
+        job.status = "running".into();
+        job.error = None;
+        Ok(Some(job))
     }
 
     pub fn mark_analysis_job_status(
@@ -1754,17 +2006,10 @@ impl AppDb {
 
     pub fn materialize_attribution_session(
         &self,
-        range: &TimeRange,
-        project_id: Option<String>,
-        task_id: Option<String>,
-        category: String,
-        summary: String,
-        confidence: f32,
-        evidence: Vec<EvidenceItem>,
-        source: &str,
+        input: AttributionSessionInput,
     ) -> Result<WorkSession> {
         let id = Uuid::new_v4().to_string();
-        let evidence_json = serde_json::to_string(&evidence)?;
+        let evidence_json = serde_json::to_string(&input.evidence)?;
         let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM work_sessions
@@ -1772,21 +2017,21 @@ impl AppDb {
                AND source IN ('collector-rule','ai-analysis','rule-downgrade')
                AND ended_at >= ?1
                AND started_at <= ?2",
-            params![range.started_at, range.ended_at],
+            params![input.range.started_at, input.range.ended_at],
         )?;
         conn.execute(
             "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11)",
             params![
                 id,
-                range.started_at,
-                range.ended_at,
-                project_id,
-                task_id,
-                category,
-                summary,
-                confidence.clamp(0.0, 1.0),
+                input.range.started_at,
+                input.range.ended_at,
+                input.project_id,
+                input.task_id,
+                input.category,
+                input.summary,
+                input.confidence.clamp(0.0, 1.0),
                 evidence_json,
-                source,
+                input.source,
                 now()
             ],
         )?;
@@ -1795,12 +2040,12 @@ impl AppDb {
             params![
                 Uuid::new_v4().to_string(),
                 id,
-                source,
+                input.source,
                 "自动归因活动",
-                summary,
-                range.started_at,
-                range.ended_at,
-                serde_json::to_string(&evidence)?
+                input.summary,
+                input.range.started_at,
+                input.range.ended_at,
+                serde_json::to_string(&input.evidence)?
             ],
         )?;
         drop(conn);
@@ -1857,6 +2102,138 @@ impl AppDb {
             )?;
         }
         Ok(())
+    }
+
+    pub fn repair_session_timeline(&self) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut changed = 0_u32;
+
+        // A task is the most specific assignment. Repair legacy rows produced
+        // before hierarchy validation by deriving their project and category.
+        changed += tx.execute(
+            "UPDATE work_sessions AS ws
+             SET project_id=(SELECT t.project_id FROM tasks t WHERE t.id=ws.task_id),
+                 category=(SELECT p.category FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=ws.task_id),
+                 updated_at=?1
+             WHERE ws.task_id IS NOT NULL
+               AND EXISTS(SELECT 1 FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=ws.task_id)
+               AND (ws.project_id IS NOT (SELECT t.project_id FROM tasks t WHERE t.id=ws.task_id)
+                    OR ws.category<>(SELECT p.category FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=ws.task_id))",
+            params![now()],
+        )? as u32;
+        changed += tx.execute(
+            "UPDATE work_sessions
+             SET task_id=NULL,updated_at=?1
+             WHERE task_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=work_sessions.task_id)",
+            params![now()],
+        )? as u32;
+        // If only the old project conflicts with a category correction, preserve
+        // the user's category choice and drop the stale project reference.
+        changed += tx.execute(
+            "UPDATE work_sessions AS ws
+             SET project_id=NULL,task_id=NULL,updated_at=?1
+             WHERE ws.project_id IS NOT NULL AND ws.task_id IS NULL
+               AND (NOT EXISTS(SELECT 1 FROM projects p WHERE p.id=ws.project_id)
+                    OR EXISTS(SELECT 1 FROM projects p WHERE p.id=ws.project_id AND p.category<>ws.category))",
+            params![now()],
+        )? as u32;
+
+        let nonpositive_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM work_sessions
+                 WHERE user_confirmed=0
+                   AND source IN ('collector-rule','collector-idle','context-complete')
+                   AND julianday(ended_at)<=julianday(started_at)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+        for id in nonpositive_ids {
+            record_tombstone(&tx, "session", &id)?;
+            changed += tx.execute("DELETE FROM work_sessions WHERE id=?1", params![id])? as u32;
+        }
+
+        let sessions = {
+            let mut stmt = tx.prepare(
+                "SELECT ws.id,ws.started_at,ws.ended_at,ws.project_id,p.name,ws.task_id,t.title,
+                        ws.category,ws.summary,ws.confidence,ws.evidence_json,ws.user_confirmed,ws.source
+                 FROM work_sessions ws
+                 LEFT JOIN projects p ON p.id=ws.project_id
+                 LEFT JOIN tasks t ON t.id=ws.task_id
+                 WHERE ws.user_confirmed=0
+                   AND ws.source IN ('collector-rule','collector-idle','context-complete')
+                   AND julianday(ws.ended_at)>julianday(ws.started_at)
+                 ORDER BY ws.started_at ASC,ws.ended_at ASC,ws.updated_at ASC",
+            )?;
+            let rows = stmt.query_map([], map_work_session)?;
+            collect_rows(rows)?
+        };
+
+        let mut previous: Option<WorkSession> = None;
+        for current in sessions {
+            let Some(mut anchor) = previous.take() else {
+                previous = Some(current);
+                continue;
+            };
+            if !sessions_overlap(&anchor, &current) {
+                previous = Some(current);
+                continue;
+            }
+
+            if can_repair_overlapping_sessions(&anchor, &current) {
+                let merged_end = if timestamp_is_after(&current.ended_at, &anchor.ended_at) {
+                    current.ended_at.clone()
+                } else {
+                    anchor.ended_at.clone()
+                };
+                anchor.summary = preferred_coalesced_summary(&anchor.summary, &current.summary);
+                anchor.confidence = anchor.confidence.max(current.confidence);
+                anchor.evidence = merge_evidence(&anchor.evidence, &current.evidence);
+                anchor.ended_at = merged_end.clone();
+                tx.execute(
+                    "UPDATE work_sessions SET ended_at=?1,summary=?2,confidence=?3,evidence_json=?4,updated_at=?5 WHERE id=?6",
+                    params![merged_end, anchor.summary, anchor.confidence, serde_json::to_string(&anchor.evidence)?, now(), anchor.id],
+                )?;
+                tx.execute(
+                    "UPDATE activities SET ended_at=?1,summary=?2,evidence_json=?3 WHERE session_id=?4",
+                    params![merged_end, anchor.summary, serde_json::to_string(&anchor.evidence)?, anchor.id],
+                )?;
+                record_tombstone(&tx, "session", &current.id)?;
+                tx.execute("DELETE FROM work_sessions WHERE id=?1", params![current.id])?;
+                changed += 1;
+                previous = Some(anchor);
+                continue;
+            }
+
+            if timestamp_is_after(&current.started_at, &anchor.started_at) {
+                anchor.ended_at = current.started_at.clone();
+                tx.execute(
+                    "UPDATE work_sessions SET ended_at=?1,updated_at=?2 WHERE id=?3",
+                    params![anchor.ended_at, now(), anchor.id],
+                )?;
+                tx.execute(
+                    "UPDATE activities SET ended_at=?1 WHERE session_id=?2",
+                    params![anchor.ended_at, anchor.id],
+                )?;
+                changed += 1;
+                previous = Some(current);
+            } else {
+                // Two collectors started at exactly the same moment. Keep the
+                // longer (then more confident) automatic row instead of counting twice.
+                let keep_current = timestamp_is_after(&current.ended_at, &anchor.ended_at)
+                    || (current.ended_at == anchor.ended_at
+                        && current.confidence > anchor.confidence);
+                let removed_id = if keep_current { &anchor.id } else { &current.id };
+                record_tombstone(&tx, "session", removed_id)?;
+                tx.execute("DELETE FROM work_sessions WHERE id=?1", params![removed_id])?;
+                changed += 1;
+                previous = Some(if keep_current { current } else { anchor });
+            }
+        }
+
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn compact_sessions(&self) -> Result<u32> {
@@ -2094,11 +2471,14 @@ impl AppDb {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.data_dir.join("backups"));
         fs::create_dir_all(&dir)?;
+        let timestamp = Utc::now();
         let target = dir.join(format!(
-            "screenuse-backup-{}.db",
-            Utc::now().format("%Y%m%d-%H%M%S")
+            "screenuse-backup-{}-{:03}.db",
+            timestamp.format("%Y%m%d-%H%M%S"),
+            timestamp.timestamp_subsec_millis(),
         ));
-        fs::copy(&self.db_path, &target)?;
+        let conn = self.conn.lock();
+        conn.backup(DatabaseName::Main, &target, None)?;
         Ok(target)
     }
 }
@@ -2113,14 +2493,7 @@ fn starts_new_context(event: &RawActivityEvent) -> bool {
 
 fn insert_seed_session(
     conn: &Connection,
-    id: &str,
-    project_id: &str,
-    task_id: &str,
-    category: &str,
-    summary: &str,
-    start: chrono::DateTime<Utc>,
-    end: chrono::DateTime<Utc>,
-    confidence: f32,
+    session: SeedSession<'_>,
 ) -> Result<()> {
     let evidence = vec![
         EvidenceItem {
@@ -2132,21 +2505,21 @@ fn insert_seed_session(
         EvidenceItem {
             kind: "ai".into(),
             label: "AI摘要".into(),
-            value: summary.into(),
+            value: session.summary.into(),
             weight: 0.9,
         },
     ];
     conn.execute(
         "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'seed',?10)",
         params![
-            id,
-            fmt(start),
-            fmt(end),
-            project_id,
-            task_id,
-            category,
-            summary,
-            confidence,
+            session.id,
+            fmt(session.start),
+            fmt(session.end),
+            session.project_id,
+            session.task_id,
+            session.category,
+            session.summary,
+            session.confidence,
             serde_json::to_string(&evidence)?,
             now()
         ],
@@ -2296,6 +2669,58 @@ fn session_duration_seconds(session: &WorkSession) -> Option<i64> {
     Some((end - start).num_seconds().max(0))
 }
 
+fn touch_or_overlap_within(left_end: &str, right_start: &str, max_seconds: i64) -> bool {
+    let left = DateTime::parse_from_rfc3339(left_end).map(|time| time.with_timezone(&Utc));
+    let right = DateTime::parse_from_rfc3339(right_start).map(|time| time.with_timezone(&Utc));
+    match (left, right) {
+        (Ok(left), Ok(right)) => right <= left + Duration::seconds(max_seconds),
+        _ => false,
+    }
+}
+
+fn timestamp_is_after(candidate: &str, current: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(candidate),
+        DateTime::parse_from_rfc3339(current),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => candidate > current,
+    }
+}
+
+fn sessions_overlap(left: &WorkSession, right: &WorkSession) -> bool {
+    let left_start = DateTime::parse_from_rfc3339(&left.started_at);
+    let left_end = DateTime::parse_from_rfc3339(&left.ended_at);
+    let right_start = DateTime::parse_from_rfc3339(&right.started_at);
+    let right_end = DateTime::parse_from_rfc3339(&right.ended_at);
+    match (left_start, left_end, right_start, right_end) {
+        (Ok(left_start), Ok(left_end), Ok(right_start), Ok(right_end)) => {
+            left_start < right_end && right_start < left_end
+        }
+        _ => right.started_at < left.ended_at && left.started_at < right.ended_at,
+    }
+}
+
+fn can_repair_overlapping_sessions(left: &WorkSession, right: &WorkSession) -> bool {
+    if left.user_confirmed
+        || right.user_confirmed
+        || !is_auto_session_source(&left.source)
+        || !is_auto_session_source(&right.source)
+        || left.project_id != right.project_id
+        || left.task_id != right.task_id
+        || left.category != right.category
+    {
+        return false;
+    }
+    if left.source == "collector-idle" && right.source == "collector-idle" {
+        return true;
+    }
+    left.summary == right.summary
+        || ((left.project_id.is_some() || left.task_id.is_some())
+            && primary_session_app(left).is_some()
+            && primary_session_app(left) == primary_session_app(right))
+}
+
 fn is_auto_session_source(source: &str) -> bool {
     matches!(source, "collector-rule" | "collector-idle" | "context-complete")
 }
@@ -2424,13 +2849,6 @@ fn collect_rows<T>(
     Ok(out)
 }
 
-fn merge_evidence_blobs(blob: &str) -> Vec<EvidenceItem> {
-    blob.split("||")
-        .flat_map(|part| serde_json::from_str::<Vec<EvidenceItem>>(part).unwrap_or_default())
-        .take(20)
-        .collect()
-}
-
 fn dir_size(path: PathBuf) -> u64 {
     if !path.exists() {
         return 0;
@@ -2533,9 +2951,11 @@ mod tests {
         let data_dir =
             std::env::temp_dir().join(format!("screenuse-sampling-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
-        let mut settings = AppSettings::default();
-        settings.poll_interval_seconds = 10;
-        settings.heartbeat_seconds = 10;
+        let mut settings = AppSettings {
+            poll_interval_seconds: 10,
+            heartbeat_seconds: 10,
+            ..AppSettings::default()
+        };
         db.save_settings(&settings).expect("save legacy settings");
         db.conn.lock().execute("DELETE FROM settings WHERE key=?1", params![ONE_SECOND_SAMPLING_MIGRATION_KEY]).expect("reset migration marker");
 
@@ -3298,6 +3718,55 @@ mod tests {
     }
 
     #[test]
+    fn collector_does_not_merge_identical_titles_across_projects() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-project-boundary-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let first_project = db.create_project("项目甲", "开发").expect("create project");
+        let second_project = db.create_project("项目乙", "开发").expect("create project");
+        let first_task = db
+            .create_task(&first_project.id, "同名任务")
+            .expect("create task");
+        let second_task = db
+            .create_task(&second_project.id, "同名任务")
+            .expect("create task");
+        let start = Utc::now();
+
+        db.pin_context(&first_project.id, Some(&first_task.id), 30)
+            .expect("pin first context");
+        let mut first = chat_event("project-boundary-1", "ChatGPT");
+        first.timestamp = fmt(start);
+        first.metadata = serde_json::json!({});
+        db.ingest_raw_event(first).expect("ingest first event");
+
+        db.pin_context(&second_project.id, Some(&second_task.id), 30)
+            .expect("pin second context");
+        let mut second = chat_event("project-boundary-2", "ChatGPT");
+        second.timestamp = fmt(start + Duration::seconds(1));
+        second.metadata = serde_json::json!({});
+        db.ingest_raw_event(second).expect("ingest second event");
+
+        let collected = db
+            .list_sessions(20)
+            .expect("list sessions")
+            .into_iter()
+            .filter(|session| session.source == "collector-rule")
+            .collect::<Vec<_>>();
+        assert_eq!(collected.len(), 2);
+        assert!(collected
+            .iter()
+            .any(|session| session.project_id.as_deref() == Some(first_project.id.as_str())));
+        assert!(collected
+            .iter()
+            .any(|session| session.project_id.as_deref() == Some(second_project.id.as_str())));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn idle_sessions_use_the_configured_category_and_project() {
         let data_dir = std::env::temp_dir().join(format!("screenuse-idle-target-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
@@ -3381,6 +3850,237 @@ mod tests {
         }
         drop(conn);
         assert!(db.dashboard(false).expect("load dashboard").sessions.len() >= 120);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn session_corrections_keep_category_project_and_task_consistent() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-assignment-invariant-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let development = db
+            .create_project("开发项目", "开发")
+            .expect("create development project");
+        let study = db
+            .create_project("学习项目", "学习")
+            .expect("create study project");
+        let study_task = db
+            .create_task(&study.id, "阅读资料")
+            .expect("create study task");
+        let session_id = db.list_sessions(1).expect("list sessions")[0].id.clone();
+
+        let corrected = db
+            .update_session(
+                &session_id,
+                SessionPatch {
+                    summary: Some("跨项目修正".into()),
+                    project_id: Some(development.id),
+                    task_id: Some(study_task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some("开发".into()),
+                    confidence: Some(1.2),
+                    user_confirmed: Some(true),
+                },
+            )
+            .expect("correct with task");
+        assert_eq!(corrected.project_id.as_deref(), Some(study.id.as_str()));
+        assert_eq!(corrected.task_id.as_deref(), Some(study_task.id.as_str()));
+        assert_eq!(corrected.category, "学习");
+        assert_eq!(corrected.confidence, 1.0);
+        assert_eq!(corrected.source, "manual-correction");
+
+        let category_only = db
+            .update_session(
+                &session_id,
+                SessionPatch {
+                    summary: None,
+                    project_id: None,
+                    task_id: None,
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some("开发".into()),
+                    confidence: None,
+                    user_confirmed: Some(true),
+                },
+            )
+            .expect("change category only");
+        assert_eq!(category_only.category, "开发");
+        assert!(category_only.project_id.is_none());
+        assert!(category_only.task_id.is_none());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn timeline_repair_removes_stale_rows_and_resolves_automatic_overlaps() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-timeline-repair-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::hours(2);
+        let evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "QQ.exe".into(),
+            weight: 0.5,
+        }])
+        .expect("serialize evidence");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('stale',?1,?1,NULL,NULL,'沟通','QQ',0.8,?2,0,'collector-rule',?3)",
+                params![fmt(base), evidence, now()],
+            )
+            .expect("insert stale row");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('confirmed-zero',?1,?1,NULL,NULL,'沟通','手工保留',1.0,?2,1,'manual-correction',?3)",
+                params![fmt(base - Duration::seconds(1)), evidence, now()],
+            )
+            .expect("insert confirmed zero row");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('overlap-a',?1,?2,NULL,NULL,'沟通','QQ',0.8,?3,0,'context-complete',?4)",
+                params![fmt(base), fmt(base + Duration::seconds(20)), evidence, now()],
+            )
+            .expect("insert first overlap");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('overlap-b',?1,?2,NULL,NULL,'沟通','QQ',0.9,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(15)), fmt(base + Duration::seconds(30)), evidence, now()],
+            )
+            .expect("insert compatible overlap");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('next-context',?1,?2,NULL,NULL,'开发','ScreenUse',0.9,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(28)), fmt(base + Duration::seconds(40)), evidence, now()],
+            )
+            .expect("insert incompatible overlap");
+        }
+
+        assert!(db.repair_session_timeline().expect("repair timeline") >= 3);
+        assert!(db.get_session("stale").expect("load stale").is_none());
+        assert!(db
+            .get_session("confirmed-zero")
+            .expect("load confirmed zero")
+            .is_some());
+        let first = db
+            .get_session("overlap-a")
+            .expect("load first overlap")
+            .expect("first overlap remains");
+        assert_eq!(first.ended_at, fmt(base + Duration::seconds(28)));
+        assert!(db
+            .get_session("overlap-b")
+            .expect("load merged overlap")
+            .is_none());
+        assert_eq!(
+            db.get_session("next-context")
+                .expect("load next context")
+                .expect("next context remains")
+                .started_at,
+            fmt(base + Duration::seconds(28))
+        );
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn manual_merge_is_atomic_contiguous_and_updates_plan_links() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-manual-merge-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::hours(3);
+        let evidence = serde_json::to_string(&Vec::<EvidenceItem>::new()).unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('merge-a',?1,?2,NULL,NULL,'沟通','QQ',0.8,?3,0,'context-complete',?4)",
+                params![fmt(base), fmt(base + Duration::seconds(20)), evidence, now()],
+            )
+            .expect("insert first merge row");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('merge-b',?1,?2,NULL,NULL,'沟通','QQ',0.9,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(23)), fmt(base + Duration::seconds(40)), evidence, now()],
+            )
+            .expect("insert second merge row");
+            conn.execute(
+                "INSERT INTO plan_items(id,source,title,note,start_at,due_at,status,tags_json,matched_session_ids_json,updated_at)
+                 VALUES('merge-plan','manual','沟通复盘',NULL,NULL,NULL,'active','[]','[\"merge-a\",\"merge-b\"]',?1)",
+                params![now()],
+            )
+            .expect("insert plan link");
+        }
+
+        let merged = db
+            .merge_sessions(
+                &["merge-b".to_string(), "merge-a".to_string()],
+                Some("QQ 沟通".into()),
+            )
+            .expect("merge contiguous rows");
+        assert_eq!(merged.started_at, fmt(base));
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(40)));
+        assert_eq!(merged.source, "manual-merge");
+        assert!(merged.user_confirmed);
+        assert!(db.get_session("merge-a").expect("load first").is_none());
+        assert!(db.get_session("merge-b").expect("load second").is_none());
+        let plan_links: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT matched_session_ids_json FROM plan_items WHERE id='merge-plan'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load plan links");
+        let plan_links: Vec<String> = parse_json(&plan_links);
+        assert_eq!(plan_links, vec![merged.id]);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn manual_split_requires_two_five_second_segments() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-manual-split-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() + Duration::hours(3);
+        let evidence = serde_json::to_string(&Vec::<EvidenceItem>::new()).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO work_sessions VALUES ('split-source',?1,?2,NULL,NULL,'开发','ScreenUse',0.9,?3,1,'manual-correction',?4)",
+                params![fmt(base), fmt(base + Duration::seconds(20)), evidence, now()],
+            )
+            .expect("insert split source");
+
+        assert!(db
+            .split_session("split-source", &fmt(base + Duration::seconds(3)))
+            .is_err());
+        assert!(db
+            .get_session("split-source")
+            .expect("load source after rejected split")
+            .is_some());
+        let split = db
+            .split_session("split-source", &fmt(base + Duration::seconds(10)))
+            .expect("split valid source");
+        assert_eq!(split.len(), 2);
+        assert!(split.iter().all(|item| item.source == "manual-split"));
+        assert!(split
+            .iter()
+            .all(|item| session_duration_seconds(item).is_some_and(|seconds| seconds >= 5)));
+        assert!(db
+            .get_session("split-source")
+            .expect("load removed source")
+            .is_none());
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

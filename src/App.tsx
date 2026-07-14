@@ -303,6 +303,103 @@ function RenameCategoryDialog({
   );
 }
 
+function TextInputDialog({
+  title,
+  detail,
+  initialValue,
+  inputLabel,
+  confirmLabel,
+  type = 'text',
+  min,
+  max,
+  step,
+  busy = false,
+  isValid,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  detail: string;
+  initialValue: string;
+  inputLabel: string;
+  confirmLabel: string;
+  type?: 'text' | 'datetime-local';
+  min?: string;
+  max?: string;
+  step?: number;
+  busy?: boolean;
+  isValid?: (value: string) => boolean;
+  onCancel: () => void;
+  onConfirm: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const normalizedValue = type === 'text' ? value.trim() : value;
+  const valid = Boolean(normalizedValue) && (isValid ? isValid(normalizedValue) : true);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    if (type === 'text') inputRef.current?.select();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || busy) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [busy, onCancel, type]);
+
+  return createPortal(
+    <div
+      className="confirm-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (!busy) onCancel();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="text-input-dialog-title"
+        aria-modal="true"
+        className="confirm-dialog rename-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-dialog-icon rename"><Pencil size={19} /></div>
+        <div>
+          <h2 id="text-input-dialog-title">{title}</h2>
+          <p>{detail}</p>
+        </div>
+        <input
+          aria-label={inputLabel}
+          disabled={busy}
+          max={max}
+          min={min}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && valid && !busy) {
+              event.preventDefault();
+              onConfirm(normalizedValue);
+            }
+          }}
+          ref={inputRef}
+          step={step}
+          type={type}
+          value={value}
+        />
+        <div className="confirm-dialog-actions">
+          <button className="confirm-cancel" disabled={busy} onClick={onCancel} type="button">取消</button>
+          <button className="primary" disabled={!valid || busy} onClick={() => onConfirm(normalizedValue)} type="button">
+            {busy ? '处理中…' : confirmLabel}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [data, setData] = useState<DashboardData | null>(null);
@@ -315,16 +412,21 @@ export default function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [projectFocusId, setProjectFocusId] = useState('');
+  const loadSequenceRef = useRef(0);
+  const toastTimerRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
+    const sequence = ++loadSequenceRef.current;
     try {
       const dashboard = await api.dashboard();
+      if (sequence !== loadSequenceRef.current) return;
       setData(dashboard);
       setLoadError('');
     } catch (error) {
+      if (sequence !== loadSequenceRef.current) return;
       setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequenceRef.current) setLoading(false);
     }
   }, []);
 
@@ -336,10 +438,14 @@ export default function App() {
     const onVisibility = () => {
       if (document.visibilityState === 'visible') void load();
     };
+    const onFocus = () => void load();
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
     return () => {
+      loadSequenceRef.current += 1;
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
     };
   }, [load]);
 
@@ -370,25 +476,39 @@ export default function App() {
   }, [data?.settings.theme]);
 
   const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
     setToast(message);
-    window.setTimeout(() => setToast(''), 3200);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast('');
+      toastTimerRef.current = null;
+    }, 3200);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
   }, []);
 
   const runAction = useCallback(
-    async (fn: () => Promise<unknown>, successMessage: string) => {
-      try {
-        const result = await fn();
-        showToast(
-          typeof result === 'string' && result.length > 0
-            ? `${successMessage}：${result}`
-            : successMessage,
-        );
-        await load();
-        return result;
-      } catch (error) {
-        showToast(error instanceof Error ? error.message : String(error));
-        throw error;
-      }
+    (fn: () => Promise<unknown>, successMessage: string) => {
+      const action = (async () => {
+        try {
+          const result = await fn();
+          showToast(
+            typeof result === 'string' && result.length > 0
+              ? `${successMessage}：${result}`
+              : successMessage,
+          );
+          await load();
+          return result;
+        } catch (error) {
+          showToast(error instanceof Error ? error.message : String(error));
+          throw error;
+        }
+      })();
+      // Fire-and-forget toolbar actions still report through the toast without
+      // producing an unhandled rejection. Awaiting callers keep normal errors.
+      void action.catch(() => undefined);
+      return action;
     },
     [load, showToast],
   );
@@ -403,6 +523,13 @@ export default function App() {
         ),
     [data, selectedDate],
   );
+  useEffect(() => {
+    const validIds = new Set((data?.sessions || []).map((session) => session.id));
+    setSelected((current) => {
+      const next = new Set([...current].filter((id) => validIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [data?.sessions]);
   const stats = useMemo(
     () => summarizeDay(daySessions, selectedDate, data?.settings),
     [data?.settings, daySessions, selectedDate],
@@ -1239,13 +1366,18 @@ function DayActivityTimeline({
     return () => element.removeEventListener('wheel', handleWheel);
   }, [onZoomChange, zoom]);
 
+  const axisLabelPadding = 34;
+  const firstVisiblePixel = viewport.left > 0 ? viewport.left + axisLabelPadding : 0;
+  const lastVisiblePixel = viewport.left + viewport.width < width
+    ? viewport.left + viewport.width - axisLabelPadding
+    : width;
   const firstTick = Math.max(
     0,
-    Math.floor((viewport.left / pixelsPerSecond) / scale.secondsPerGrid) - 2,
+    Math.ceil((firstVisiblePixel / pixelsPerSecond) / scale.secondsPerGrid),
   );
   const lastTick = Math.min(
     Math.floor((24 * 60 * 60) / scale.secondsPerGrid),
-    Math.ceil(((viewport.left + viewport.width) / pixelsPerSecond) / scale.secondsPerGrid) + 2,
+    Math.floor((lastVisiblePixel / pixelsPerSecond) / scale.secondsPerGrid),
   );
   const visibleTicks = Array.from(
     { length: Math.max(0, lastTick - firstTick + 1) },
@@ -1457,7 +1589,13 @@ function TimelineView({
 }) {
   const [query, setQuery] = useState('');
   const [reviewOnly, setReviewOnly] = useState(false);
+  const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  const [mergeBusy, setMergeBusy] = useState(false);
   const normalized = query.trim().toLowerCase();
+  const sessionIndexById = useMemo(
+    () => new Map(sessions.map((session, index) => [session.id, index])),
+    [sessions],
+  );
   const filtered = sessions.filter((session) => {
     if (reviewOnly && !needsReview(session)) return false;
     if (!normalized) return true;
@@ -1482,13 +1620,17 @@ function TimelineView({
     setSelected(next);
   };
 
-  const mergeSelected = async () => {
+  const mergeSelected = async (summary: string) => {
     const ids = [...selected];
     if (ids.length < 2) return;
-    const summary = window.prompt('合并后的会话名称', '连续工作会话')?.trim();
-    if (!summary) return;
-    await api.mergeSessions(ids, summary);
-    setSelected(new Set());
+    setMergeBusy(true);
+    try {
+      await runAction(() => api.mergeSessions(ids, summary), '已合并所选会话');
+      setSelected(new Set());
+      setMergeDialogOpen(false);
+    } finally {
+      setMergeBusy(false);
+    }
   };
 
   const editSession = (session: WorkSession) => {
@@ -1525,7 +1667,7 @@ function TimelineView({
           </button>
           <button
             disabled={selected.size < 2}
-            onClick={() => void runAction(mergeSelected, '已合并所选会话')}
+            onClick={() => setMergeDialogOpen(true)}
             type="button"
           >
             <Merge size={15} />合并 {selected.size || ''}
@@ -1535,8 +1677,8 @@ function TimelineView({
         <div className="timeline-list">
           {filtered.map((session, index) => {
             const newer = index > 0 ? filtered[index - 1] : null;
-            const newerIndex = newer ? sessions.findIndex((item) => item.id === newer.id) : -1;
-            const currentIndex = sessions.findIndex((item) => item.id === session.id);
+            const newerIndex = newer ? sessionIndexById.get(newer.id) ?? -1 : -1;
+            const currentIndex = sessionIndexById.get(session.id) ?? -1;
             const hidden = newerIndex >= 0 && currentIndex > newerIndex + 1
               ? sessions.slice(newerIndex + 1, currentIndex)
               : [];
@@ -1580,7 +1722,20 @@ function TimelineView({
           )}
         </div>
       </section>
-
+      {mergeDialogOpen && (
+        <TextInputDialog
+          busy={mergeBusy}
+          confirmLabel="确认合并"
+          detail={`将 ${selectedSessions.length} 条记录合并为一个连续时间段。`}
+          initialValue={selectedSessions[0]?.summary || '连续工作会话'}
+          inputLabel="合并后的会话名称"
+          onCancel={() => {
+            if (!mergeBusy) setMergeDialogOpen(false);
+          }}
+          onConfirm={(value) => void mergeSelected(value)}
+          title="合并会话"
+        />
+      )}
     </div>
   );
 }
@@ -2617,6 +2772,9 @@ function SearchCreateSelect({
       && onCreate
       && (canCreate ? canCreate(trimmedQuery) : true),
   );
+  const createIsFirst = showCreate && !filtered.some(
+    (option) => normalizeSearchText(option.label) === normalizedQuery,
+  );
   const itemCount = filtered.length + (showCreate ? 1 : 0);
 
   useEffect(() => {
@@ -2665,10 +2823,15 @@ function SearchCreateSelect({
         setOpen(true);
         return;
       }
-      const option = filtered[activeIndex];
+      if (createIsFirst && activeIndex === 0) {
+        void createCurrent();
+        return;
+      }
+      const optionIndex = createIsFirst ? activeIndex - 1 : activeIndex;
+      const option = filtered[optionIndex];
       if (option) {
         selectOption(option);
-      } else if (showCreate && activeIndex === filtered.length) {
+      } else if (showCreate && !createIsFirst && activeIndex === filtered.length) {
         void createCurrent();
       }
       return;
@@ -2679,6 +2842,26 @@ function SearchCreateSelect({
       close();
     }
   };
+
+  const renderCreateOption = (index: number) => showCreate && (
+    <button
+      aria-selected={false}
+      className={`create-option${activeIndex === index ? ' active' : ''}`}
+      id={`${listboxId}-option-${index}`}
+      key="create-option"
+      onClick={() => void createCurrent()}
+      onMouseDown={(event) => event.preventDefault()}
+      onMouseEnter={() => setActiveIndex(index)}
+      role="option"
+      type="button"
+    >
+      <Plus size={14} />
+      <span>
+        <strong>{createLabel ? createLabel(trimmedQuery) : `新建“${trimmedQuery}”`}</strong>
+        <small>按 Enter 直接创建</small>
+      </span>
+    </button>
+  );
 
   return (
     <div
@@ -2742,15 +2925,16 @@ function SearchCreateSelect({
       </div>
       {open && (
         <div className="search-create-menu" id={listboxId} role="listbox">
+          {createIsFirst && renderCreateOption(0)}
           {filtered.map((option, index) => (
             <button
               aria-selected={option.value === value}
-              className={`${index === activeIndex ? 'active' : ''}${option.value === value ? ' selected' : ''}`}
-              id={`${listboxId}-option-${index}`}
+              className={`${index + (createIsFirst ? 1 : 0) === activeIndex ? 'active' : ''}${option.value === value ? ' selected' : ''}`}
+              id={`${listboxId}-option-${index + (createIsFirst ? 1 : 0)}`}
               key={option.value}
               onClick={() => selectOption(option)}
               onMouseDown={(event) => event.preventDefault()}
-              onMouseEnter={() => setActiveIndex(index)}
+              onMouseEnter={() => setActiveIndex(index + (createIsFirst ? 1 : 0))}
               role="option"
               type="button"
             >
@@ -2766,24 +2950,7 @@ function SearchCreateSelect({
               {option.value === value && <Check size={14} />}
             </button>
           ))}
-          {showCreate && (
-            <button
-              aria-selected={false}
-              className={`create-option${activeIndex === filtered.length ? ' active' : ''}`}
-              id={`${listboxId}-option-${filtered.length}`}
-              onClick={() => void createCurrent()}
-              onMouseDown={(event) => event.preventDefault()}
-              onMouseEnter={() => setActiveIndex(filtered.length)}
-              role="option"
-              type="button"
-            >
-              <Plus size={14} />
-              <span>
-                <strong>{createLabel ? createLabel(trimmedQuery) : `新建“${trimmedQuery}”`}</strong>
-                <small>按 Enter 直接创建</small>
-              </span>
-            </button>
-          )}
+          {!createIsFirst && renderCreateOption(filtered.length)}
           {!filtered.length && !showCreate && <p>{emptyText}</p>}
         </div>
       )}
@@ -2835,7 +3002,13 @@ function EditSessionModal({
   const [keyword, setKeyword] = useState('');
   const [pin, setPin] = useState(false);
   const [renamingCategory, setRenamingCategory] = useState<CategoryOption | null>(null);
+  const [splitDialogOpen, setSplitDialogOpen] = useState(false);
+  const [splitBusy, setSplitBusy] = useState(false);
   const confirmation = useConfirmation();
+  const projectById = useMemo(
+    () => new Map(projectOptions.map((project) => [project.id, project])),
+    [projectOptions],
+  );
   const categorySearchOptions = useMemo<SearchSelectOption[]>(
     () => localCategories.map((item) => ({
       value: item.name,
@@ -2887,7 +3060,7 @@ function EditSessionModal({
       ...[...taskOptions]
         .sort((left, right) => {
           const priority = (task: Task) => {
-            const project = projectOptions.find((item) => item.id === task.projectId);
+            const project = projectById.get(task.projectId);
             if (projectId) {
               if (task.projectId === projectId) return taskId && task.id === taskId ? 0 : 1;
               if (category && project?.category === category) return 2;
@@ -2903,7 +3076,7 @@ function EditSessionModal({
             || left.title.localeCompare(right.title, 'zh-CN');
         })
         .map((task) => {
-          const project = projectOptions.find((item) => item.id === task.projectId);
+          const project = projectById.get(task.projectId);
           return {
             value: task.id,
             label: task.title,
@@ -2918,9 +3091,9 @@ function EditSessionModal({
           };
         }),
     ],
-    [category, projectId, projectOptions, taskId, taskOptions],
+    [category, projectById, projectId, taskId, taskOptions],
   );
-  const selectedProject = projectOptions.find((project) => project.id === projectId);
+  const selectedProject = projectById.get(projectId);
   const selectedCategory = localCategories.find((item) => item.name === category);
   const categoryIsEditable = Boolean(selectedCategory);
   const projectPlaceholder = category ? `搜索全部项目，“${category}”优先` : '搜索全部项目';
@@ -2945,7 +3118,7 @@ function EditSessionModal({
   const selectCategory = (name: string) => {
     setCategory(name);
     setCategoryTouched(true);
-    const selectedProject = projectOptions.find((project) => project.id === projectId);
+    const selectedProject = projectById.get(projectId);
     if (selectedProject && selectedProject.category !== name) {
       setProjectId('');
       setTaskId('');
@@ -2959,7 +3132,7 @@ function EditSessionModal({
     setTaskId('');
     setProjectTouched(true);
     setTaskTouched(true);
-    const selectedProject = projectOptions.find((project) => project.id === id);
+    const selectedProject = projectById.get(id);
     if (selectedProject) {
       setCategory(selectedProject.category);
       setCategoryTouched(true);
@@ -2973,7 +3146,7 @@ function EditSessionModal({
     if (!selectedTask) return;
     setProjectId(selectedTask.projectId);
     setProjectTouched(true);
-    const selectedProject = projectOptions.find((project) => project.id === selectedTask.projectId);
+    const selectedProject = projectById.get(selectedTask.projectId);
     if (selectedProject) {
       setCategory(selectedProject.category);
       setCategoryTouched(true);
@@ -3002,7 +3175,7 @@ function EditSessionModal({
   };
 
   const deleteSelectedProject = async () => {
-    const project = projectOptions.find((item) => item.id === projectId);
+    const project = projectById.get(projectId);
     if (!project || projectBusy) return;
     const accepted = await confirmation.confirm({
       title: `删除项目“${project.name}”？`,
@@ -3128,16 +3301,17 @@ function EditSessionModal({
     }
   };
 
-  const split = async () => {
-    const splitAt = window.prompt(
-      '拆分时间（ISO）',
-      new Date(
-        (new Date(session.startedAt).getTime() + new Date(session.endedAt).getTime()) / 2,
-      ).toISOString(),
-    );
-    if (!splitAt) return;
-    await api.splitSession(session.id, splitAt);
-    onClose();
+  const split = async (localValue: string) => {
+    const splitAt = new Date(localValue);
+    if (Number.isNaN(splitAt.getTime())) return;
+    setSplitBusy(true);
+    try {
+      await runAction(() => api.splitSession(session.id, splitAt.toISOString()), '会话已拆分');
+      setSplitDialogOpen(false);
+      onClose();
+    } finally {
+      setSplitBusy(false);
+    }
   };
 
   return (
@@ -3245,7 +3419,7 @@ function EditSessionModal({
                     && normalizeSearchText(task.title) === normalizeSearchText(query),
                 )}
                 createLabel={(query) => {
-                  const project = projectOptions.find((item) => item.id === projectId);
+                  const project = projectById.get(projectId);
                   return `在“${project?.name || '当前项目'}”中新建“${query}”`;
                 }}
                 emptyText={projectId ? '没有匹配任务' : '没有匹配任务；选择已有任务会自动带出项目和分类'}
@@ -3299,7 +3473,12 @@ function EditSessionModal({
             </details>
 
             <div className="modal-secondary">
-              <button onClick={() => void runAction(split, '会话已拆分')} type="button">
+              <button
+                disabled={new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime() < 10_000}
+                onClick={() => setSplitDialogOpen(true)}
+                title="拆分后两段都至少保留 5 秒"
+                type="button"
+              >
                 <SplitSquareHorizontal size={16} />拆分
               </button>
             </div>
@@ -3348,6 +3527,31 @@ function EditSessionModal({
             if (!categoryBusy) setRenamingCategory(null);
           }}
           onRename={(name) => void renameSelectedCategory(name)}
+        />
+      )}
+      {splitDialogOpen && (
+        <TextInputDialog
+          busy={splitBusy}
+          confirmLabel="确认拆分"
+          detail="选择分界时间；拆分后的两段都至少保留 5 秒。"
+          initialValue={toDateTimeLocalValue(new Date(
+            (new Date(session.startedAt).getTime() + new Date(session.endedAt).getTime()) / 2,
+          ))}
+          inputLabel="会话拆分时间"
+          isValid={(value) => {
+            const timestamp = new Date(value).getTime();
+            return timestamp >= new Date(session.startedAt).getTime() + 5_000
+              && timestamp <= new Date(session.endedAt).getTime() - 5_000;
+          }}
+          max={toDateTimeLocalValue(new Date(new Date(session.endedAt).getTime() - 5_000))}
+          min={toDateTimeLocalValue(new Date(new Date(session.startedAt).getTime() + 5_000))}
+          onCancel={() => {
+            if (!splitBusy) setSplitDialogOpen(false);
+          }}
+          onConfirm={(value) => void split(value)}
+          step={5}
+          title="拆分会话"
+          type="datetime-local"
         />
       )}
     </div>
@@ -3646,6 +3850,16 @@ function formatDateTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function toDateTimeLocalValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hour = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const second = String(date.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}`;
 }
 
 function localDateKey(date: Date) {

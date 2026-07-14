@@ -737,6 +737,8 @@ kbd {
 .session-row {
   position: relative;
   min-width: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 76px;
   padding: 11px;
   display: grid;
   grid-template-columns: 18px 65px minmax(0, 1fr) 66px auto;

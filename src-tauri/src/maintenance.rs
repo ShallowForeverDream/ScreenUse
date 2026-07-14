@@ -36,7 +36,9 @@ pub fn start_worker(db: Arc<AppDb>) {
 pub fn optimize_storage(db: &AppDb, aggressive: bool) -> Result<u32> {
     let settings = db.get_settings()?.normalized();
     let db_path = db.data_dir().join("screenuse.db");
-    let mut removed = remove_directory_children(&db.data_dir().join("media-cache"))?;
+    let mut removed = db.repair_session_timeline()?;
+    removed += db.compact_sessions()?;
+    removed += remove_directory_children(&db.data_dir().join("media-cache"))?;
 
     let conn = Connection::open(&db_path).with_context(|| format!("cannot open {}", db_path.display()))?;
     conn.busy_timeout(StdDuration::from_secs(5))?;

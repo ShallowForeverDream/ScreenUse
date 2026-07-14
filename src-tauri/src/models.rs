@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "无效"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputStats {
     pub idle_seconds: u64,
@@ -14,18 +14,6 @@ pub struct InputStats {
     pub mouse_clicks: u32,
     pub scroll_ticks: u32,
     pub shortcut_events: Vec<String>,
-}
-
-impl Default for InputStats {
-    fn default() -> Self {
-        Self {
-            idle_seconds: 0,
-            keyboard_events: 0,
-            mouse_clicks: 0,
-            scroll_ticks: 0,
-            shortcut_events: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +288,18 @@ impl AppSettings {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AttributionSessionInput {
+    pub range: TimeRange,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub category: String,
+    pub summary: String,
+    pub confidence: f32,
+    pub evidence: Vec<EvidenceItem>,
+    pub source: String,
+}
+
 fn clean_setting_label(value: &str, fallback: &str) -> String {
     let value = value.trim().replace(['\r', '\n', '\t'], " ");
     let value: String = value.chars().take(80).collect();
@@ -346,12 +346,16 @@ mod tests {
         assert_eq!(existing.poll_interval_seconds, 1);
         assert!(existing.passive_content_counts_as_active);
 
-        let mut invalid = AppSettings::default();
-        invalid.theme = "unknown".into();
+        let invalid = AppSettings {
+            theme: "unknown".into(),
+            ..AppSettings::default()
+        };
         assert_eq!(invalid.normalized().theme, "light");
 
-        let mut dark = AppSettings::default();
-        dark.theme = "dark".into();
+        let dark = AppSettings {
+            theme: "dark".into(),
+            ..AppSettings::default()
+        };
         assert_eq!(dark.normalized().theme, "dark");
 
         let legacy: AppSettings =

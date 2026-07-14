@@ -309,16 +309,6 @@ fn import_ics(state: State<AppState>, path: String) -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn import_google_calendar_placeholder() -> usize {
-    integrations::google_calendar_placeholder().len()
-}
-
-#[tauri::command]
-fn import_microsoft_todo_placeholder() -> usize {
-    integrations::microsoft_todo_placeholder().len()
-}
-
-#[tauri::command]
 fn save_secret(name: String, value: String) -> Result<String, String> {
     secrets::save_secret(&name, &value).map_err(map_err)
 }
@@ -411,6 +401,17 @@ fn setup_tray(
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Login startup and an already-running background process should stay
+            // silent. A normal second launch brings the existing window forward.
+            if !args.iter().any(|arg| arg == "--background") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -438,9 +439,14 @@ fn main() {
             if settings.auto_start {
                 collector.start(db.clone()).map_err(tauri::Error::Anyhow)?;
             }
-            if autostart::background_launch_requested() {
-                if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window("main") {
+                if autostart::background_launch_requested() {
                     let _ = window.hide();
+                } else {
+                    // The window starts hidden in tauri.conf.json so login startup
+                    // cannot flash before setup decides whether this is interactive.
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
             app.manage(AppState { db, collector });
@@ -480,8 +486,6 @@ fn main() {
             backup_now,
             reveal_data_dir,
             import_ics,
-            import_google_calendar_placeholder,
-            import_microsoft_todo_placeholder,
             save_secret,
             read_secret_probe,
             delete_secret,

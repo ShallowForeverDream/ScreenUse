@@ -8,7 +8,6 @@ use std::path::Path;
 use std::collections::hash_map::DefaultHasher;
 
 pub trait IntegrationAdapter {
-    fn name(&self) -> &'static str;
     fn pull_plan_items(&self) -> Result<Vec<PlanItem>>;
 }
 
@@ -17,7 +16,6 @@ pub struct IcsAdapter {
 }
 
 impl IntegrationAdapter for IcsAdapter {
-    fn name(&self) -> &'static str { "ics" }
     fn pull_plan_items(&self) -> Result<Vec<PlanItem>> {
         parse_ics_file(&self.path)
     }
@@ -59,9 +57,6 @@ pub fn parse_ics_file(path: &str) -> Result<Vec<PlanItem>> {
     }
     Ok(items)
 }
-
-pub fn google_calendar_placeholder() -> Vec<PlanItem> { vec![] }
-pub fn microsoft_todo_placeholder() -> Vec<PlanItem> { vec![] }
 
 fn unfold_ics_lines(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
