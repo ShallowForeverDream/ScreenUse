@@ -1040,6 +1040,7 @@ function TodayView({
 }) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(DEFAULT_TIMELINE_ZOOM);
+  const [showDetailedSegments, setShowDetailedSegments] = useState(false);
   const review = sessions.filter(needsReview).slice(0, 4);
   const projectRows = projectBreakdown(sessions, selectedDate).slice(0, 6);
   const projectTotal = projectRows.reduce((sum, row) => sum + row.minutes, 0);
@@ -1163,33 +1164,46 @@ function TodayView({
         <PanelTitle
           title="今日时间段"
           action={
-            <div className="timeline-zoom" aria-label="时间刻度缩放">
+            <div className="timeline-controls">
               <button
-                onClick={() => setTimelineZoom((value) => Math.max(0, value - 1))}
-                disabled={timelineZoom === 0}
-                title="缩小时间刻度（也可按 Ctrl 向下滚轮）"
+                aria-label={showDetailedSegments ? '合并相邻的相同任务' : '显示每个原始时间段'}
+                aria-pressed={showDetailedSegments}
+                className={`timeline-detail-toggle${showDetailedSegments ? ' active' : ''}`}
+                onClick={() => setShowDetailedSegments((value) => !value)}
+                title={showDetailedSegments ? '合并相邻的相同任务' : '显示每个原始时间段'}
                 type="button"
               >
-                <ZoomOut size={15} />
+                <SplitSquareHorizontal size={15} />
               </button>
-              <span>{TIMELINE_SCALES[timelineZoom].label}</span>
-              <button
-                onClick={() => setTimelineZoom((value) => Math.min(TIMELINE_SCALES.length - 1, value + 1))}
-                disabled={timelineZoom === TIMELINE_SCALES.length - 1}
-                title="放大时间刻度（也可按 Ctrl 向上滚轮）"
-                type="button"
-              >
-                <ZoomIn size={15} />
-              </button>
+              <div className="timeline-zoom" aria-label="时间刻度缩放">
+                <button
+                  onClick={() => setTimelineZoom((value) => Math.max(0, value - 1))}
+                  disabled={timelineZoom === 0}
+                  title="缩小时间刻度（也可按 Ctrl 向下滚轮）"
+                  type="button"
+                >
+                  <ZoomOut size={15} />
+                </button>
+                <span>{TIMELINE_SCALES[timelineZoom].label}</span>
+                <button
+                  onClick={() => setTimelineZoom((value) => Math.min(TIMELINE_SCALES.length - 1, value + 1))}
+                  disabled={timelineZoom === TIMELINE_SCALES.length - 1}
+                  title="放大时间刻度（也可按 Ctrl 向上滚轮）"
+                  type="button"
+                >
+                  <ZoomIn size={15} />
+                </button>
+              </div>
             </div>
           }
         />
         <DayActivityTimeline
+          detailed={showDetailedSegments}
           sessions={sessions}
           selectedDate={selectedDate}
           zoom={timelineZoom}
           onZoomChange={setTimelineZoom}
-          onEdit={(session) => onEdit([session])}
+          onEdit={onEdit}
         />
       </section>
 
@@ -1254,17 +1268,19 @@ function TodayView({
 }
 
 function DayActivityTimeline({
+  detailed,
   sessions,
   selectedDate,
   zoom,
   onZoomChange,
   onEdit,
 }: {
+  detailed: boolean;
   sessions: WorkSession[];
   selectedDate: string;
   zoom: number;
   onZoomChange: (zoom: number) => void;
-  onEdit: (session: WorkSession) => void;
+  onEdit: (sessions: WorkSession[]) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const centerRef = useRef<{ date: string; seconds: number } | null>(null);
@@ -1287,6 +1303,35 @@ function DayActivityTimeline({
     ),
     [sessions],
   );
+  const groups = useMemo(() => {
+    const result: Array<{
+      id: string;
+      sessions: WorkSession[];
+      startedAt: string;
+      endedAt: string;
+    }> = [];
+    for (const session of sorted) {
+      const previous = result[result.length - 1];
+      const previousSession = previous?.sessions[previous.sessions.length - 1];
+      const touchesPrevious = previous
+        && new Date(session.startedAt).getTime() <= new Date(previous.endedAt).getTime() + 5_000;
+      if (!detailed && previous && previousSession
+        && touchesPrevious && sameTimelineTask(previousSession, session)) {
+        previous.sessions.push(session);
+        if (new Date(session.endedAt).getTime() > new Date(previous.endedAt).getTime()) {
+          previous.endedAt = session.endedAt;
+        }
+      } else {
+        result.push({
+          id: session.id,
+          sessions: [session],
+          startedAt: session.startedAt,
+          endedAt: session.endedAt,
+        });
+      }
+    }
+    return result;
+  }, [detailed, sorted]);
   const initialCenterSeconds = useMemo(() => {
     if (selectedDate === localDateKey(new Date())) {
       const now = new Date();
@@ -1415,30 +1460,40 @@ function DayActivityTimeline({
             className="day-track-lane"
             style={{ backgroundSize: `${TIMELINE_GRID_WIDTH}px 100%` }}
           >
-            {sorted.map((session) => {
-              const bounds = sessionBoundsOnDate(session, selectedDate);
-              const app = sessionApplication(session);
+            {groups.map((group) => {
+              const primary = group.sessions[0];
+              const displaySession = group.sessions.length === 1
+                ? primary
+                : {
+                    ...primary,
+                    startedAt: group.startedAt,
+                    endedAt: group.endedAt,
+                    summary: primary.taskTitle || primary.summary,
+                  };
+              const bounds = sessionBoundsOnDate(displaySession, selectedDate);
+              const applications = [...new Set(group.sessions.map(sessionApplication))];
+              const app = `${applications.slice(0, 3).join('、')}${applications.length > 3 ? ` 等 ${applications.length} 个应用` : ''}${group.sessions.length > 1 ? ` · 合并 ${group.sessions.length} 段` : ''}`;
               const blockWidth = Math.max(1, Math.max(5, bounds.durationSeconds) * pixelsPerSecond);
-              const timeRange = `${formatTimelineClock(session.startedAt, true)}–${formatTimelineClock(session.endedAt, true)}`;
+              const timeRange = `${formatTimelineClock(group.startedAt, true)}–${formatTimelineClock(group.endedAt, true)}`;
               return (
                 <button
-                  aria-label={`${timeRange}，${session.summary}，${app}，点击修正`}
-                  className={`day-track-block${needsReview(session) ? ' needs-review' : ''}`}
-                  key={session.id}
+                  aria-label={`${timeRange}，${displaySession.summary}，${app}，点击修正`}
+                  className={`day-track-block${group.sessions.some(needsReview) ? ' needs-review' : ''}`}
+                  key={group.id}
                   onBlur={() => setTooltip(null)}
                   onClick={() => {
                     setTooltip(null);
-                    onEdit(session);
+                    onEdit(group.sessions);
                   }}
-                  onFocus={(event) => showSessionTooltip(event.currentTarget, session, app, timeRange)}
-                  onMouseEnter={(event) => showSessionTooltip(event.currentTarget, session, app, timeRange)}
+                  onFocus={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
+                  onMouseEnter={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
                   onMouseLeave={() => setTooltip(null)}
                   type="button"
                   style={
                     {
                       left: bounds.startSeconds * pixelsPerSecond,
                       width: blockWidth,
-                      '--block-color': categoryColor(session.category),
+                      '--block-color': categoryColor(primary.category),
                     } as CSSProperties
                   }
                 />
@@ -1491,6 +1546,12 @@ function CategoryDetailModal({
     0,
   );
   const allSelected = sorted.length > 0 && selected.size === sorted.length;
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selected.size > 0 && !allSelected;
+    }
+  }, [allSelected, selected.size]);
   const editSession = (session: WorkSession) => {
     const belongsToSelection = selected.has(session.id);
     onEdit(belongsToSelection && selectedSessions.length > 1 ? selectedSessions : [session]);
@@ -1517,14 +1578,26 @@ function CategoryDetailModal({
             </div>
           </div>
           <div className="category-detail-actions">
-            <label>
+            <label className="selection-toggle" title={`选择全部 ${sorted.length} 个时间段`}>
               <input
+                className="themed-checkbox"
+                ref={selectAllRef}
                 type="checkbox"
                 checked={allSelected}
-                onChange={() => setSelected(allSelected ? new Set() : new Set(sorted.map((session) => session.id)))}
+                onChange={(event) => setSelected(
+                  event.target.checked ? new Set(sorted.map((session) => session.id)) : new Set(),
+                )}
               />
               全选
             </label>
+            <button
+              className="selection-clear"
+              disabled={!selected.size}
+              onClick={() => setSelected(new Set())}
+              type="button"
+            >
+              全不选
+            </button>
             <button
               disabled={!selectedSessions.length}
               onClick={() => onEdit(selectedSessions)}
@@ -1545,6 +1618,7 @@ function CategoryDetailModal({
             <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
               <label className="category-session-check" aria-label={`选择 ${session.summary}`}>
                 <input
+                  className="themed-checkbox"
                   checked={selected.has(session.id)}
                   onChange={() => toggle(session.id)}
                   type="checkbox"
@@ -1612,11 +1686,31 @@ function TimelineView({
       .includes(normalized);
   });
   const selectedSessions = sessions.filter((session) => selected.has(session.id));
+  const filteredSelectedCount = filtered.reduce(
+    (count, session) => count + Number(selected.has(session.id)),
+    0,
+  );
+  const allFilteredSelected = filtered.length > 0 && filteredSelectedCount === filtered.length;
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = filteredSelectedCount > 0 && !allFilteredSelected;
+    }
+  }, [allFilteredSelected, filteredSelectedCount]);
 
   const toggle = (id: string) => {
     const next = new Set(selected);
     if (next.has(id)) next.delete(id);
     else next.add(id);
+    setSelected(next);
+  };
+
+  const toggleAllFiltered = (checked: boolean) => {
+    const next = new Set(selected);
+    filtered.forEach((session) => {
+      if (checked) next.add(session.id);
+      else next.delete(session.id);
+    });
     setSelected(next);
   };
 
@@ -1652,12 +1746,34 @@ function TimelineView({
           </label>
           <label className="switch-label">
             <input
+              className="themed-checkbox"
               type="checkbox"
               checked={reviewOnly}
               onChange={(event) => setReviewOnly(event.target.checked)}
             />
             只看待复核
           </label>
+          <div className="selection-controls">
+            <label className="selection-toggle" title={`选择当前显示的 ${filtered.length} 个时间段`}>
+              <input
+                className="themed-checkbox"
+                ref={selectAllRef}
+                type="checkbox"
+                checked={allFilteredSelected}
+                disabled={!filtered.length}
+                onChange={(event) => toggleAllFiltered(event.target.checked)}
+              />
+              全选
+            </label>
+            <button
+              className="selection-clear"
+              disabled={!selected.size}
+              onClick={() => setSelected(new Set())}
+              type="button"
+            >
+              全不选
+            </button>
+          </div>
           <button
             disabled={!selectedSessions.length}
             onClick={() => onEdit(selectedSessions)}
@@ -1761,7 +1877,7 @@ function SessionRow({
       style={{ '--session-color': categoryColor(session.category) } as CSSProperties}
     >
       <label className="select-session" title="选择会话">
-        <input type="checkbox" checked={selected} onChange={onToggle} />
+        <input className="themed-checkbox" type="checkbox" checked={selected} onChange={onToggle} />
       </label>
       <div className="time-cell">
         <strong>{formatClock(session.startedAt)}</strong>
@@ -3441,11 +3557,11 @@ function EditSessionModal({
 
         <div className="correction-options">
           <label>
-            <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
+            <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
             <span><strong>记住规则</strong><small>以后按上下文识别，不按应用名硬归类</small></span>
           </label>
           <label className={!projectId ? 'disabled' : ''}>
-            <input type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />
+            <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />
             <span><strong>固定 30 分钟</strong><small>适合 ChatGPT、终端等上下文不明确的应用</small></span>
           </label>
           {remember && (
@@ -3790,6 +3906,12 @@ function sessionBoundsOnDate(session: WorkSession, dateKey: string) {
     startSeconds: Math.max(0, (start - dayStart) / 1000),
     durationSeconds: Math.max(0, (end - start) / 1000),
   };
+}
+
+function sameTimelineTask(left: WorkSession, right: WorkSession) {
+  if (left.category !== right.category || left.projectId !== right.projectId) return false;
+  if (left.taskId || right.taskId) return Boolean(left.taskId && left.taskId === right.taskId);
+  return left.summary.trim() === right.summary.trim();
 }
 
 function sessionApplication(session: WorkSession) {
