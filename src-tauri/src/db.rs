@@ -1018,6 +1018,27 @@ impl AppDb {
         collect_rows(rows)
     }
 
+    pub fn list_sessions_in_range(
+        &self,
+        started_at: &str,
+        ended_at: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkSession>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(r#"
+            SELECT ws.id, ws.started_at, ws.ended_at, ws.project_id, p.name, ws.task_id, t.title,
+                   ws.category, ws.summary, ws.confidence, ws.evidence_json, ws.user_confirmed, ws.source
+            FROM work_sessions ws
+            LEFT JOIN projects p ON p.id = ws.project_id
+            LEFT JOIN tasks t ON t.id = ws.task_id
+            WHERE ws.ended_at >= ?1 AND ws.started_at <= ?2
+            ORDER BY ws.started_at ASC
+            LIMIT ?3
+        "#)?;
+        let rows = stmt.query_map(params![started_at, ended_at, limit], map_work_session)?;
+        collect_rows(rows)
+    }
+
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
         let project_was_explicit = patch.project_id.is_some();
@@ -1155,6 +1176,26 @@ impl AppDb {
             updated.push(self.update_session(id, patch.clone())?);
         }
         Ok(updated)
+    }
+
+    pub fn apply_ai_review(
+        &self,
+        id: &str,
+        patch: SessionPatch,
+        evidence: Vec<EvidenceItem>,
+    ) -> Result<WorkSession> {
+        let updated = self.update_session(id, patch)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE work_sessions
+             SET evidence_json=?1,source='ai-review',user_confirmed=0,updated_at=?2
+             WHERE id=?3",
+            params![serde_json::to_string(&evidence)?, now(), updated.id],
+        )?;
+        drop(conn);
+        self.match_plan_items_for_session(&updated.id)?;
+        self.get_session(&updated.id)?
+            .context("AI-reviewed session disappeared")
     }
 
     pub fn propagate_context_from_sessions(&self, anchor_ids: &[String]) -> Result<u32> {
@@ -2011,6 +2052,20 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn analysis_job_session_ids(&self) -> Result<HashSet<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_ids_json FROM analysis_jobs
+             WHERE status IN ('pending','running','failed','downgraded')",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            ids.extend(parse_json::<Vec<String>>(&row?));
+        }
+        Ok(ids)
+    }
+
     pub fn claim_next_analysis_job(&self) -> Result<Option<AnalysisJob>> {
         let conn = self.conn.lock();
         let job = conn.query_row(
@@ -2159,55 +2214,6 @@ impl AppDb {
             params![id, project_id, title, source, now()],
         )?;
         Ok(id)
-    }
-
-    pub fn materialize_attribution_session(
-        &self,
-        input: AttributionSessionInput,
-    ) -> Result<WorkSession> {
-        let id = Uuid::new_v4().to_string();
-        let evidence_json = serde_json::to_string(&input.evidence)?;
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM work_sessions
-             WHERE user_confirmed=0
-               AND source IN ('collector-rule','ai-analysis','rule-downgrade')
-               AND ended_at >= ?1
-               AND started_at <= ?2",
-            params![input.range.started_at, input.range.ended_at],
-        )?;
-        conn.execute(
-            "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11)",
-            params![
-                id,
-                input.range.started_at,
-                input.range.ended_at,
-                input.project_id,
-                input.task_id,
-                input.category,
-                input.summary,
-                input.confidence.clamp(0.0, 1.0),
-                evidence_json,
-                input.source,
-                now()
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO activities VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                Uuid::new_v4().to_string(),
-                id,
-                input.source,
-                "自动归因活动",
-                input.summary,
-                input.range.started_at,
-                input.range.ended_at,
-                serde_json::to_string(&input.evidence)?
-            ],
-        )?;
-        drop(conn);
-        self.match_plan_items_for_session(&id)?;
-        self.get_session(&id)?.context("inserted session missing")
     }
 
     fn match_plan_items_for_session(&self, session_id: &str) -> Result<()> {
@@ -3328,6 +3334,55 @@ mod tests {
         assert_eq!(session.evidence[0].kind, "page");
         assert_eq!(session.evidence[0].label, "当前页面");
         assert_eq!(session.evidence[0].value, "ICPC 训练计划.docx");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn ai_review_updates_the_target_in_place_without_creating_an_overlap() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-ai-in-place-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let session = classification::ingest_event(&db, &chat_event("ai-target", "成果填报群"))
+            .expect("ingest target")
+            .expect("target session");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let count_before = db.list_sessions(500).expect("sessions before").len();
+        let reviewed = db
+            .apply_ai_review(
+                &session.id,
+                SessionPatch {
+                    summary: Some("沟通推免成果填报".into()),
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some(category.name.clone()),
+                    confidence: Some(0.93),
+                    user_confirmed: Some(false),
+                },
+                vec![EvidenceItem {
+                    kind: "ai".into(),
+                    label: "上下文".into(),
+                    value: "前一时段为成果填报".into(),
+                    weight: 0.9,
+                }],
+            )
+            .expect("apply AI review");
+        assert_eq!(reviewed.id, session.id);
+        assert_eq!(reviewed.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(reviewed.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(reviewed.source, "ai-review");
+        assert!(!reviewed.user_confirmed);
+        assert_eq!(db.list_sessions(500).expect("sessions after").len(), count_before);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

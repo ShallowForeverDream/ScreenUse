@@ -124,6 +124,7 @@ export interface AppSettings {
   launchAtLogin: boolean;
   quickPauseEnabled: boolean;
   aiMode: AiMode;
+  aiProvider: 'codex-account' | 'openai-compatible' | string;
   minAiSessionMinutes: number;
   aiBaseUrl: string;
   aiModel: string;

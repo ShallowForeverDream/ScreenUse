@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tiny_http = "0.12"
-tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.42", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]

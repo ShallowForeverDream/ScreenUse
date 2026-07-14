@@ -2226,7 +2226,7 @@ function SettingsView({
 
   const saveAll = async () => {
     let next = { ...settings };
-    if (secret.trim()) {
+    if (settings.aiProvider === 'openai-compatible' && secret.trim()) {
       const secretName = settings.aiSecretRef?.trim() || 'openai-compatible';
       await api.saveSecret(secretName, secret.trim());
       next = { ...next, aiSecretRef: secretName };
@@ -2361,15 +2361,31 @@ function SettingsView({
           title="可选 AI 复核"
           subtitle="本地规则始终先运行；不开 AI 也能完整使用。"
         />
-        <Field label="AI 模式" hint="个人使用推荐关闭或手动复核。">
+        <Field label="AI 模式" hint="只复核低于 80% 且达到最低时长的已结束会话。">
           <select value={settings.aiMode} onChange={(event) => update('aiMode', event.target.value)}>
             <option value="off">关闭（零费用）</option>
-            <option value="manual">手动复核低置信长会话</option>
-            <option value="auto">自动复核低置信长会话</option>
+            <option value="manual">手动复核低置信会话</option>
+            <option value="auto">自动复核低置信会话</option>
           </select>
         </Field>
         {settings.aiMode !== 'off' && (
           <div className="ai-fields">
+            <Field label="AI 来源" hint="Codex 模式直接复用当前 ChatGPT 登录，不读取或复制账号令牌。">
+              <select
+                value={settings.aiProvider}
+                onChange={(event) => {
+                  const provider = event.target.value;
+                  setSettings((current) => ({
+                    ...current,
+                    aiProvider: provider,
+                    aiModel: provider === 'codex-account' ? 'gpt-5.6-luna' : current.aiModel,
+                  }));
+                }}
+              >
+                <option value="codex-account">当前 Codex / ChatGPT 账号</option>
+                <option value="openai-compatible">OpenAI-compatible API</option>
+              </select>
+            </Field>
             <Field label="最低会话时长" hint="短碎片不调用模型。">
               <NumberInput
                 value={settings.minAiSessionMinutes}
@@ -2379,35 +2395,43 @@ function SettingsView({
                 onChange={(value) => update('minAiSessionMinutes', value)}
               />
             </Field>
-            <Field label="API Base">
-              <input
-                value={settings.aiBaseUrl}
-                onChange={(event) => update('aiBaseUrl', event.target.value)}
-                placeholder="https://api.openai.com/v1"
-              />
-            </Field>
-            <Field label="模型名" hint="选择支持 JSON 输出的小模型即可。">
+            <Field
+              label="模型名"
+              hint={settings.aiProvider === 'codex-account' ? 'Luna 适合高频、结构化的分类任务。' : '填写服务端支持的模型 ID。'}
+            >
               <input
                 value={settings.aiModel}
                 onChange={(event) => update('aiModel', event.target.value)}
-                placeholder="例如低价 mini / flash 模型"
+                placeholder="gpt-5.6-luna"
+                readOnly={settings.aiProvider === 'codex-account'}
               />
             </Field>
-            <Field label="凭据名称">
-              <input
-                value={settings.aiSecretRef || ''}
-                onChange={(event) => update('aiSecretRef', event.target.value)}
-                placeholder="openai-compatible"
-              />
-            </Field>
-            <Field label="API Key" hint="留空不会覆盖已保存凭据。">
-              <input
-                type="password"
-                value={secret}
-                onChange={(event) => setSecret(event.target.value)}
-                placeholder="保存到系统凭据库"
-              />
-            </Field>
+            {settings.aiProvider === 'openai-compatible' && (
+              <>
+                <Field label="API Base">
+                  <input
+                    value={settings.aiBaseUrl}
+                    onChange={(event) => update('aiBaseUrl', event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </Field>
+                <Field label="凭据名称">
+                  <input
+                    value={settings.aiSecretRef || ''}
+                    onChange={(event) => update('aiSecretRef', event.target.value)}
+                    placeholder="openai-compatible"
+                  />
+                </Field>
+                <Field label="API Key" hint="留空不会覆盖已保存凭据。">
+                  <input
+                    type="password"
+                    value={secret}
+                    onChange={(event) => setSecret(event.target.value)}
+                    placeholder="保存到系统凭据库"
+                  />
+                </Field>
+              </>
+            )}
             <button
               onClick={() =>
                 void runAction(
@@ -2424,8 +2448,8 @@ function SettingsView({
         <div className="setting-callout">
           <WandSparkles size={19} />
           <div>
-            <strong>单次载荷有硬上限</strong>
-            <span>最多发送 80 条精简元数据，URL 查询参数会去除，30 秒自动超时。</span>
+            <strong>一次结合整段工作上下文</strong>
+            <span>每批最多 8 个目标，附带前后 30 分钟时间段及全部分类、项目、任务；URL 查询参数会去除。</span>
           </div>
         </div>
       </section>

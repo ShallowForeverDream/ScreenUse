@@ -342,12 +342,19 @@ async fn test_ai_config(settings: AppSettings, secret_name: String) -> Result<St
     if settings.ai_model.trim().is_empty() {
         return Err("模型名不能为空".into());
     }
+    if settings.ai_provider == "codex-account" {
+        ai::probe_codex_account().await.map_err(map_err)?;
+        return Ok(format!(
+            "已连接当前 Codex ChatGPT 账号，将使用 {} 复核",
+            settings.ai_model
+        ));
+    }
     let secret = secrets::read_secret(&secret_name).map_err(map_err)?;
     if secret.trim().is_empty() {
         return Err("凭据为空".into());
     }
     let _client = ai::OpenAiCompatibleClient::new(&settings, secret);
-    Ok("配置可读取。AI 只会接收低置信会话的窗口、网址、文件和工作区元数据。".into())
+    Ok("配置可读取。AI 会接收目标会话、前后时间线和完整分类树。".into())
 }
 
 fn run_optional_ai(db: Arc<AppDb>) {

@@ -204,6 +204,7 @@ pub struct AppSettings {
     // AI is optional and disabled by default. "manual" analyzes one uncertain
     // completed session when explicitly requested; "auto" also processes queued jobs.
     pub ai_mode: String,
+    pub ai_provider: String,
     pub min_ai_session_minutes: u32,
     pub ai_base_url: String,
     pub ai_model: String,
@@ -237,7 +238,8 @@ impl Default for AppSettings {
             launch_at_login: false,
             quick_pause_enabled: true,
             ai_mode: "off".into(),
-            min_ai_session_minutes: 10,
+            ai_provider: String::new(),
+            min_ai_session_minutes: 1,
             ai_base_url: "https://api.openai.com/v1".into(),
             ai_model: "".into(),
             ai_secret_ref: None,
@@ -273,6 +275,22 @@ impl AppSettings {
             _ => "off",
         }
         .into();
+        self.ai_provider = match self.ai_provider.as_str() {
+            "codex-account" => "codex-account",
+            "openai-compatible" => "openai-compatible",
+            _ if self.ai_secret_ref.as_deref().is_some_and(|value| !value.trim().is_empty())
+                || (!self.ai_model.trim().is_empty()
+                    && self.ai_model.trim() != "gpt-5.6-luna")
+                || self.ai_base_url.trim_end_matches('/') != "https://api.openai.com/v1" =>
+            {
+                "openai-compatible"
+            }
+            _ => "codex-account",
+        }
+        .into();
+        if self.ai_provider == "codex-account" && self.ai_model.trim().is_empty() {
+            self.ai_model = "gpt-5.6-luna".into();
+        }
 
         self.capture_scope = "metadata-only".into();
         self.fps = 0.0;
@@ -286,18 +304,6 @@ impl AppSettings {
         self.temp_storage_limit_gb = 1;
         self
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AttributionSessionInput {
-    pub range: TimeRange,
-    pub project_id: Option<String>,
-    pub task_id: Option<String>,
-    pub category: String,
-    pub summary: String,
-    pub confidence: f32,
-    pub evidence: Vec<EvidenceItem>,
-    pub source: String,
 }
 
 fn clean_setting_label(value: &str, fallback: &str) -> String {
@@ -345,6 +351,10 @@ mod tests {
         assert_eq!(existing.theme, "light");
         assert_eq!(existing.poll_interval_seconds, 1);
         assert!(existing.passive_content_counts_as_active);
+        let normalized_existing = existing.normalized();
+        assert_eq!(normalized_existing.ai_provider, "codex-account");
+        assert_eq!(normalized_existing.ai_model, "gpt-5.6-luna");
+        assert_eq!(normalized_existing.min_ai_session_minutes, 1);
 
         let invalid = AppSettings {
             theme: "unknown".into(),
