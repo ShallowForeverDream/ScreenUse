@@ -1072,8 +1072,8 @@ kbd {
   transition: border-color .16s ease, box-shadow .16s ease;
 }
 .search-create-select.open .search-create-input {
-  border-color: color-mix(in srgb, var(--blue-strong) 72%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue-strong) 13%, transparent);
+  border-color: var(--text-secondary);
+  box-shadow: none;
 }
 .search-create-input > svg { justify-self: end; color: var(--subtle); }
 .search-create-input input {
@@ -1139,6 +1139,7 @@ kbd {
   border-radius: 50%;
   background: var(--option-color);
 }
+.search-create-menu > button > i.empty { background: transparent; }
 .search-create-menu > button > span { min-width: 0; }
 .search-create-menu strong,
 .search-create-menu small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

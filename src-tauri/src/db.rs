@@ -931,60 +931,137 @@ impl AppDb {
         let previous = self
             .get_session(&previous_id)?
             .context("previous session not found")?;
-        if !can_auto_coalesce(&previous, &current) {
-            return Ok(current);
+        if can_auto_coalesce(&previous, &current) {
+            return self.merge_sessions_into(&previous, &[current]);
         }
 
-        let summary = preferred_coalesced_summary(&previous.summary, &current.summary);
-        let evidence = merge_evidence(&previous.evidence, &current.evidence);
-        let confidence = previous.confidence.max(current.confidence);
+        let Some((anchor, mut middle)) = self.find_short_detour_anchor(&current)? else {
+            return Ok(current);
+        };
+        middle.push(current);
+        self.merge_sessions_into(&anchor, &middle)
+    }
+
+    fn find_short_detour_anchor(
+        &self,
+        current: &WorkSession,
+    ) -> Result<Option<(WorkSession, Vec<WorkSession>)>> {
+        let candidate_ids = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM work_sessions
+                 WHERE started_at < ?1
+                 ORDER BY started_at DESC
+                 LIMIT 8",
+            )?;
+            let rows = stmt.query_map(params![current.started_at], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+
+        for candidate_id in candidate_ids {
+            let Some(anchor) = self.get_session(&candidate_id)? else {
+                continue;
+            };
+            if !can_bridge_short_detour(&anchor, current) {
+                continue;
+            }
+            let middle_ids = {
+                let conn = self.conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM work_sessions
+                     WHERE started_at >= ?1 AND ended_at <= ?2 AND id <> ?3
+                     ORDER BY started_at ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![anchor.ended_at, current.started_at, anchor.id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                collect_rows(rows)?
+            };
+            if middle_ids.is_empty() || middle_ids.len() > 6 {
+                continue;
+            }
+            let mut middle = Vec::with_capacity(middle_ids.len());
+            for middle_id in middle_ids {
+                if let Some(session) = self.get_session(&middle_id)? {
+                    middle.push(session);
+                }
+            }
+            if short_detour_is_compatible(&anchor, &middle, current) {
+                return Ok(Some((anchor, middle)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn merge_sessions_into(
+        &self,
+        anchor: &WorkSession,
+        following: &[WorkSession],
+    ) -> Result<WorkSession> {
+        let Some(last) = following.last() else {
+            return Ok(anchor.clone());
+        };
+        let mut summary = anchor.summary.clone();
+        let mut evidence = anchor.evidence.clone();
+        let mut confidence = anchor.confidence;
+        for session in following {
+            summary = preferred_coalesced_summary(&summary, &session.summary);
+            evidence = merge_evidence(&evidence, &session.evidence);
+            confidence = confidence.max(session.confidence);
+        }
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE work_sessions SET ended_at=?1,summary=?2,confidence=?3,evidence_json=?4,updated_at=?5 WHERE id=?6",
-            params![current.ended_at, summary, confidence, serde_json::to_string(&evidence)?, now(), previous.id],
+            params![last.ended_at, summary, confidence, serde_json::to_string(&evidence)?, now(), anchor.id],
         )?;
         conn.execute(
             "UPDATE activities SET ended_at=?1,summary=?2,evidence_json=?3 WHERE session_id=?4",
             params![
-                current.ended_at,
+                last.ended_at,
                 summary,
                 serde_json::to_string(&evidence)?,
-                previous.id
+                anchor.id
             ],
         )?;
 
-        let plan_updates = {
-            let mut stmt = conn.prepare(
-                "SELECT id,matched_session_ids_json FROM plan_items WHERE matched_session_ids_json LIKE ?1",
-            )?;
-            let rows = stmt.query_map(params![format!("%{}%", current.id)], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut updates = Vec::new();
-            for row in rows {
-                let (plan_id, matched_json) = row?;
-                let mut matched: Vec<String> = parse_json(&matched_json);
-                for session_id in &mut matched {
-                    if session_id == &current.id {
-                        *session_id = previous.id.clone();
+        for absorbed in following {
+            let plan_updates = {
+                let mut stmt = conn.prepare(
+                    "SELECT id,matched_session_ids_json FROM plan_items WHERE matched_session_ids_json LIKE ?1",
+                )?;
+                let rows = stmt.query_map(params![format!("%{}%", absorbed.id)], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut updates = Vec::new();
+                for row in rows {
+                    let (plan_id, matched_json) = row?;
+                    let mut matched: Vec<String> = parse_json(&matched_json);
+                    for session_id in &mut matched {
+                        if session_id == &absorbed.id {
+                            *session_id = anchor.id.clone();
+                        }
                     }
+                    matched.sort();
+                    matched.dedup();
+                    updates.push((plan_id, serde_json::to_string(&matched)?));
                 }
-                matched.sort();
-                matched.dedup();
-                updates.push((plan_id, serde_json::to_string(&matched)?));
+                updates
+            };
+            for (plan_id, matched_json) in plan_updates {
+                conn.execute(
+                    "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
+                    params![matched_json, now(), plan_id],
+                )?;
             }
-            updates
-        };
-        for (plan_id, matched_json) in plan_updates {
+            record_tombstone(&conn, "session", &absorbed.id)?;
             conn.execute(
-                "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
-                params![matched_json, now(), plan_id],
+                "DELETE FROM work_sessions WHERE id=?1",
+                params![absorbed.id],
             )?;
         }
-        record_tombstone(&conn, "session", &current.id)?;
-        conn.execute("DELETE FROM work_sessions WHERE id=?1", params![current.id])?;
         drop(conn);
-        self.get_session(&previous.id)?
+        self.get_session(&anchor.id)?
             .context("coalesced session missing")
     }
 
@@ -1994,10 +2071,17 @@ fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
         || right.user_confirmed
         || left.source != "context-complete"
         || right.source != "context-complete"
-        || left.project_id != right.project_id
+        || !within_gap_seconds(&left.ended_at, &right.started_at, 3)
+    {
+        return false;
+    }
+    if is_task_overlay_session(right) {
+        return left.category != "离开"
+            && session_duration_seconds(right).is_some_and(|seconds| seconds <= 5 * 60);
+    }
+    if left.project_id != right.project_id
         || left.task_id != right.task_id
         || left.category != right.category
-        || !within_gap_seconds(&left.ended_at, &right.started_at, 3)
     {
         return false;
     }
@@ -2006,6 +2090,73 @@ fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
     left_app.is_some()
         && left_app == right_app
         && (left.project_id.is_some() || left.task_id.is_some() || left.summary == right.summary)
+}
+
+fn can_bridge_short_detour(left: &WorkSession, right: &WorkSession) -> bool {
+    !left.user_confirmed
+        && !right.user_confirmed
+        && left.source == "context-complete"
+        && right.source == "context-complete"
+        && left.category != "离开"
+        && left.project_id == right.project_id
+        && left.task_id == right.task_id
+        && left.category == right.category
+        && (left.project_id.is_some() || left.task_id.is_some())
+        && primary_session_app(left).is_some()
+        && primary_session_app(left) == primary_session_app(right)
+        && within_gap_seconds(&left.ended_at, &right.started_at, 90)
+}
+
+fn short_detour_is_compatible(
+    anchor: &WorkSession,
+    middle: &[WorkSession],
+    current: &WorkSession,
+) -> bool {
+    if middle.is_empty() {
+        return false;
+    }
+    let mut previous_end = anchor.ended_at.as_str();
+    for session in middle {
+        let compatible_assignment = session.project_id == anchor.project_id
+            || (session.project_id.is_none() && session.category == "杂务");
+        if session.user_confirmed
+            || session.source != "context-complete"
+            || session.category == "离开"
+            || !compatible_assignment
+            || !within_gap_seconds(previous_end, &session.started_at, 3)
+        {
+            return false;
+        }
+        previous_end = &session.ended_at;
+    }
+    within_gap_seconds(previous_end, &current.started_at, 3)
+}
+
+fn session_duration_seconds(session: &WorkSession) -> Option<i64> {
+    let start = DateTime::parse_from_rfc3339(&session.started_at).ok()?;
+    let end = DateTime::parse_from_rfc3339(&session.ended_at).ok()?;
+    Some((end - start).num_seconds().max(0))
+}
+
+fn is_task_overlay_session(session: &WorkSession) -> bool {
+    primary_session_app(session)
+        .as_deref()
+        .is_some_and(is_task_overlay_app_name)
+}
+
+fn is_task_overlay_app_name(app: &str) -> bool {
+    let app = app.trim().trim_end_matches(".exe");
+    matches!(
+        app,
+        "snipaste"
+            | "snippingtool"
+            | "screenclippinghost"
+            | "sharex"
+            | "greenshot"
+            | "picpick"
+            | "lightshot"
+            | "flameshot"
+    )
 }
 
 fn primary_session_app(session: &WorkSession) -> Option<String> {
@@ -2027,7 +2178,16 @@ fn preferred_coalesced_summary(left: &str, right: &str) -> String {
 
 fn is_transient_summary(value: &str) -> bool {
     let value = value.to_lowercase();
-    ["图片查看器", "无标题", "新标签页", "loading", "加载中"]
+    [
+        "图片查看器",
+        "snipaste",
+        "snipping tool",
+        "截图工具",
+        "无标题",
+        "新标签页",
+        "loading",
+        "加载中",
+    ]
         .iter()
         .any(|needle| value.contains(needle))
 }
@@ -2361,6 +2521,19 @@ mod tests {
             "ChatGPT",
             "ChatGPT.exe",
         );
+        let other_project = db
+            .create_project("另一个事务", "开发")
+            .expect("create other project");
+        let other_task = db
+            .create_task(&other_project.id, "独立任务")
+            .expect("create other task");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions SET project_id=?1,task_id=?2,category='开发' WHERE id='chat-switch'",
+                params![other_project.id, other_task.id],
+            )
+            .expect("move real switch to another task");
         insert(
             "qq-return",
             base + Duration::seconds(65),
@@ -2382,6 +2555,155 @@ mod tests {
             .expect("load switch")
             .is_some());
         assert!(db.get_session("qq-return").expect("load return").is_some());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn short_same_task_detour_is_folded_into_one_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-short-detour-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("短暂切换测试", "开发")
+            .expect("create project");
+        let primary_task = db
+            .create_task(&project.id, "使用测试")
+            .expect("create primary task");
+        let helper_task = db
+            .create_task(&project.id, "开发与调试")
+            .expect("create helper task");
+        let base = Utc::now() + Duration::hours(3);
+        let insert = |id: &str,
+                      start: chrono::DateTime<Utc>,
+                      end: chrono::DateTime<Utc>,
+                      project_id: Option<&str>,
+                      task_id: Option<&str>,
+                      category: &str,
+                      summary: &str,
+                      app: &str| {
+            let evidence = vec![EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: app.into(),
+                weight: 0.5,
+            }];
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,?7,0.88,?8,0,'context-complete',?9)",
+                    params![id, fmt(start), fmt(end), project_id, task_id, category, summary, serde_json::to_string(&evidence).unwrap(), now()],
+                )
+                .expect("insert session");
+        };
+
+        insert(
+            "screenuse-before",
+            base,
+            base + Duration::seconds(60),
+            Some(&project.id),
+            Some(&primary_task.id),
+            "开发",
+            "screenuse",
+            "screenuse.exe",
+        );
+        insert(
+            "chat-helper",
+            base + Duration::seconds(60),
+            base + Duration::seconds(75),
+            Some(&project.id),
+            Some(&helper_task.id),
+            "开发",
+            "ScreenUse · ChatGPT.exe",
+            "ChatGPT.exe",
+        );
+        insert(
+            "chat-generic",
+            base + Duration::seconds(75),
+            base + Duration::seconds(85),
+            None,
+            None,
+            "杂务",
+            "ChatGPT",
+            "ChatGPT.exe",
+        );
+        insert(
+            "screenuse-return",
+            base + Duration::seconds(85),
+            base + Duration::seconds(120),
+            Some(&project.id),
+            Some(&primary_task.id),
+            "开发",
+            "screenuse",
+            "screenuse.exe",
+        );
+
+        assert_eq!(db.compact_sessions().expect("compact detour"), 1);
+        let merged = db
+            .get_session("screenuse-before")
+            .expect("load merged")
+            .expect("merged exists");
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(120)));
+        assert_eq!(merged.task_id.as_deref(), Some(primary_task.id.as_str()));
+        assert!(merged
+            .evidence
+            .iter()
+            .any(|item| item.value.eq_ignore_ascii_case("ChatGPT.exe")));
+        for removed in ["chat-helper", "chat-generic", "screenuse-return"] {
+            assert!(db.get_session(removed).expect("load absorbed").is_none());
+        }
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn screenshot_utility_is_assigned_to_the_previous_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-screenshot-overlay-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db.create_project("截图测试", "开发").expect("create project");
+        let task = db.create_task(&project.id, "界面修正").expect("create task");
+        let base = Utc::now() + Duration::hours(4);
+        let evidence = |app: &str| {
+            serde_json::to_string(&vec![EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: app.into(),
+                weight: 0.5,
+            }])
+            .expect("serialize evidence")
+        };
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('work-before',?1,?2,?3,?4,'开发','ScreenUse',0.9,?5,0,'context-complete',?6)",
+                params![fmt(base), fmt(base + Duration::seconds(40)), project.id, task.id, evidence("screenuse.exe"), now()],
+            )
+            .expect("insert work");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('snipaste-overlay',?1,?2,NULL,NULL,'杂务','Snipper - Snipaste',0.56,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(40)), fmt(base + Duration::seconds(55)), evidence("Snipaste.exe"), now()],
+            )
+            .expect("insert screenshot overlay");
+        }
+
+        assert_eq!(db.compact_sessions().expect("compact screenshot"), 1);
+        let merged = db
+            .get_session("work-before")
+            .expect("load merged")
+            .expect("merged exists");
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(55)));
+        assert_eq!(merged.project_id.as_deref(), Some(project.id.as_str()));
+        assert!(db
+            .get_session("snipaste-overlay")
+            .expect("load screenshot")
+            .is_none());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

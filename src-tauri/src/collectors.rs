@@ -162,7 +162,33 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     }
                 } else {
                     let active_signature = active.as_ref().map(|current| current.signature.clone()).unwrap_or_default();
-                    if active_signature == signature {
+                    if should_inherit_active_context(&active_signature, &signature, &event) {
+                        pending = None;
+                        task_view_started_at = None;
+                        if let Some(current) = active.as_mut() {
+                            current.last_observed_at = Instant::now();
+                            let mut inherited_event = event;
+                            mark_metadata(
+                                &mut inherited_event,
+                                "inheritedTaskOverlay",
+                                serde_json::Value::Bool(true),
+                            );
+                            let heartbeat_due = current.last_emitted_at.elapsed()
+                                >= Duration::from_secs(settings.heartbeat_seconds as u64);
+                            if heartbeat_due {
+                                if let Err(error) = heartbeat_context(
+                                    &collector,
+                                    &db,
+                                    current,
+                                    inherited_event,
+                                ) {
+                                    collector.set_error(error);
+                                }
+                            } else {
+                                current.event = inherited_event;
+                            }
+                        }
+                    } else if active_signature == signature {
                         pending = None;
                         task_view_started_at = None;
                         if let Some(current) = active.as_mut() {
@@ -405,6 +431,48 @@ fn is_windows_task_view(event: &RawActivityEvent) -> bool {
     shell_app
         && (matches!(title.as_str(), "任务视图" | "task view")
             || title.contains("multitaskingviewframe"))
+}
+
+fn should_inherit_active_context(
+    active_signature: &str,
+    observed_signature: &str,
+    event: &RawActivityEvent,
+) -> bool {
+    !active_signature.is_empty()
+        && active_signature != "idle"
+        && observed_signature != "idle"
+        && is_task_overlay_app(event)
+}
+
+fn is_task_overlay_app(event: &RawActivityEvent) -> bool {
+    let app = event
+        .app
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(".exe")
+        .to_lowercase();
+    if matches!(
+        app.as_str(),
+        "snipaste"
+            | "snippingtool"
+            | "screenclippinghost"
+            | "sharex"
+            | "greenshot"
+            | "picpick"
+            | "lightshot"
+            | "flameshot"
+    ) {
+        return true;
+    }
+    let title = event
+        .window_title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    title.contains("snipper - snipaste")
+        || matches!(title.as_str(), "截图工具" | "snipping tool" | "screen clipping")
 }
 
 fn signature_window_title<'a>(app: &str, title: Option<&'a str>) -> &'a str {
@@ -949,6 +1017,32 @@ mod tests {
 
         event.window_title = Some("QQ设置".into());
         assert_ne!(main, context_signature(&event, 180));
+    }
+
+    #[test]
+    fn screenshot_overlays_inherit_the_active_task_but_not_idle() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-14T01:00:00Z".into(),
+            app: Some("Snipaste.exe".into()),
+            window_title: Some("Snipper - Snipaste".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        let observed = context_signature(&event, 180);
+        assert!(!should_inherit_active_context("", &observed, &event));
+        assert!(should_inherit_active_context("code|ScreenUse||||", &observed, &event));
+        assert!(!should_inherit_active_context("idle", &observed, &event));
+
+        let mut normal = event;
+        normal.app = Some("Code.exe".into());
+        normal.window_title = Some("ScreenUse - Visual Studio Code".into());
+        let observed = context_signature(&normal, 180);
+        assert!(!should_inherit_active_context("chatgpt|ScreenUse||||", &observed, &normal));
     }
 
     #[test]

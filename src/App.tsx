@@ -2419,7 +2419,11 @@ function SearchCreateSelect({
               role="option"
               type="button"
             >
-              {option.color && <i style={{ '--option-color': option.color } as CSSProperties} />}
+              <i
+                aria-hidden="true"
+                className={option.color ? undefined : 'empty'}
+                style={option.color ? { '--option-color': option.color } as CSSProperties : undefined}
+              />
               <span>
                 <strong>{option.label}</strong>
                 {option.meta && <small>{option.meta}</small>}
@@ -2508,7 +2512,8 @@ function EditSessionModal({
     () => [
       { value: '', label: '暂不指定', meta: '不关联项目' },
       ...[...projectOptions]
-        .sort((left, right) => Number(right.category === category) - Number(left.category === category))
+        .filter((project) => !category || project.category === category)
+        .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
         .map((project) => ({
           value: project.id,
           label: project.name,
@@ -2523,7 +2528,12 @@ function EditSessionModal({
     () => [
       { value: '', label: '暂不指定', meta: '不关联任务' },
       ...[...taskOptions]
-        .sort((left, right) => Number(right.projectId === projectId) - Number(left.projectId === projectId))
+        .filter((task) => {
+          if (projectId) return task.projectId === projectId;
+          if (!category) return true;
+          return projectOptions.find((project) => project.id === task.projectId)?.category === category;
+        })
+        .sort((left, right) => left.title.localeCompare(right.title, 'zh-CN'))
         .map((task) => {
           const project = projectOptions.find((item) => item.id === task.projectId);
           return {
@@ -2535,8 +2545,15 @@ function EditSessionModal({
           };
         }),
     ],
-    [projectId, projectOptions, taskOptions],
+    [category, projectId, projectOptions, taskOptions],
   );
+  const selectedProject = projectOptions.find((project) => project.id === projectId);
+  const projectPlaceholder = category ? `搜索“${category}”中的项目` : '搜索全部项目';
+  const taskPlaceholder = selectedProject
+    ? `搜索“${selectedProject.name}”中的任务`
+    : category
+      ? `搜索“${category}”项目中的任务`
+      : '搜索全部项目中的任务';
 
   useEffect(() => setProjectOptions(projects), [projects]);
   useEffect(() => setTaskOptions(tasks), [tasks]);
@@ -2785,7 +2802,7 @@ function EditSessionModal({
                 onChange={selectProject}
                 onCreate={createProject}
                 options={projectSearchOptions}
-                placeholder="搜索全部项目"
+                placeholder={projectPlaceholder}
                 value={projectId}
               />
               <div className="project-picker-actions single">
@@ -2817,7 +2834,7 @@ function EditSessionModal({
                 onChange={selectTask}
                 onCreate={createTask}
                 options={taskSearchOptions}
-                placeholder="搜索全部项目中的任务"
+                placeholder={taskPlaceholder}
                 value={taskId}
               />
               <div className="project-picker-actions single">
