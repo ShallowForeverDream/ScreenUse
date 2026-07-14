@@ -2531,10 +2531,40 @@ interface SearchSelectOption {
   meta?: string;
   keywords?: string[];
   color?: string;
+  priority?: number;
 }
 
 function normalizeSearchText(value: string) {
-  return value.trim().toLocaleLowerCase('zh-CN');
+  return value.trim().toLocaleLowerCase('zh-CN').replace(/\s+/g, ' ');
+}
+
+function searchTextQuality(value: string, query: string) {
+  const normalized = normalizeSearchText(value);
+  if (!normalized || !normalized.includes(query)) return null;
+  if (normalized === query) return 0;
+  if (normalized.startsWith(query)) return 1;
+  return 2;
+}
+
+function searchOptionRank(option: SearchSelectOption, query: string) {
+  const labelQuality = searchTextQuality(option.label, query);
+  if (labelQuality !== null) return { relation: 0, quality: labelQuality };
+
+  const relatedValues = [option.meta, ...(option.keywords || [])].filter(Boolean) as string[];
+  const relatedQualities = relatedValues.flatMap((value) => {
+    const quality = searchTextQuality(value, query);
+    return quality === null ? [] : [quality];
+  });
+  if (relatedQualities.length) {
+    return { relation: 1, quality: Math.min(...relatedQualities) };
+  }
+
+  const tokens = query.split(' ').filter(Boolean);
+  const searchable = normalizeSearchText([option.label, ...relatedValues].join(' '));
+  if (tokens.length > 1 && tokens.every((token) => searchable.includes(token))) {
+    return { relation: 2, quality: 0 };
+  }
+  return null;
 }
 
 function SearchCreateSelect({
@@ -2571,11 +2601,15 @@ function SearchCreateSelect({
   const filtered = useMemo(() => {
     if (!normalizedQuery) return options.slice(0, 80);
     return options
-      .filter((option) => normalizeSearchText([
-        option.label,
-        option.meta,
-        ...(option.keywords || []),
-      ].filter(Boolean).join(' ')).includes(normalizedQuery))
+      .flatMap((option, index) => {
+        const rank = searchOptionRank(option, normalizedQuery);
+        return rank ? [{ option, index, rank }] : [];
+      })
+      .sort((left, right) => left.rank.relation - right.rank.relation
+        || (left.option.priority ?? 0) - (right.option.priority ?? 0)
+        || left.rank.quality - right.rank.quality
+        || left.index - right.index)
+      .map((item) => item.option)
       .slice(0, 80);
   }, [normalizedQuery, options]);
   const showCreate = Boolean(
@@ -2813,7 +2847,7 @@ function EditSessionModal({
   );
   const projectSearchOptions = useMemo<SearchSelectOption[]>(
     () => [
-      { value: '', label: '暂不指定', meta: '不关联项目' },
+      { value: '', label: '暂不指定', meta: '不关联项目', priority: -1 },
       ...[...projectOptions]
         .sort((left, right) => {
           const priority = (project: Project) => {
@@ -2826,19 +2860,30 @@ function EditSessionModal({
           return priority(left) - priority(right)
             || left.name.localeCompare(right.name, 'zh-CN');
         })
-        .map((project) => ({
-          value: project.id,
-          label: project.name,
-          meta: project.category,
-          color: project.color || categoryColor(project.category),
-          keywords: [project.category],
-        })),
+        .map((project) => {
+          const priority = projectId && project.id === projectId
+            ? 0
+            : category && project.category === category
+              ? 1
+              : 2;
+          return {
+            value: project.id,
+            label: project.name,
+            meta: project.category,
+            color: project.color || categoryColor(project.category),
+            keywords: [
+              project.category,
+              ...taskOptions.filter((task) => task.projectId === project.id).map((task) => task.title),
+            ],
+            priority,
+          };
+        }),
     ],
-    [category, projectId, projectOptions],
+    [category, projectId, projectOptions, taskOptions],
   );
   const taskSearchOptions = useMemo<SearchSelectOption[]>(
     () => [
-      { value: '', label: '暂不指定', meta: '不关联任务' },
+      { value: '', label: '暂不指定', meta: '不关联任务', priority: -1 },
       ...[...taskOptions]
         .sort((left, right) => {
           const priority = (task: Task) => {
@@ -2865,6 +2910,11 @@ function EditSessionModal({
             meta: project ? `${project.name} · ${project.category}` : '项目已删除',
             color: project?.color || categoryColor(project?.category || '杂务'),
             keywords: project ? [project.name, project.category] : [],
+            priority: projectId && task.projectId === projectId
+              ? 0
+              : category && project?.category === category
+                ? 1
+                : 2,
           };
         }),
     ],
