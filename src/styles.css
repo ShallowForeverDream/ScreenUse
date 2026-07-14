@@ -443,6 +443,7 @@ kbd {
 .project-investment-list { display: grid; gap: 7px; }
 .project-investment {
   position: relative;
+  display: block;
   width: 100%;
   padding: 9px 10px;
   color: inherit;
