@@ -102,6 +102,7 @@ const TIMELINE_SCALES = [
   { secondsPerGrid: 1, label: '1 秒/格' },
 ] as const;
 const DEFAULT_TIMELINE_ZOOM = 2;
+const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD = 0.8;
 
 function normalizeTheme(value: unknown): ThemeMode {
   return value === 'system' || value === 'light' || value === 'dark' ? value : 'light';
@@ -3367,7 +3368,7 @@ function needsReview(session: WorkSession) {
   return (
     session.category !== '离开' &&
     !session.userConfirmed &&
-    (session.source === 'context-complete' || !session.projectId || session.confidence < 0.72)
+    session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD
   );
 }
 

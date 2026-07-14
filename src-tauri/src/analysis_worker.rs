@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
+const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD: f32 = 0.8;
+
 pub fn start_analysis_worker(db: Arc<AppDb>) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -37,7 +39,7 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
     let candidate = db.list_sessions(200)?.into_iter().find(|session| {
         !session.user_confirmed
             && session.category != "离开"
-            && session.confidence < 0.82
+            && session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD
             && duration_minutes(&session.started_at, &session.ended_at) >= minimum_minutes
     });
     let Some(session) = candidate else {
