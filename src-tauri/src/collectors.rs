@@ -653,7 +653,9 @@ fn active_page_context(
     native_title: &str,
 ) -> Option<ActivePageContext> {
     if is_chat_workspace_app(app) {
-        return chatgpt_selected_context(window).ok().flatten();
+        if let Some(context) = chatgpt_selected_context(window).ok().flatten() {
+            return Some(context);
+        }
     }
     if is_document_app(app) {
         let native_document = clean_document_title(native_title, app);
@@ -670,13 +672,22 @@ fn active_page_context(
         } else {
             None
         };
-        let (title, source) = native_document
+        if let Some((title, source)) = native_document
             .map(|title| (title, "document-window-title"))
             .or_else(|| selected_tab.map(|title| (title, "selected-document-tab")))
-            .or_else(|| visible_wps_title.map(|title| (title, "wps-visible-window")))?;
-        return Some(ActivePageContext { title, project: None, source });
+            .or_else(|| visible_wps_title.map(|title| (title, "wps-visible-window")))
+        {
+            return Some(ActivePageContext { title, project: None, source });
+        }
     }
-    None
+    if let Some(title) = clean_native_page_title(native_title, app) {
+        return Some(ActivePageContext {
+            title,
+            project: None,
+            source: "window-page-title",
+        });
+    }
+    selected_page_context(window, app).ok().flatten()
 }
 
 #[cfg(windows)]
@@ -711,6 +722,170 @@ fn is_document_app(app: &str) -> bool {
         ]
         .iter()
         .any(|name| app.eq_ignore_ascii_case(name))
+}
+
+#[cfg(windows)]
+fn selected_page_context(
+    window: windows::Win32::Foundation::HWND,
+    app: &str,
+) -> Result<Option<ActivePageContext>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern, TreeScope_Descendants,
+        UIA_IsSelectionItemPatternAvailablePropertyId, UIA_ListItemControlTypeId,
+        UIA_SelectionItemPatternId, UIA_TabItemControlTypeId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let condition = automation.CreatePropertyCondition(
+                UIA_IsSelectionItemPatternAvailablePropertyId,
+                &VARIANT::from(true),
+            )?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition)?;
+            let mut best: Option<(i32, String)> = None;
+            for index in 0..elements.Length()? {
+                let element = elements.GetElement(index)?;
+                let selected: IUIAutomationSelectionItemPattern = match element
+                    .GetCurrentPatternAs(UIA_SelectionItemPatternId)
+                {
+                    Ok(pattern) => pattern,
+                    Err(_) => continue,
+                };
+                if !selected.CurrentIsSelected()?.as_bool() {
+                    continue;
+                }
+                let name = element
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let automation_id = element
+                    .CurrentAutomationId()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let class_name = element
+                    .CurrentClassName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let Some(title) = selected_item_page_title(&name, &automation_id, app) else {
+                    continue;
+                };
+                let control_type = element.CurrentControlType().ok();
+                let mut score = 0;
+                let identity = format!("{automation_id} {class_name}").to_lowercase();
+                if identity.contains("session") || identity.contains("conversation") {
+                    score += 100;
+                } else if identity.contains("chat") {
+                    score += 80;
+                }
+                if control_type == Some(UIA_TabItemControlTypeId) {
+                    score += 40;
+                } else if control_type == Some(UIA_ListItemControlTypeId) {
+                    score += 30;
+                }
+                score += title.chars().count().min(30) as i32;
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_score, _)| score > *best_score)
+                {
+                    best = Some((score, title));
+                }
+            }
+            Ok(best.map(|(_, title)| ActivePageContext {
+                title,
+                project: None,
+                source: "selected-page-item",
+            }))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn selected_item_page_title(name: &str, automation_id: &str, app: &str) -> Option<String> {
+    let normalized_id = automation_id.to_lowercase();
+    for marker in ["session_item_", "conversation_item_", "chat_item_"] {
+        if let Some(index) = normalized_id.find(marker) {
+            let value = &automation_id[index + marker.len()..];
+            if let Some(title) = clean_page_label(value, app) {
+                return Some(title);
+            }
+        }
+    }
+    name.lines().find_map(|line| clean_page_label(line, app))
+}
+
+#[cfg(windows)]
+fn clean_native_page_title(value: &str, app: &str) -> Option<String> {
+    clean_page_label(value, app)
+}
+
+#[cfg(windows)]
+fn clean_page_label(value: &str, app: &str) -> Option<String> {
+    let value = value
+        .replace(['\r', '\n', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let value = value.trim_matches(['-', '—', '–', '·', '|', ' ']);
+    if value.is_empty() || value.chars().count() > 220 || is_generic_page_label(value, app) {
+        None
+    } else {
+        Some(value.chars().take(120).collect())
+    }
+}
+
+#[cfg(windows)]
+fn is_generic_page_label(value: &str, app: &str) -> bool {
+    let value = value.trim().to_lowercase();
+    let app_name = std::path::Path::new(app.trim())
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(app)
+        .trim()
+        .to_lowercase();
+    if value == app_name {
+        return true;
+    }
+    [
+        "qq", "腾讯qq", "微信", "wechat", "weixin", "钉钉", "dingtalk", "企业微信",
+        "wecom", "飞书", "feishu", "lark", "chatgpt", "codex", "screenuse", "wps",
+        "wps office", "word", "microsoft word", "excel", "microsoft excel", "powerpoint",
+        "microsoft powerpoint", "onenote", "microsoft onenote", "outlook", "notepad",
+        "notepad++", "typora", "obsidian", "adobe acrobat", "acrobat reader",
+        "google chrome", "chrome", "microsoft edge", "msedge", "firefox", "mozilla firefox",
+        "tabbit browser", "windows explorer", "file explorer", "文件资源管理器",
+        "消息", "聊天", "会话", "通讯录", "联系人", "工作台", "文档", "会议", "邮箱",
+        "日历", "首页", "好友", "群聊", "搜索", "设置", "home", "messages", "contacts",
+        "workbench", "calendar", "settings", "main window", "mainwindow",
+    ]
+    .contains(&value.as_str())
+        || looks_like_clock(&value)
+}
+
+#[cfg(windows)]
+fn looks_like_clock(value: &str) -> bool {
+    let mut parts = value.split(':');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(hour), Some(minute), None)
+            if !hour.is_empty()
+                && hour.len() <= 2
+                && minute.len() == 2
+                && hour.chars().all(|character| character.is_ascii_digit())
+                && minute.chars().all(|character| character.is_ascii_digit())
+    )
 }
 
 #[cfg(windows)]
@@ -1237,5 +1412,36 @@ mod tests {
         assert!(is_document_app("wps.exe"));
         assert!(is_document_app("EXCEL.EXE"));
         assert!(!is_document_app("steam.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_chat_item_keeps_only_the_current_conversation_name() {
+        assert_eq!(
+            selected_item_page_title(
+                "微信ClawBot\n最新消息预览会不断变化…\n13:31",
+                "session_item_微信ClawBot",
+                "Weixin.exe",
+            ),
+            Some("微信ClawBot".into())
+        );
+        assert_eq!(
+            selected_item_page_title("ICPC 讨论群\n今晚训练", "", "QQ.exe"),
+            Some("ICPC 讨论群".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generic_app_titles_are_not_mistaken_for_page_names() {
+        assert_eq!(clean_native_page_title("微信", "Weixin.exe"), None);
+        assert_eq!(clean_native_page_title("QQ", "QQ.exe"), None);
+        assert_eq!(clean_native_page_title("钉钉", "DingTalk.exe"), None);
+        assert_eq!(clean_native_page_title("WPS Office", "wps.exe"), None);
+        assert_eq!(clean_native_page_title("Google Chrome", "chrome.exe"), None);
+        assert_eq!(
+            clean_native_page_title("ICPC 训练群", "DingTalk.exe"),
+            Some("ICPC 训练群".into())
+        );
     }
 }
