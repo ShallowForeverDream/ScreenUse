@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, UndoStatus, WorkSession } from './types';
+import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, CodexRateCard, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, UndoStatus, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -32,6 +32,17 @@ const previewSyncStatus = (): GithubSyncStatus => ({
     rules: 0,
   },
   devices: [],
+});
+
+const previewCodexRateCard = (): CodexRateCard => ({
+  sourceUrl: 'https://help.openai.com/en/articles/20001106-codex-rate-card',
+  fetchedAt: '2026-07-15T00:00:00Z',
+  sourceUpdatedLabel: 'ScreenUse 内置官方费率快照',
+  rates: [
+    { model: 'GPT-5.6 Sol', inputCreditsPerMillion: 125, cachedInputCreditsPerMillion: 12.5, outputCreditsPerMillion: 750 },
+    { model: 'GPT-5.6 Terra', inputCreditsPerMillion: 62.5, cachedInputCreditsPerMillion: 6.25, outputCreditsPerMillion: 375 },
+    { model: 'GPT-5.6 Luna', inputCreditsPerMillion: 25, cachedInputCreditsPerMillion: 2.5, outputCreditsPerMillion: 150 },
+  ],
 });
 
 async function call<T>(command: string, args?: Record<string, unknown>, fallback?: T): Promise<T> {
@@ -123,6 +134,8 @@ export const api = {
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),
   listAnalysisJobs: (limit = 200) => call<AnalysisJob[]>('list_analysis_jobs', { limit }, []),
   getAnalysisJob: (id: string) => call<AnalysisJob | null>('get_analysis_job', { id }, null),
+  getCodexRateCard: () => call<CodexRateCard>('get_codex_rate_card', undefined, previewCodexRateCard()),
+  refreshCodexRateCard: () => call<CodexRateCard>('refresh_codex_rate_card', undefined, previewCodexRateCard()),
   deleteAnalysisJob: async (id: string) => {
     if (!isTauri()) return;
     await call<void>('delete_analysis_job', { id });

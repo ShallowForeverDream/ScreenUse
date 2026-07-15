@@ -18,14 +18,15 @@ mod integration_server;
 mod integrations;
 mod maintenance;
 mod models;
+mod pricing;
 mod secrets;
 
 use collectors::{CollectorAdapter, DesktopCollector};
 use db::AppDb;
 use integrations::{IcsAdapter, IntegrationAdapter};
 use models::{
-    AnalysisJob, AppSettings, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus,
-    SessionPatch,
+    AnalysisJob, AppSettings, CodexRateCard, DashboardData, GithubSyncConfig, GithubSyncResult,
+    GithubSyncStatus, SessionPatch,
 };
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -111,13 +112,7 @@ fn apply_session_correction(
 ) -> Result<Vec<models::WorkSession>, String> {
     state
         .db
-        .apply_session_correction(
-            &ids,
-            patch,
-            remember,
-            keyword.as_deref(),
-            pin_minutes,
-        )
+        .apply_session_correction(&ids, patch, remember, keyword.as_deref(), pin_minutes)
         .map_err(map_err)
 }
 
@@ -267,16 +262,23 @@ fn list_analysis_jobs(
 }
 
 #[tauri::command]
-fn get_analysis_job(
-    state: State<AppState>,
-    id: String,
-) -> Result<Option<AnalysisJob>, String> {
+fn get_analysis_job(state: State<AppState>, id: String) -> Result<Option<AnalysisJob>, String> {
     state.db.get_analysis_job(&id).map_err(map_err)
 }
 
 #[tauri::command]
 fn delete_analysis_job(state: State<AppState>, id: String) -> Result<(), String> {
     state.db.delete_skipped_analysis_job(&id).map_err(map_err)
+}
+
+#[tauri::command]
+fn get_codex_rate_card(state: State<AppState>) -> Result<CodexRateCard, String> {
+    pricing::get_rate_card(&state.db).map_err(map_err)
+}
+
+#[tauri::command]
+async fn refresh_codex_rate_card(state: State<'_, AppState>) -> Result<CodexRateCard, String> {
+    pricing::refresh_rate_card(&state.db).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -557,6 +559,8 @@ fn main() {
             list_analysis_jobs,
             get_analysis_job,
             delete_analysis_job,
+            get_codex_rate_card,
+            refresh_codex_rate_card,
             run_analysis_once,
             compact_sessions,
             learn_rule_from_session,

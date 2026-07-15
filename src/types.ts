@@ -126,6 +126,7 @@ export interface AppSettings {
   aiMode: AiMode;
   aiProvider: 'codex-account' | 'openai-compatible' | string;
   minAiSessionMinutes: number;
+  codexPlan: 'plus' | 'pro-5x' | 'pro-20x' | string;
   aiBaseUrl: string;
   aiModel: string;
   aiSecretRef?: string | null;
@@ -169,6 +170,20 @@ export interface AnalysisJob {
     costUsd?: number | null;
     costNote?: string | null;
   };
+}
+
+export interface CodexModelRate {
+  model: string;
+  inputCreditsPerMillion: number;
+  cachedInputCreditsPerMillion: number;
+  outputCreditsPerMillion: number;
+}
+
+export interface CodexRateCard {
+  sourceUrl: string;
+  fetchedAt: string;
+  sourceUpdatedLabel?: string | null;
+  rates: CodexModelRate[];
 }
 
 export interface GithubSyncConfig {

@@ -2631,9 +2631,9 @@ impl AppDb {
     ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE analysis_jobs
+             "UPDATE analysis_jobs
              SET provider=?1,model=?2,system_prompt=?3,user_prompt=?4,response=NULL,
-                 result_count=0,usage_json='{}'
+                 result_count=0
              WHERE id=?5",
             params![provider, model, system_prompt, user_prompt, id],
         )?;
@@ -2642,9 +2642,20 @@ impl AppDb {
 
     pub fn record_analysis_job_response(&self, id: &str, response: &str, usage: &AiUsage) -> Result<()> {
         let conn = self.conn.lock();
+        let previous = conn
+            .query_row(
+                "SELECT usage_json FROM analysis_jobs WHERE id=?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| serde_json::from_str::<AiUsage>(&value).ok())
+            .unwrap_or_default();
+        let mut cumulative = previous;
+        cumulative.add_attempt(usage);
         conn.execute(
             "UPDATE analysis_jobs SET response=?1,usage_json=?2 WHERE id=?3",
-            params![response, serde_json::to_string(usage)?, id],
+            params![response, serde_json::to_string(&cumulative)?, id],
         )?;
         Ok(())
     }
@@ -6079,6 +6090,25 @@ mod tests {
         };
         db.record_analysis_job_response(&claimed.id, "{\"results\":[]}", &usage)
             .expect("record response");
+        db.record_analysis_job_request(
+            &claimed.id,
+            "codex-account",
+            "gpt-5.4",
+            "retry system prompt",
+            "retry user prompt",
+        )
+        .expect("record retry request");
+        let retry_usage = AiUsage {
+            input_tokens: 300,
+            cached_input_tokens: 100,
+            output_tokens: 20,
+            reasoning_output_tokens: 8,
+            total_tokens: 320,
+            cost_usd: None,
+            cost_note: Some("当前 Codex 账号未返回单次金额".into()),
+        };
+        db.record_analysis_job_response(&claimed.id, "{\"results\":[{}]}", &retry_usage)
+            .expect("record retry response");
         db.set_analysis_job_result_count(&claimed.id, 2)
             .expect("record result count");
         db.mark_analysis_job_status(&claimed.id, "completed", None, None)
@@ -6091,12 +6121,14 @@ mod tests {
         assert_eq!(detail.status, "completed");
         assert_eq!(detail.provider, "codex-account");
         assert_eq!(detail.model, "gpt-5.4");
-        assert_eq!(detail.system_prompt.as_deref(), Some("system prompt"));
-        assert_eq!(detail.user_prompt.as_deref(), Some("user prompt"));
-        assert_eq!(detail.response.as_deref(), Some("{\"results\":[]}"));
+        assert_eq!(detail.system_prompt.as_deref(), Some("retry system prompt"));
+        assert_eq!(detail.user_prompt.as_deref(), Some("retry user prompt"));
+        assert_eq!(detail.response.as_deref(), Some("{\"results\":[{}]}"));
         assert_eq!(detail.result_count, 2);
-        assert_eq!(detail.usage.total_tokens, 1_280);
-        assert_eq!(detail.usage.cached_input_tokens, 500);
+        assert_eq!(detail.usage.total_tokens, 1_600);
+        assert_eq!(detail.usage.input_tokens, 1_500);
+        assert_eq!(detail.usage.cached_input_tokens, 600);
+        assert_eq!(detail.usage.output_tokens, 100);
         assert_eq!(detail.usage.cost_note.as_deref(), Some("当前 Codex 账号未返回单次金额"));
         assert!(detail.completed_at.is_some());
         assert!(detail.duration_ms.is_some());

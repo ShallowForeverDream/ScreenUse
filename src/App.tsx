@@ -61,6 +61,7 @@ import type {
   AnalysisJob,
   AppSettings,
   CategoryOption,
+  CodexRateCard,
   DashboardData,
   GithubSyncConfig,
   GithubSyncResult,
@@ -916,7 +917,11 @@ export default function App() {
           />
         )}
         {activeTab === 'ai' && (
-          <AiReviewView sessions={data.sessions} runAction={runAction} />
+          <AiReviewView
+            sessions={data.sessions}
+            codexPlan={data.settings.codexPlan}
+            runAction={runAction}
+          />
         )}
         {activeTab === 'settings' && (
           <SettingsView data={data} runAction={runAction} onThemeChange={setThemeMode} />
@@ -1024,9 +1029,11 @@ const aiJobFilters: { id: AiJobFilter; label: string }[] = [
 
 function AiReviewView({
   sessions,
+  codexPlan,
   runAction,
 }: {
   sessions: WorkSession[];
+  codexPlan: string;
   runAction: ActionRunner;
 }) {
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
@@ -1035,6 +1042,7 @@ function AiReviewView({
   const [filter, setFilter] = useState<AiJobFilter>('all');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [rateCard, setRateCard] = useState<CodexRateCard | null>(null);
   const confirmation = useConfirmation();
 
   const refresh = useCallback(async (quiet = false) => {
@@ -1052,6 +1060,7 @@ function AiReviewView({
 
   useEffect(() => {
     void refresh();
+    void api.getCodexRateCard().then(setRateCard);
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void refresh(true);
     }, 5000);
@@ -1090,6 +1099,18 @@ function AiReviewView({
       if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
     } catch {
       // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshRateCard = async () => {
+    setBusy(true);
+    try {
+      const next = await runAction(api.refreshCodexRateCard, '已对齐 OpenAI 最新 Codex 费率') as CodexRateCard;
+      setRateCard(next);
+    } catch {
+      // runAction already surfaces the backend message.
     } finally {
       setBusy(false);
     }
@@ -1150,6 +1171,9 @@ function AiReviewView({
             type="button"
           >
             <WandSparkles size={15} />立即复核
+          </button>
+          <button disabled={busy} onClick={() => void refreshRateCard()} type="button">
+            <RefreshCw size={15} />更新费率
           </button>
           <button
             disabled={busy || counts.failed === 0}
@@ -1238,13 +1262,31 @@ function AiReviewView({
                 <AiFact label="完成" value={formatAiDateTime(detail.completedAt)} />
                 <AiFact label="耗时" value={formatAiDuration(detail.durationMs)} />
                 <AiFact label="重试" value={`${detail.retryCount} 次`} />
-                <AiFact label="总 Token" value={formatAiTokens(detail.usage.totalTokens)} />
+                <AiFact label={detail.retryCount > 0 ? '累计总 Token' : '总 Token'} value={formatAiTokens(detail.usage.totalTokens)} />
                 <AiFact label="输入 Token" value={formatAiTokens(detail.usage.inputTokens)} />
                 <AiFact label="缓存 Token" value={formatAiTokens(detail.usage.cachedInputTokens)} />
                 <AiFact label="输出 Token" value={formatAiTokens(detail.usage.outputTokens)} />
                 <AiFact label="推理 Token" value={formatAiTokens(detail.usage.reasoningOutputTokens)} />
-                <AiFact label="开销" value={formatAiCost(detail.usage)} />
+                <AiFact label="信用点" value={formatAiCredits(detail, rateCard)} />
+                <AiFact label="开销" value={formatAiCost(detail, rateCard, codexPlan)} />
+                {detail.provider === 'codex-account' && (
+                  <AiFact label="套餐" value={codexPlanLabel(codexPlan)} />
+                )}
+                {detail.provider === 'codex-account' && rateCard && (
+                  <AiFact label="费率同步" value={formatAiDateTime(rateCard.fetchedAt)} />
+                )}
               </div>
+
+              {detail.provider === 'codex-account' && rateCard && (
+                <div className="ai-rate-note">
+                  <span>
+                    按当前官方 token 费率估算信用点，并累计失败重试；Pro 套餐内用量不产生单次增量扣款，超限购买以 Codex Usage 账单为准。
+                  </span>
+                  <button onClick={() => window.open(rateCard.sourceUrl, '_blank')} type="button">
+                    查看官方费率
+                  </button>
+                </div>
+              )}
 
               {detail.error && <div className="ai-job-error"><CircleAlert size={16} />{detail.error}</div>}
 
@@ -1371,11 +1413,47 @@ function formatAiTokens(value?: number | null) {
   return value.toLocaleString('zh-CN');
 }
 
-function formatAiCost(usage: AnalysisJob['usage']) {
-  if (usage.costUsd != null) {
-    return `$${usage.costUsd.toFixed(usage.costUsd < 0.01 ? 6 : 4)}`;
+function normalizeAiModel(value: string) {
+  return value.toLocaleLowerCase('en-US').replace(/[^a-z0-9]/g, '');
+}
+
+function estimateAiCredits(job: AnalysisJob, rateCard: CodexRateCard | null) {
+  if (!rateCard || !job.usage.totalTokens) return null;
+  const model = normalizeAiModel(job.model);
+  const rate = rateCard.rates.find((item) => normalizeAiModel(item.model) === model);
+  if (!rate) return null;
+  const cached = Math.min(job.usage.cachedInputTokens || 0, job.usage.inputTokens || 0);
+  const uncached = Math.max(0, (job.usage.inputTokens || 0) - cached);
+  return (
+    uncached * rate.inputCreditsPerMillion
+    + cached * rate.cachedInputCreditsPerMillion
+    + (job.usage.outputTokens || 0) * rate.outputCreditsPerMillion
+  ) / 1_000_000;
+}
+
+function formatAiCredits(job: AnalysisJob, rateCard: CodexRateCard | null) {
+  const credits = estimateAiCredits(job, rateCard);
+  if (credits == null) return job.usage.totalTokens > 0 ? '暂无匹配费率' : '—';
+  return `${credits.toFixed(credits < 10 ? 4 : 2)} Credits`;
+}
+
+function codexPlanLabel(plan: string) {
+  const labels: Record<string, string> = {
+    plus: 'Plus · $20/月',
+    'pro-5x': 'Pro 5x · $100/月',
+    'pro-20x': 'Pro 20x · $200/月',
+  };
+  return labels[plan] || 'Codex 套餐';
+}
+
+function formatAiCost(job: AnalysisJob, rateCard: CodexRateCard | null, codexPlan: string) {
+  if (job.usage.costUsd != null) {
+    return `$${job.usage.costUsd.toFixed(job.usage.costUsd < 0.01 ? 6 : 4)}`;
   }
-  return usage.costNote || (usage.totalTokens > 0 ? '未返回金额' : '—');
+  if (job.provider === 'codex-account' && estimateAiCredits(job, rateCard) != null) {
+    return `${codexPlanLabel(codexPlan)} · 套餐内增量 $0`;
+  }
+  return job.usage.costNote || (job.usage.totalTokens > 0 ? '未返回金额' : '—');
 }
 
 type GlobalSearchResult =
@@ -3625,15 +3703,24 @@ function SettingsView({
                 <option value="openai-compatible">OpenAI-compatible API</option>
               </select>
             </Field>
-            <Field label="最低会话时长" hint="短碎片不调用模型。">
+            <Field label="最低会话时长" hint="设为 0 分钟时，所有尚未人工确认的会话都进入复核。">
               <NumberInput
                 value={settings.minAiSessionMinutes}
-                min={1}
+                min={0}
                 max={240}
                 suffix="分钟"
                 onChange={(value) => update('minAiSessionMinutes', value)}
               />
             </Field>
+            {settings.aiProvider === 'codex-account' && (
+              <Field label="Codex 套餐" hint="用于区分固定订阅费与单次信用点消耗。">
+                <select value={settings.codexPlan} onChange={(event) => update('codexPlan', event.target.value)}>
+                  <option value="plus">Plus · $20/月</option>
+                  <option value="pro-5x">Pro 5x · $100/月</option>
+                  <option value="pro-20x">Pro 20x · $200/月</option>
+                </select>
+              </Field>
+            )}
             <Field
               label="模型名"
               hint={settings.aiProvider === 'codex-account' ? 'Luna 适合高频、结构化的分类任务。' : '填写服务端支持的模型 ID。'}
@@ -3682,6 +3769,14 @@ function SettingsView({
             >
               <Sparkles size={16} />测试配置
             </button>
+            {settings.aiProvider === 'codex-account' && (
+              <button
+                onClick={() => void runAction(api.refreshCodexRateCard, '已对齐 OpenAI 最新 Codex 费率')}
+                type="button"
+              >
+                <RefreshCw size={16} />对齐最新费率
+              </button>
+            )}
           </div>
         )}
         <div className="setting-callout">
@@ -3919,6 +4014,9 @@ function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
   const repoUrl = config.owner && config.repo
     ? `https://github.com/${config.owner}/${config.repo}`
     : '';
+  const historyUrl = repoUrl
+    ? `${repoUrl}/commits/${encodeURIComponent(config.branch)}/${config.filePath.split('/').map(encodeURIComponent).join('/')}`
+    : '';
   const recordCount = status.counts.categories + status.counts.projects
     + status.counts.tasks + status.counts.sessions + status.counts.rules;
 
@@ -3927,7 +4025,7 @@ function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
       <div className="sync-panel-head">
         <PanelTitle
           title="GitHub 多端同步"
-          subtitle="独立 Private 仓库 · AES-256-GCM 加密 · 自动合并最新修改"
+          subtitle="拉取 → 按更新时间合并 → 推送 · 独立 Private 仓库 · 端侧加密"
         />
         <span className={`sync-state ${status.ready ? 'ready' : ''}`}>
           <span />{status.ready ? '可以同步' : config.enabled ? '还差凭据' : '未开启'}
@@ -4045,14 +4143,30 @@ function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
           </div>
         </div>
         <div className="sync-actions">
+          {historyUrl && config.lastSyncedAt && (
+            <button
+              onClick={() => window.open(historyUrl, '_blank')}
+              title="GitHub 为每次同步保留 commit；可在历史中查看或撤销上一版"
+              type="button"
+            >
+              <Undo2 size={15} />同步历史/撤销
+            </button>
+          )}
           {repoUrl && config.lastSyncedAt && (
             <button onClick={() => window.open(repoUrl, '_blank')} type="button"><Github size={15} />查看仓库</button>
           )}
           {config.enabled && <button onClick={() => void disconnect()} disabled={busy} type="button">停止同步</button>}
           <button onClick={() => void save()} disabled={busy} type="button">保存同步设置</button>
           <button className="primary" onClick={() => void syncNow()} disabled={busy || !status.ready} type="button">
-            <Cloud size={16} />{busy ? '处理中…' : '立即同步'}
+            <Cloud size={16} />{busy ? '处理中…' : '拉取并推送'}
           </button>
+        </div>
+      </div>
+      <div className="setting-callout compact">
+        <RefreshCw size={18} />
+        <div>
+          <strong>同一数据协议可供后续 Android、平板端复用</strong>
+          <span>分类、项目、任务、会话、学习规则和删除记录会按 ID 合并；每次远端写入都是一个可追溯的 Git commit。</span>
         </div>
       </div>
     </section>

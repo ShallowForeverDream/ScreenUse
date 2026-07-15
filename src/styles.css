@@ -1650,6 +1650,8 @@ kbd {
 .ai-job-facts span, .ai-job-facts strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-job-facts span { color: var(--subtle); font-size: 9px; }
 .ai-job-facts strong { margin-top: 4px; color: var(--text); font-size: 11px; }
+.ai-rate-note { margin-top: 10px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--border); border-radius: 11px; color: var(--muted); background: var(--panel-soft); font-size: 10px; line-height: 1.55; }
+.ai-rate-note button { min-height: 29px; padding: 5px 8px; flex: 0 0 auto; font-size: 10px; }
 .ai-job-error { margin-top: 12px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; border-radius: 11px; color: var(--rose); background: color-mix(in srgb, var(--rose) 7%, var(--surface-subtle)); font-size: 11px; line-height: 1.55; }
 .ai-job-error svg { flex: 0 0 auto; }
 .ai-targets { margin-top: 18px; }

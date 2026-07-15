@@ -3,7 +3,9 @@ use crate::ai::{
     AiAttributionBatch, AiResponse, AiReviewInput, OpenAiCompatibleClient,
 };
 use crate::db::{now, AppDb};
-use crate::models::{AiUsage, AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession};
+use crate::models::{
+    AiUsage, AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession,
+};
 use crate::secrets;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -232,14 +234,10 @@ fn nearest_context_sessions(
         let started_at = parse_time(&session.started_at).ok();
         let ended_at = parse_time(&session.ended_at).ok();
         match (target_start, target_end, started_at, ended_at) {
-            (Some(target_start), Some(_), Some(_), Some(ended_at))
-                if ended_at < target_start =>
-            {
+            (Some(target_start), Some(_), Some(_), Some(ended_at)) if ended_at < target_start => {
                 (target_start - ended_at).num_seconds()
             }
-            (Some(_), Some(target_end), Some(started_at), Some(_))
-                if started_at > target_end =>
-            {
+            (Some(_), Some(target_end), Some(started_at), Some(_)) if started_at > target_end => {
                 (started_at - target_end).num_seconds()
             }
             (Some(_), Some(_), Some(_), Some(_)) => 0,
@@ -378,9 +376,11 @@ fn metadata_evidence(events: Vec<&RawActivityEvent>) -> Vec<EvidenceItem> {
             weight: 0.70,
         });
     }
-    if let Some(event) = events.iter().rev().find(|event| {
-        event.url.as_deref().is_some_and(|value| !value.is_empty())
-    }) {
+    if let Some(event) = events
+        .iter()
+        .rev()
+        .find(|event| event.url.as_deref().is_some_and(|value| !value.is_empty()))
+    {
         evidence.push(EvidenceItem {
             kind: "url".into(),
             label: "网页".into(),
@@ -423,11 +423,10 @@ fn is_review_candidate(
 ) -> bool {
     !session.user_confirmed
         && session.category != "离开"
-        && !matches!(
-            session.source.as_str(),
-            "collector-idle" | "collector-rule" | "ai-review"
-        )
-        && (session.task_id.is_none()
+        && !matches!(session.source.as_str(), "collector-idle" | "ai-review")
+        && (minimum_seconds == 0 || session.source != "collector-rule")
+        && (minimum_seconds == 0
+            || session.task_id.is_none()
             || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)
         && duration_seconds(&session.started_at, &session.ended_at) >= minimum_seconds
         && !queued.contains(&session.id)
@@ -488,6 +487,22 @@ mod tests {
         value.project_id = Some("project".into());
         value.task_id = Some("task".into());
         assert!(!is_review_candidate(&value, 60, &queued));
+    }
+
+    #[test]
+    fn zero_minutes_reviews_every_unconfirmed_eligible_session() {
+        let queued = HashSet::new();
+        let mut value = session(5);
+        value.confidence = 0.99;
+        value.project_id = Some("project".into());
+        value.task_id = Some("task".into());
+        assert!(is_review_candidate(&value, 0, &queued));
+
+        value.source = "collector-rule".into();
+        assert!(is_review_candidate(&value, 0, &queued));
+
+        value.user_confirmed = true;
+        assert!(!is_review_candidate(&value, 0, &queued));
     }
 
     #[test]

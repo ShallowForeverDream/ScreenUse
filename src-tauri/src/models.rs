@@ -44,6 +44,45 @@ pub struct AiUsage {
     pub cost_note: Option<String>,
 }
 
+impl AiUsage {
+    pub fn add_attempt(&mut self, attempt: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(attempt.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(attempt.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(attempt.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(attempt.reasoning_output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(attempt.total_tokens);
+        self.cost_usd = match (self.cost_usd, attempt.cost_usd) {
+            (Some(current), Some(next)) => Some(current + next),
+            (current, next) => current.or(next),
+        };
+        if attempt.cost_note.is_some() {
+            self.cost_note = attempt.cost_note.clone();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelRate {
+    pub model: String,
+    pub input_credits_per_million: f64,
+    pub cached_input_credits_per_million: f64,
+    pub output_credits_per_million: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRateCard {
+    pub source_url: String,
+    pub fetched_at: String,
+    pub source_updated_label: Option<String>,
+    pub rates: Vec<CodexModelRate>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisJob {
@@ -238,6 +277,7 @@ pub struct AppSettings {
     pub ai_mode: String,
     pub ai_provider: String,
     pub min_ai_session_minutes: u32,
+    pub codex_plan: String,
     pub ai_base_url: String,
     pub ai_model: String,
     pub ai_secret_ref: Option<String>,
@@ -272,6 +312,7 @@ impl Default for AppSettings {
             ai_mode: "off".into(),
             ai_provider: String::new(),
             min_ai_session_minutes: 1,
+            codex_plan: "pro-20x".into(),
             ai_base_url: "https://api.openai.com/v1".into(),
             ai_model: "".into(),
             ai_secret_ref: None,
@@ -302,7 +343,14 @@ impl AppSettings {
         self.idle_threshold_seconds = self.idle_threshold_seconds.clamp(30, 3600);
         self.idle_category = clean_setting_label(&self.idle_category, "无效");
         self.idle_project_name = clean_setting_label(&self.idle_project_name, "离开");
-        self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(1, 240);
+        self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(0, 240);
+        self.codex_plan = match self.codex_plan.as_str() {
+            "plus" => "plus",
+            "pro-5x" => "pro-5x",
+            "pro-20x" => "pro-20x",
+            _ => "pro-20x",
+        }
+        .into();
         self.ai_mode = match self.ai_mode.as_str() {
             "manual" => "manual",
             "auto" => "auto",
@@ -312,9 +360,11 @@ impl AppSettings {
         self.ai_provider = match self.ai_provider.as_str() {
             "codex-account" => "codex-account",
             "openai-compatible" => "openai-compatible",
-            _ if self.ai_secret_ref.as_deref().is_some_and(|value| !value.trim().is_empty())
-                || (!self.ai_model.trim().is_empty()
-                    && self.ai_model.trim() != "gpt-5.6-luna")
+            _ if self
+                .ai_secret_ref
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || (!self.ai_model.trim().is_empty() && self.ai_model.trim() != "gpt-5.6-luna")
                 || self.ai_base_url.trim_end_matches('/') != "https://api.openai.com/v1" =>
             {
                 "openai-compatible"
@@ -343,7 +393,11 @@ impl AppSettings {
 fn clean_setting_label(value: &str, fallback: &str) -> String {
     let value = value.trim().replace(['\r', '\n', '\t'], " ");
     let value: String = value.chars().take(80).collect();
-    if value.is_empty() { fallback.into() } else { value }
+    if value.is_empty() {
+        fallback.into()
+    } else {
+        value
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +443,13 @@ mod tests {
         assert_eq!(normalized_existing.ai_provider, "codex-account");
         assert_eq!(normalized_existing.ai_model, "gpt-5.6-luna");
         assert_eq!(normalized_existing.min_ai_session_minutes, 1);
+        assert_eq!(normalized_existing.codex_plan, "pro-20x");
+
+        let review_all = AppSettings {
+            min_ai_session_minutes: 0,
+            ..AppSettings::default()
+        };
+        assert_eq!(review_all.normalized().min_ai_session_minutes, 0);
 
         let invalid = AppSettings {
             theme: "unknown".into(),
