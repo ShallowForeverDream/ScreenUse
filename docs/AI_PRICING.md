@@ -16,9 +16,18 @@ Credits = 非缓存输入 / 1,000,000 × 输入费率
 
 同一作业失败后重试时，Token 与 Credits 会累计，不再用最后一次调用覆盖前一次消耗；提示词和原始回复区域显示最后一次尝试，`重试`字段给出尝试关系。
 
-Plus 和 Pro 会先消耗套餐内用量，所以作业级别显示“套餐内增量 $0”。固定订阅费单独显示：Plus $20/月、Pro 5x $100/月、Pro 20x $200/月。若套餐额度耗尽后购买 Credits，真实现金扣款只能以 Codex Usage 页面为准，ScreenUse 不把 Credits 虚构成美元。
+ScreenUse 继续把 Credits 换算为美元等值：OpenAI 的公开说明中 `2,500 Credits = $100`，即 `1 Credit ≈ $0.04`：
 
-“更新费率”从 OpenAI Help Center 的 Codex rate card 重新读取并缓存费率；网络或页面解析失败时继续使用上一次成功费率，不清空审计数据。
+```text
+美元等值 = Credits × $0.04
+```
+
+这项结果用于直观比较不同复核任务的资源消耗。Plus 和 Pro 会先消耗套餐内用量，因此“Token 等值开销”不等同于信用卡当次扣款，也不摊分固定订阅费。固定订阅费仍单独显示：Plus $20/月、Pro 5x $100/月、Pro 20x $200/月。
+
+“更新费率”会同时读取 OpenAI Help Center 的 Codex rate card 和 Credits 美元等值依据并缓存；网络或页面解析失败时继续使用上一次成功费率，不清空审计数据。
+
+- Codex Token 费率：<https://help.openai.com/en/articles/20001106-codex-rate-card>
+- Credits 美元等值依据：<https://help.openai.com/en/articles/20001147-codex-credits-for-students-terms-of-service>
 
 ## OpenAI-compatible API
 

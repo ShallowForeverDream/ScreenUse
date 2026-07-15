@@ -38,6 +38,8 @@ const previewCodexRateCard = (): CodexRateCard => ({
   sourceUrl: 'https://help.openai.com/en/articles/20001106-codex-rate-card',
   fetchedAt: '2026-07-15T00:00:00Z',
   sourceUpdatedLabel: 'ScreenUse 内置官方费率快照',
+  usdPerCredit: 0.04,
+  creditValueSourceUrl: 'https://help.openai.com/en/articles/20001147-codex-credits-for-students-terms-of-service',
   rates: [
     { model: 'GPT-5.6 Sol', inputCreditsPerMillion: 125, cachedInputCreditsPerMillion: 12.5, outputCreditsPerMillion: 750 },
     { model: 'GPT-5.6 Terra', inputCreditsPerMillion: 62.5, cachedInputCreditsPerMillion: 6.25, outputCreditsPerMillion: 375 },

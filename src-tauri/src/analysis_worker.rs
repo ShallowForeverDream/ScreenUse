@@ -152,7 +152,16 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
             &user_prompt,
         )?;
         let response = maybe_ai(&settings, &system_prompt, &user_prompt).await?;
-        db.record_analysis_job_response(&job.id, &response.content, &response.usage)?;
+        let mut usage = response.usage;
+        if settings.ai_provider == "codex-account" && usage.cost_usd.is_none() {
+            if let Some((credits, usd)) = crate::pricing::estimate_usage_cost(&db, &settings.ai_model, &usage) {
+                usage.cost_usd = Some(usd);
+                usage.cost_note = Some(format!(
+                    "按调用时官方 Token/Credits 等值费率估算：{credits:.6} Credits"
+                ));
+            }
+        }
+        db.record_analysis_job_response(&job.id, &response.content, &usage)?;
         parse_and_validate(&response.content, &input)
     }
     .await;

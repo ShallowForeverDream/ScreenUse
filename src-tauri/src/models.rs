@@ -80,7 +80,15 @@ pub struct CodexRateCard {
     pub source_url: String,
     pub fetched_at: String,
     pub source_updated_label: Option<String>,
+    #[serde(default = "default_codex_usd_per_credit")]
+    pub usd_per_credit: f64,
+    #[serde(default)]
+    pub credit_value_source_url: Option<String>,
     pub rates: Vec<CodexModelRate>,
+}
+
+fn default_codex_usd_per_credit() -> f64 {
+    0.04
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

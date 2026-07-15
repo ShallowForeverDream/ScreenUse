@@ -25,6 +25,7 @@ import {
   Copy,
   Database,
   Download,
+  Ellipsis,
   EyeOff,
   FolderKanban,
   HardDrive,
@@ -521,7 +522,7 @@ export default function App() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
-  const [toast, setToast] = useState('');
+  const [toast, setToast] = useState<{ message: string; tone: 'success' | 'error' } | null>(null);
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [selectionResetKey, setSelectionResetKey] = useState(0);
@@ -597,11 +598,11 @@ export default function App() {
     if (data) setThemeMode(normalizeTheme(data.settings.theme));
   }, [data?.settings.theme]);
 
-  const showToast = useCallback((message: string) => {
+  const showToast = useCallback((message: string, tone: 'success' | 'error' = 'success') => {
     if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
-    setToast(message);
+    setToast({ message, tone });
     toastTimerRef.current = window.setTimeout(() => {
-      setToast('');
+      setToast(null);
       toastTimerRef.current = null;
     }, 3200);
   }, []);
@@ -623,7 +624,7 @@ export default function App() {
           await load();
           return result;
         } catch (error) {
-          showToast(error instanceof Error ? error.message : String(error));
+          showToast(error instanceof Error ? error.message : String(error), 'error');
           throw error;
         }
       })();
@@ -634,6 +635,40 @@ export default function App() {
     },
     [load, showToast],
   );
+
+  const undoLastCorrection = useCallback(async () => {
+    if (!undoStatus.available) return;
+    await runAction(api.undoLastSessionCorrection, '已撤销上一次修正');
+    setEditing([]);
+    setSelected(new Set());
+    setSelectionResetKey((value) => value + 1);
+  }, [runAction, undoStatus.available]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = Boolean(target?.matches('input, textarea, select, [contenteditable="true"]'));
+      if (!isTyping && event.altKey && !event.ctrlKey && !event.metaKey) {
+        const index = Number(event.key) - 1;
+        if (index >= 0 && index < tabs.length) {
+          event.preventDefault();
+          setActiveTab(tabs[index].id);
+        }
+      }
+      if (
+        !isTyping
+        && editing.length === 0
+        && undoStatus.available
+        && (event.ctrlKey || event.metaKey)
+        && event.key.toLowerCase() === 'z'
+      ) {
+        event.preventDefault();
+        void undoLastCorrection().catch(() => undefined);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [editing.length, undoLastCorrection, undoStatus.available]);
 
   const daySessions = useMemo(
     () =>
@@ -711,6 +746,7 @@ export default function App() {
                 aria-current={activeTab === tab.id ? 'page' : undefined}
                 aria-label={tab.label}
                 onClick={() => setActiveTab(tab.id)}
+                title={`${tab.label}（Alt+${tabs.indexOf(tab) + 1}）`}
                 type="button"
               >
                 <Icon size={18} />
@@ -799,51 +835,62 @@ export default function App() {
             <div className="top-actions">
               <button
                 disabled={!undoStatus.available}
-                onClick={() => {
-                  void runAction(
-                    api.undoLastSessionCorrection,
-                    '已撤销上一次修正',
-                  ).then(() => {
-                    setEditing([]);
-                    setSelected(new Set());
-                    setSelectionResetKey((value) => value + 1);
-                  }).catch(() => undefined);
-                }}
+                onClick={() => void undoLastCorrection().catch(() => undefined)}
                 title={undoStatus.available
-                  ? `撤销：${undoStatus.label || '上一次修正'}`
+                  ? `撤销：${undoStatus.label || '上一次修正'}（Ctrl+Z）`
                   : '暂无可撤销的修正'}
                 type="button"
               >
                 <Undo2 size={16} />撤销
               </button>
-              {data.settings.aiMode !== 'off' && (
-                <button
-                  onClick={() =>
-                    void runAction(api.runAnalysisOnce, '已复核一条低置信会话')
+              <details
+                className="top-more"
+                onBlur={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) {
+                    event.currentTarget.removeAttribute('open');
                   }
-                  type="button"
-                >
-                  <WandSparkles size={16} />AI 复核
-                </button>
-              )}
-              <button
-                onClick={() =>
-                  void runAction(api.compactSessions, '已整理连续同类会话')
-                }
-                type="button"
-                title="合并被短暂切换打断的同类活动"
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') event.currentTarget.removeAttribute('open');
+                }}
               >
-                <RefreshCw size={16} />整理会话
-              </button>
-              <button
-                onClick={() =>
-                  void runAction(api.cleanupMediaCache, '数据库与旧缓存已优化')
-                }
-                type="button"
-                title="清理过期原始事件并压缩数据库"
-              >
-                <Database size={16} />清理存储
-              </button>
+                <summary aria-label="更多操作" title="更多操作">
+                  <Ellipsis size={17} /><span>更多</span>
+                </summary>
+                <div className="top-more-menu">
+                  {data.settings.aiMode !== 'off' && (
+                    <button
+                      onClick={(event) => {
+                        event.currentTarget.closest('details')?.removeAttribute('open');
+                        void runAction(api.runAnalysisOnce, '已复核一条低置信会话');
+                      }}
+                      type="button"
+                    >
+                      <WandSparkles size={16} />AI 复核
+                    </button>
+                  )}
+                  <button
+                    onClick={(event) => {
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                      void runAction(api.compactSessions, '已整理连续同类会话');
+                    }}
+                    type="button"
+                    title="合并被短暂切换打断的同类活动"
+                  >
+                    <RefreshCw size={16} />整理会话
+                  </button>
+                  <button
+                    onClick={(event) => {
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                      void runAction(api.cleanupMediaCache, '数据库与旧缓存已优化');
+                    }}
+                    type="button"
+                    title="清理过期原始事件并压缩数据库"
+                  >
+                    <Database size={16} />清理存储
+                  </button>
+                </div>
+              </details>
             </div>
           </div>
         </header>
@@ -920,7 +967,9 @@ export default function App() {
           <AiReviewView
             sessions={data.sessions}
             codexPlan={data.settings.codexPlan}
+            aiMode={data.settings.aiMode}
             runAction={runAction}
+            onOpenSettings={() => setActiveTab('settings')}
           />
         )}
         {activeTab === 'settings' && (
@@ -978,7 +1027,13 @@ export default function App() {
           }}
         />
       )}
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className={`toast ${toast.tone}`} role={toast.tone === 'error' ? 'alert' : 'status'}>
+          {toast.tone === 'error' ? <CircleAlert size={17} /> : <CheckCircle2 size={17} />}
+          <span>{toast.message}</span>
+          <button aria-label="关闭提示" onClick={() => setToast(null)} type="button"><X size={14} /></button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1030,11 +1085,15 @@ const aiJobFilters: { id: AiJobFilter; label: string }[] = [
 function AiReviewView({
   sessions,
   codexPlan,
+  aiMode,
   runAction,
+  onOpenSettings,
 }: {
   sessions: WorkSession[];
   codexPlan: string;
+  aiMode: string;
   runAction: ActionRunner;
+  onOpenSettings: () => void;
 }) {
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1058,14 +1117,19 @@ function AiReviewView({
     }
   }, []);
 
+  const hasActiveJobs = jobs.some((job) => job.status === 'pending' || job.status === 'running');
+
   useEffect(() => {
     void refresh();
     void api.getCodexRateCard().then(setRateCard);
+  }, [refresh]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void refresh(true);
-    }, 5000);
+    }, hasActiveJobs ? 3000 : 30_000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [hasActiveJobs, refresh]);
 
   const selectedStatus = jobs.find((job) => job.id === selectedId)?.status;
   useEffect(() => {
@@ -1150,6 +1214,30 @@ function AiReviewView({
     skipped: jobs.filter((job) => job.status === 'skipped').length,
     failed: jobs.filter((job) => job.status === 'failed' || job.status === 'downgraded').length,
   }), [jobs]);
+  const usageSummary = useMemo(() => {
+    let totalTokens = 0;
+    let credits = 0;
+    let jobCount = 0;
+    let unmatched = false;
+    jobs.forEach((job) => {
+      if (job.provider !== 'codex-account') return;
+      jobCount += 1;
+      totalTokens += job.usage.totalTokens || 0;
+      const estimate = estimateAiCredits(job, rateCard);
+      if (estimate == null) {
+        if (job.usage.totalTokens > 0) unmatched = true;
+      } else {
+        credits += estimate;
+      }
+    });
+    return {
+      totalTokens,
+      credits,
+      jobCount,
+      costUsd: rateCard ? credits * rateCard.usdPerCredit : null,
+      unmatched,
+    };
+  }, [jobs, rateCard]);
   const sessionsById = useMemo(
     () => new Map(sessions.map((session) => [session.id, session])),
     [sessions],
@@ -1188,7 +1276,29 @@ function AiReviewView({
         </div>
       </section>
 
-      <section className="ai-review-workspace">
+      {usageSummary.totalTokens > 0 && (
+        <section className="ai-usage-strip" aria-label="AI 用量估算">
+          <div>
+            <span>最近 {usageSummary.jobCount} 条 Codex 记录</span>
+            <strong>{formatAiTokens(usageSummary.totalTokens)} Token</strong>
+          </div>
+          <div>
+            <span>信用点</span>
+            <strong>{usageSummary.credits.toFixed(usageSummary.credits < 10 ? 4 : 2)} Credits</strong>
+          </div>
+          <div>
+            <span>Token 等值开销</span>
+            <strong>{usageSummary.costUsd == null ? '—' : formatUsdEstimate(usageSummary.costUsd)}</strong>
+          </div>
+          <div>
+            <span>套餐</span>
+            <strong>{codexPlanLabel(codexPlan)}</strong>
+          </div>
+          {usageSummary.unmatched && <small>部分历史模型没有匹配费率，合计不包含这些记录。</small>}
+        </section>
+      )}
+
+      <section className={`ai-review-workspace ${jobs.length === 0 ? 'empty' : ''}`}>
         <aside className="ai-job-browser">
           <div className="ai-job-filters" role="tablist" aria-label="复核状态">
             {aiJobFilters.map((item) => (
@@ -1221,8 +1331,10 @@ function AiReviewView({
             {!loading && visibleJobs.length === 0 && (
               <div className="ai-job-empty">
                 <WandSparkles size={22} />
-                <strong>这里还没有记录</strong>
-                <span>未归到具体任务，或低于 80% 且达到最小时长的会话会进入复核。</span>
+                <strong>{filter === 'all' ? '这里还没有记录' : '这个状态下没有记录'}</strong>
+                <span>{filter === 'all'
+                  ? '未归到具体任务，或低于 80% 且达到最小时长的会话会进入复核。'
+                  : '切换上方状态，或刷新列表查看最新结果。'}</span>
               </div>
             )}
           </div>
@@ -1268,7 +1380,10 @@ function AiReviewView({
                 <AiFact label="输出 Token" value={formatAiTokens(detail.usage.outputTokens)} />
                 <AiFact label="推理 Token" value={formatAiTokens(detail.usage.reasoningOutputTokens)} />
                 <AiFact label="信用点" value={formatAiCredits(detail, rateCard)} />
-                <AiFact label="开销" value={formatAiCost(detail, rateCard, codexPlan)} />
+                <AiFact
+                  label={isEstimatedAiCost(detail) || detail.usage.costUsd == null ? 'Token 等值开销' : '实际开销'}
+                  value={formatAiCost(detail, rateCard)}
+                />
                 {detail.provider === 'codex-account' && (
                   <AiFact label="套餐" value={codexPlanLabel(codexPlan)} />
                 )}
@@ -1280,11 +1395,18 @@ function AiReviewView({
               {detail.provider === 'codex-account' && rateCard && (
                 <div className="ai-rate-note">
                   <span>
-                    按当前官方 token 费率估算信用点，并累计失败重试；Pro 套餐内用量不产生单次增量扣款，超限购买以 Codex Usage 账单为准。
+                    按 Token 先换算 Credits，再按 1 Credit ≈ ${rateCard.usdPerCredit.toFixed(2)} 计算美元等值，并累计失败重试；这是用量等值，不摊分每月订阅费。
                   </span>
-                  <button onClick={() => window.open(rateCard.sourceUrl, '_blank')} type="button">
-                    查看官方费率
-                  </button>
+                  <div>
+                    <button onClick={() => window.open(rateCard.sourceUrl, '_blank')} type="button">
+                      模型费率
+                    </button>
+                    {rateCard.creditValueSourceUrl && (
+                      <button onClick={() => window.open(rateCard.creditValueSourceUrl || '', '_blank')} type="button">
+                        换算依据
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -1327,8 +1449,23 @@ function AiReviewView({
           ) : (
             <div className="ai-detail-empty">
               <WandSparkles size={28} />
-              <strong>选择一条复核记录</strong>
-              <span>可查看模型、完整提示词、原始回复和运行状态。</span>
+              <strong>{jobs.length === 0 ? '准备好后开始第一次复核' : '选择一条复核记录'}</strong>
+              <span>{jobs.length === 0
+                ? '复核会保留模型、提示词、原始回复、Token 和估算开销。'
+                : '可查看模型、完整提示词、原始回复和运行状态。'}</span>
+              {jobs.length === 0 && (
+                <button
+                  className={aiMode === 'off' ? '' : 'primary'}
+                  disabled={busy}
+                  onClick={() => aiMode === 'off'
+                    ? onOpenSettings()
+                    : void runAndRefresh(api.runAnalysisOnce, 'AI 复核已完成')}
+                  type="button"
+                >
+                  {aiMode === 'off' ? <Settings size={15} /> : <WandSparkles size={15} />}
+                  {aiMode === 'off' ? '先开启 AI 复核' : '立即复核'}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -1352,11 +1489,19 @@ function AiTraceBlock({
   empty: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+  }, []);
   const copy = async () => {
     if (!value) return;
     await navigator.clipboard.writeText(value);
     setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+    copiedTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      copiedTimerRef.current = null;
+    }, 1400);
   };
   return (
     <details className="ai-trace" open={title === 'AI 原始回复' && Boolean(value)}>
@@ -1418,7 +1563,7 @@ function normalizeAiModel(value: string) {
 }
 
 function estimateAiCredits(job: AnalysisJob, rateCard: CodexRateCard | null) {
-  if (!rateCard || !job.usage.totalTokens) return null;
+  if (job.provider !== 'codex-account' || !rateCard || !job.usage.totalTokens) return null;
   const model = normalizeAiModel(job.model);
   const rate = rateCard.rates.find((item) => normalizeAiModel(item.model) === model);
   if (!rate) return null;
@@ -1446,12 +1591,23 @@ function codexPlanLabel(plan: string) {
   return labels[plan] || 'Codex 套餐';
 }
 
-function formatAiCost(job: AnalysisJob, rateCard: CodexRateCard | null, codexPlan: string) {
+function formatUsdEstimate(value: number) {
+  const decimals = value < 0.01 ? 6 : value < 1 ? 4 : 2;
+  return `≈ $${value.toFixed(decimals)}`;
+}
+
+function isEstimatedAiCost(job: AnalysisJob) {
+  return job.provider === 'codex-account' || Boolean(job.usage.costNote?.includes('估算'));
+}
+
+function formatAiCost(job: AnalysisJob, rateCard: CodexRateCard | null) {
   if (job.usage.costUsd != null) {
-    return `$${job.usage.costUsd.toFixed(job.usage.costUsd < 0.01 ? 6 : 4)}`;
+    const value = `$${job.usage.costUsd.toFixed(job.usage.costUsd < 0.01 ? 6 : 4)}`;
+    return isEstimatedAiCost(job) ? `≈ ${value}` : value;
   }
-  if (job.provider === 'codex-account' && estimateAiCredits(job, rateCard) != null) {
-    return `${codexPlanLabel(codexPlan)} · 套餐内增量 $0`;
+  const credits = estimateAiCredits(job, rateCard);
+  if (job.provider === 'codex-account' && credits != null && rateCard) {
+    return formatUsdEstimate(credits * rateCard.usdPerCredit);
   }
   return job.usage.costNote || (job.usage.totalTokens > 0 ? '未返回金额' : '—');
 }
@@ -3528,9 +3684,17 @@ function SettingsView({
   onThemeChange: (theme: ThemeMode) => void;
 }) {
   const [settings, setSettings] = useState<AppSettings>(data.settings);
+  const [savedSettings, setSavedSettings] = useState<AppSettings>(data.settings);
   const [secret, setSecret] = useState('');
+  const savedFingerprintRef = useRef(JSON.stringify(data.settings));
 
-  useEffect(() => setSettings(data.settings), [data.settings]);
+  useEffect(() => {
+    const fingerprint = JSON.stringify(data.settings);
+    if (fingerprint === savedFingerprintRef.current) return;
+    savedFingerprintRef.current = fingerprint;
+    setSavedSettings(data.settings);
+    setSettings(data.settings);
+  }, [data.settings]);
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setSettings((current) => ({ ...current, [key]: value }));
@@ -3541,21 +3705,58 @@ function SettingsView({
     onThemeChange(theme);
   };
 
-  const saveAll = async () => {
+  const saveAll = useCallback(async () => {
     let next = { ...settings };
     if (settings.aiProvider === 'openai-compatible' && secret.trim()) {
       const secretName = settings.aiSecretRef?.trim() || 'openai-compatible';
       await api.saveSecret(secretName, secret.trim());
       next = { ...next, aiSecretRef: secretName };
-      setSettings(next);
-      setSecret('');
     }
     await api.saveSettings(next);
+    savedFingerprintRef.current = JSON.stringify(next);
+    setSavedSettings(next);
+    setSettings(next);
+    setSecret('');
+  }, [secret, settings]);
+
+  const hasChanges = JSON.stringify(settings) !== JSON.stringify(savedSettings) || Boolean(secret.trim());
+  const resetChanges = useCallback(() => {
+    setSettings(savedSettings);
+    setSecret('');
+    onThemeChange(savedSettings.theme);
+  }, [onThemeChange, savedSettings]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (hasChanges) void runAction(saveAll, '设置已保存').catch(() => undefined);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [hasChanges, runAction, saveAll]);
+
+  const jumpToSettings = (id: string) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
   return (
     <div className="settings-grid">
-      <section className="panel settings-panel appearance-panel">
+      <nav className="settings-nav" aria-label="设置分区">
+        {[
+          ['settings-appearance', '外观'],
+          ['settings-sync', '同步'],
+          ['settings-tracking', '记录'],
+          ['settings-ai', 'AI'],
+          ['settings-data', '数据'],
+        ].map(([id, label]) => (
+          <button key={id} onClick={() => jumpToSettings(id)} type="button">{label}</button>
+        ))}
+        <span>{hasChanges ? '有未保存修改' : '设置已同步'}</span>
+      </nav>
+
+      <section className="panel settings-panel appearance-panel" id="settings-appearance">
         <PanelTitle
           title="外观"
           subtitle="主题会立即预览；保存后在下次启动时继续使用。"
@@ -3587,7 +3788,7 @@ function SettingsView({
 
       <GithubSyncPanel runAction={runAction} />
 
-      <section className="panel settings-panel">
+      <section className="panel settings-panel" id="settings-tracking">
         <PanelTitle
           title="自动记录"
           subtitle="默认配置优先降低 CPU、写盘和打扰。"
@@ -3673,7 +3874,7 @@ function SettingsView({
         </div>
       </section>
 
-      <section className="panel settings-panel">
+      <section className="panel settings-panel" id="settings-ai">
         <PanelTitle
           title="可选 AI 复核"
           subtitle="本地规则始终先运行；不开 AI 也能完整使用。"
@@ -3788,7 +3989,7 @@ function SettingsView({
         </div>
       </section>
 
-      <section className="panel settings-panel">
+      <section className="panel settings-panel" id="settings-integrations">
         <PanelTitle title="日历线索" subtitle="可选导入日历计划，用于核对项目投入。" />
         <Field label="ICS 文件路径">
           <input id="ics-path" placeholder="D:\\calendar.ics" />
@@ -3809,17 +4010,11 @@ function SettingsView({
         </div>
       </section>
 
-      <section className="panel settings-panel">
+      <section className="panel settings-panel" id="settings-data">
         <PanelTitle title="数据管理" subtitle="SQLite 会话长期保留，原始事件按保留期轮转。" />
         <div className="data-actions">
           <button
-            onClick={() =>
-              void runAction(async () => {
-                const path = await api.revealDataDir();
-                window.alert(path);
-                return path;
-              }, '数据目录')
-            }
+            onClick={() => void runAction(api.revealDataDir, '已打开数据目录')}
             type="button"
           >
             <FolderKanban size={16} />查看数据目录
@@ -3867,12 +4062,24 @@ function SettingsView({
 
       <div className="settings-savebar">
         <div>
-          <strong>保存后自动生效</strong>
-          <span>采集器会在下一次配置刷新时应用间隔和保留策略。</span>
+          <strong>{hasChanges ? '有未保存修改' : '所有设置已保存'}</strong>
+          <span>{hasChanges ? '按 Ctrl+S 快速保存；采集器会自动应用新配置。' : '周期刷新不会再覆盖正在编辑的表单。'}</span>
         </div>
-        <button className="primary" onClick={() => void runAction(saveAll, '设置已保存')} type="button">
-          <Check size={17} />保存全部设置
-        </button>
+        <div className="settings-save-actions">
+          {hasChanges && (
+            <button onClick={resetChanges} type="button">
+              <Undo2 size={16} />放弃修改
+            </button>
+          )}
+          <button
+            className="primary"
+            disabled={!hasChanges}
+            onClick={() => void runAction(saveAll, '设置已保存')}
+            type="button"
+          >
+            <Check size={17} />保存更改 <kbd>Ctrl S</kbd>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -4005,7 +4212,7 @@ function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
 
   if (!config || !status) {
     return (
-      <section className="panel settings-panel sync-panel sync-panel-loading">
+      <section className="panel settings-panel sync-panel sync-panel-loading" id="settings-sync">
         <Cloud size={20} />正在读取同步状态…
       </section>
     );
@@ -4021,7 +4228,7 @@ function GithubSyncPanel({ runAction }: { runAction: ActionRunner }) {
     + status.counts.tasks + status.counts.sessions + status.counts.rules;
 
   return (
-    <section className="panel settings-panel sync-panel">
+    <section className="panel settings-panel sync-panel" id="settings-sync">
       <div className="sync-panel-head">
         <PanelTitle
           title="GitHub 多端同步"

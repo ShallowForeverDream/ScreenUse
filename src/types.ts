@@ -183,6 +183,8 @@ export interface CodexRateCard {
   sourceUrl: string;
   fetchedAt: string;
   sourceUpdatedLabel?: string | null;
+  usdPerCredit: number;
+  creditValueSourceUrl?: string | null;
   rates: CodexModelRate[];
 }
 
