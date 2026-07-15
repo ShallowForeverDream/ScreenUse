@@ -32,6 +32,11 @@ pub fn start_analysis_worker(db: Arc<AppDb>) {
                     eprintln!("ScreenUse optional AI worker error: {error}");
                 }
                 sleep(Duration::from_secs(60)).await;
+            } else if settings.ai_mode == "manual" {
+                if let Err(error) = enqueue_recent_uncertain(&db) {
+                    eprintln!("ScreenUse optional AI enqueue error: {error}");
+                }
+                sleep(Duration::from_secs(60)).await;
             } else {
                 sleep(Duration::from_secs(120)).await;
             }
@@ -58,43 +63,42 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
     if candidates.is_empty() {
         return Ok(false);
     }
-    let mut batch = candidates
-        .into_iter()
-        .take(MAX_REVIEW_BATCH)
-        .collect::<Vec<_>>();
-    batch.sort_by(|left, right| left.started_at.cmp(&right.started_at));
-    let started_at = batch
-        .first()
-        .map(|session| session.started_at.clone())
-        .context("AI review batch has no start")?;
-    let ended_at = batch
-        .iter()
-        .map(|session| session.ended_at.clone())
-        .max()
-        .context("AI review batch has no end")?;
+    for sessions in candidates.chunks(MAX_REVIEW_BATCH) {
+        let mut batch = sessions.to_vec();
+        batch.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        let started_at = batch
+            .first()
+            .map(|session| session.started_at.clone())
+            .context("AI review batch has no start")?;
+        let ended_at = batch
+            .iter()
+            .map(|session| session.ended_at.clone())
+            .max()
+            .context("AI review batch has no end")?;
 
-    db.create_analysis_job(&AnalysisJob {
-        id: Uuid::new_v4().to_string(),
-        chunk_ids: batch.into_iter().map(|session| session.id).collect(),
-        metadata_range: TimeRange {
-            started_at,
-            ended_at,
-        },
-        mode: "metadata-context-review".into(),
-        provider: settings.ai_provider.clone(),
-        model: settings.ai_model.clone(),
-        retry_count: 0,
-        status: "pending".into(),
-        error: None,
-        system_prompt: None,
-        user_prompt: None,
-        response: None,
-        queued_at: now(),
-        processing_started_at: None,
-        completed_at: None,
-        duration_ms: None,
-        result_count: 0,
-    })?;
+        db.create_analysis_job(&AnalysisJob {
+            id: Uuid::new_v4().to_string(),
+            chunk_ids: batch.into_iter().map(|session| session.id).collect(),
+            metadata_range: TimeRange {
+                started_at,
+                ended_at,
+            },
+            mode: "metadata-context-review".into(),
+            provider: settings.ai_provider.clone(),
+            model: settings.ai_model.clone(),
+            retry_count: 0,
+            status: "pending".into(),
+            error: None,
+            system_prompt: None,
+            user_prompt: None,
+            response: None,
+            queued_at: now(),
+            processing_started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            result_count: 0,
+        })?;
+    }
     Ok(true)
 }
 
@@ -422,7 +426,8 @@ fn is_review_candidate(
             session.source.as_str(),
             "collector-idle" | "collector-rule" | "ai-review"
         )
-        && session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD
+        && (session.task_id.is_none()
+            || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)
         && duration_seconds(&session.started_at, &session.ended_at) >= minimum_seconds
         && !queued.contains(&session.id)
 }
@@ -470,6 +475,18 @@ mod tests {
         let queued = HashSet::new();
         assert!(!is_review_candidate(&session(59), 60, &queued));
         assert!(is_review_candidate(&session(60), 60, &queued));
+    }
+
+    #[test]
+    fn a_high_confidence_session_without_a_task_still_needs_ai_review() {
+        let queued = HashSet::new();
+        let mut value = session(60);
+        value.confidence = 0.96;
+        assert!(is_review_candidate(&value, 60, &queued));
+
+        value.project_id = Some("project".into());
+        value.task_id = Some("task".into());
+        assert!(!is_review_candidate(&value, 60, &queued));
     }
 
     #[test]

@@ -434,7 +434,7 @@ fn setup_tray(
     let open = MenuItem::with_id(app, "tray-open", "打开 ScreenUse", true, None::<&str>)?;
     let start = MenuItem::with_id(app, "tray-start", "开始自动记录", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "tray-pause", "暂停自动记录", true, None::<&str>)?;
-    let analyze = MenuItem::with_id(app, "tray-analyze", "AI 复核一条", true, None::<&str>)?;
+    let analyze = MenuItem::with_id(app, "tray-analyze", "AI复核", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &start, &pause, &analyze, &separator, &quit])?;

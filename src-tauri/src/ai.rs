@@ -279,7 +279,7 @@ fn hide_console(_command: &mut Command) {}
 pub(crate) fn review_instructions() -> &'static str {
     "你是个人电脑时间账本的复核器。不要调用工具、不要读取文件、不要联网，只分析输入 JSON。\
 必须为 reviewItems 中每个 targetSession.sessionId 返回且只返回一个结果。只能选择 catalog 中现有的 category、projectId、taskId；\
-taskId 必须属于 projectId，projectId 必须属于 category。不合适时 projectId 和 taskId 返回 null，禁止创造新名称。\
+taskId 必须属于 projectId，projectId 必须属于 category。目标尚未归到具体任务时，必须优先从 catalog 选择最具体且合理的任务；只有 catalog 确实没有匹配项时才返回 null，禁止创造新名称。\
 每个 reviewItem 的 contextSessions 只是该目标前后时间线线索，不可作为待修改目标。优先根据当前页面、文档、窗口标题、工作区和前后事务连续性判断，\
 不要仅按应用名归类；跨 Explorer、浏览器、QQ、微信、WPS 等软件仍可能是同一任务。summary 简洁描述当时实际事务。\
 confidence 为 0 到 0.98；evidence 最多 3 项。只输出符合给定 JSON Schema 的 JSON。"

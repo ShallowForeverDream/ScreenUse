@@ -1170,7 +1170,7 @@ function AiReviewView({
               <div className="ai-job-empty">
                 <WandSparkles size={22} />
                 <strong>这里还没有记录</strong>
-                <span>低于 80% 且达到最小时长的会话会进入复核。</span>
+                <span>未归到具体任务，或低于 80% 且达到最小时长的会话会进入复核。</span>
               </div>
             )}
           </div>
@@ -3536,11 +3536,11 @@ function SettingsView({
           title="可选 AI 复核"
           subtitle="本地规则始终先运行；不开 AI 也能完整使用。"
         />
-        <Field label="AI 模式" hint="只复核低于 80% 且达到最低时长的已结束会话。">
+        <Field label="AI 模式" hint="复核未归到具体任务，或低于 80% 且达到最低时长的已结束会话。">
           <select value={settings.aiMode} onChange={(event) => update('aiMode', event.target.value)}>
             <option value="off">关闭（零费用）</option>
-            <option value="manual">手动复核低置信会话</option>
-            <option value="auto">自动复核低置信会话</option>
+            <option value="manual">手动复核待复核会话</option>
+            <option value="auto">自动复核待复核会话</option>
           </select>
         </Field>
         {settings.aiMode !== 'off' && (
@@ -5070,7 +5070,7 @@ function needsReview(session: WorkSession) {
   return (
     !isIdleSession(session) &&
     !session.userConfirmed &&
-    session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD
+    (!session.taskId || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)
   );
 }
 
