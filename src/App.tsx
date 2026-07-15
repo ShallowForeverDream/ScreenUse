@@ -32,6 +32,7 @@ import {
   KeyRound,
   Laptop,
   LayoutDashboard,
+  ListFilter,
   Merge,
   Monitor,
   Moon,
@@ -2438,29 +2439,98 @@ function TimelineView({
   runAction: ActionRunner;
 }) {
   const [query, setQuery] = useState('');
-  const [reviewOnly, setReviewOnly] = useState(false);
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [projectFilter, setProjectFilter] = useState('all');
+  const [taskFilter, setTaskFilter] = useState('all');
+  const [appFilter, setAppFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'review' | 'confirmed' | 'automatic' | 'idle'>('all');
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
   const [mergeBusy, setMergeBusy] = useState(false);
-  const normalized = query.trim().toLowerCase();
+  const normalized = normalizeSearchText(query);
+  const categoryFilters = useMemo(
+    () => [...new Set(sessions.map((session) => session.category))]
+      .sort((left, right) => left.localeCompare(right, 'zh-CN')),
+    [sessions],
+  );
+  const projectFilters = useMemo(() => {
+    const names = new Map<string, string>();
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    for (const session of sessions) {
+      if (!session.projectId || (categoryFilter !== 'all' && session.category !== categoryFilter)) {
+        continue;
+      }
+      names.set(
+        session.projectId,
+        projectsById.get(session.projectId)?.name || session.projectName || '已删除项目',
+      );
+    }
+    return [...names.entries()].sort((left, right) => left[1].localeCompare(right[1], 'zh-CN'));
+  }, [categoryFilter, projects, sessions]);
+  const taskFilters = useMemo(() => {
+    const names = new Map<string, string>();
+    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    for (const session of sessions) {
+      if (!session.taskId
+        || (categoryFilter !== 'all' && session.category !== categoryFilter)
+        || (projectFilter !== 'all' && projectFilter !== 'unassigned' && session.projectId !== projectFilter)
+        || (projectFilter === 'unassigned' && session.projectId)) {
+        continue;
+      }
+      names.set(
+        session.taskId,
+        tasksById.get(session.taskId)?.title || session.taskTitle || '已删除任务',
+      );
+    }
+    return [...names.entries()].sort((left, right) => left[1].localeCompare(right[1], 'zh-CN'));
+  }, [categoryFilter, projectFilter, sessions, tasks]);
+  const appFilters = useMemo(
+    () => [...new Set(sessions.map(sessionApplication))]
+      .sort((left, right) => left.localeCompare(right, 'zh-CN')),
+    [sessions],
+  );
   const sessionIndexById = useMemo(
     () => new Map(sessions.map((session, index) => [session.id, index])),
     [sessions],
   );
-  const filtered = sessions.filter((session) => {
-    if (reviewOnly && !needsReview(session)) return false;
+  const filtered = useMemo(() => sessions.filter((session) => {
+    if (categoryFilter !== 'all' && session.category !== categoryFilter) return false;
+    if (projectFilter === 'unassigned' && session.projectId) return false;
+    if (projectFilter !== 'all' && projectFilter !== 'unassigned' && session.projectId !== projectFilter) {
+      return false;
+    }
+    if (taskFilter === 'unassigned' && session.taskId) return false;
+    if (taskFilter !== 'all' && taskFilter !== 'unassigned' && session.taskId !== taskFilter) {
+      return false;
+    }
+    if (appFilter !== 'all' && sessionApplication(session) !== appFilter) return false;
+    if (statusFilter === 'review' && !needsReview(session)) return false;
+    if (statusFilter === 'confirmed' && !session.userConfirmed) return false;
+    if (statusFilter === 'automatic'
+      && (session.userConfirmed || needsReview(session) || isIdleSession(session))) return false;
+    if (statusFilter === 'idle' && !isIdleSession(session)) return false;
     if (!normalized) return true;
-    return [
+    return normalizeSearchText([
       session.summary,
       session.category,
       session.projectName,
       session.taskTitle,
       ...session.evidence.map((item) => item.value),
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-      .includes(normalized);
-  });
+    ].filter(Boolean).join(' ')).includes(normalized);
+  }), [
+    appFilter,
+    categoryFilter,
+    normalized,
+    projectFilter,
+    sessions,
+    statusFilter,
+    taskFilter,
+  ]);
+  const activeFilterCount = Number(Boolean(normalized))
+    + Number(categoryFilter !== 'all')
+    + Number(projectFilter !== 'all')
+    + Number(taskFilter !== 'all')
+    + Number(appFilter !== 'all')
+    + Number(statusFilter !== 'all');
   const selectedSessions = sessions.filter((session) => selected.has(session.id));
   const filteredSelectedCount = filtered.reduce(
     (count, session) => count + Number(selected.has(session.id)),
@@ -2508,6 +2578,15 @@ function TimelineView({
     onEdit(belongsToSelection && selectedSessions.length > 1 ? selectedSessions : [session]);
   };
 
+  const clearFilters = () => {
+    setQuery('');
+    setCategoryFilter('all');
+    setProjectFilter('all');
+    setTaskFilter('all');
+    setAppFilter('all');
+    setStatusFilter('all');
+  };
+
   return (
     <div className="timeline-layout">
       <section className="panel timeline-panel">
@@ -2519,15 +2598,6 @@ function TimelineView({
               onChange={(event) => setQuery(event.target.value)}
               placeholder="搜索项目、摘要、应用或网页"
             />
-          </label>
-          <label className="switch-label">
-            <input
-              className="themed-checkbox"
-              type="checkbox"
-              checked={reviewOnly}
-              onChange={(event) => setReviewOnly(event.target.checked)}
-            />
-            只看待复核
           </label>
           <div className="selection-controls">
             <label className="selection-toggle" title={`选择当前显示的 ${filtered.length} 个时间段`}>
@@ -2608,12 +2678,78 @@ function TimelineView({
           })}
           {!filtered.length && (
             <EmptyState
-              title={reviewOnly ? '没有待复核记录' : '没有匹配的活动'}
-              detail={reviewOnly ? '本地规则已经处理完这一天。' : '尝试清空搜索条件。'}
+              title="没有匹配的活动"
+              detail={activeFilterCount ? '清空或调整右侧筛选条件后再试。' : '当天还没有可显示的时间段。'}
             />
           )}
         </div>
       </section>
+      <aside className="panel timeline-filter-panel">
+        <div className="timeline-filter-head">
+          <div>
+            <span><ListFilter size={16} /></span>
+            <div>
+              <h2>筛选条件</h2>
+              <p>显示 {filtered.length}/{sessions.length} 个时间段</p>
+            </div>
+          </div>
+          <button disabled={!activeFilterCount} onClick={clearFilters} type="button">
+            <X size={13} />清空
+          </button>
+        </div>
+        <div className="timeline-filter-fields">
+          <label>
+            <span>状态</span>
+            <select aria-label="状态筛选" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as typeof statusFilter)}>
+              <option value="all">全部状态</option>
+              <option value="review">待复核</option>
+              <option value="confirmed">已确认</option>
+              <option value="automatic">自动判断</option>
+              <option value="idle">离开/空闲</option>
+            </select>
+          </label>
+          <label>
+            <span>分类</span>
+            <select aria-label="分类筛选" value={categoryFilter} onChange={(event) => {
+              setCategoryFilter(event.target.value);
+              setProjectFilter('all');
+              setTaskFilter('all');
+            }}>
+              <option value="all">全部分类</option>
+              {categoryFilters.map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>项目</span>
+            <select aria-label="项目筛选" value={projectFilter} onChange={(event) => {
+              setProjectFilter(event.target.value);
+              setTaskFilter('all');
+            }}>
+              <option value="all">全部项目</option>
+              <option value="unassigned">未归类项目</option>
+              {projectFilters.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>任务</span>
+            <select aria-label="任务筛选" value={taskFilter} onChange={(event) => setTaskFilter(event.target.value)}>
+              <option value="all">全部任务</option>
+              <option value="unassigned">未归类任务</option>
+              {taskFilters.map(([id, title]) => <option key={id} value={id}>{title}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>应用</span>
+            <select aria-label="应用筛选" value={appFilter} onChange={(event) => setAppFilter(event.target.value)}>
+              <option value="all">全部应用</option>
+              {appFilters.map((app) => <option key={app} value={app}>{app}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className={`timeline-filter-state ${activeFilterCount ? 'active' : ''}`}>
+          {activeFilterCount ? `已启用 ${activeFilterCount} 项筛选` : '当前显示全部记录'}
+        </div>
+      </aside>
       {mergeDialogOpen && (
         <TextInputDialog
           busy={mergeBusy}
