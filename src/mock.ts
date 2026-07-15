@@ -72,5 +72,14 @@ export const fallbackDashboard: DashboardData = {
     { label: '学习', value: 42, group: '学习' },
     { label: '杂务', value: 24, group: '杂务' },
   ],
-  queue: { pending: 0, running: 0, failed: 0, downgraded: 0, tempStorageGb: 0, tempStorageLimitGb: 1 },
+  queue: {
+    pending: 0,
+    running: 0,
+    failed: 0,
+    downgraded: 0,
+    tempStorageGb: 0,
+    tempStorageLimitGb: 1,
+    personalMemoryCount: 0,
+    personalMemoryUses: 0,
+  },
 };

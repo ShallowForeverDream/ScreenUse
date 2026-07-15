@@ -436,7 +436,12 @@ impl AppDb {
                         .context("同步删除分类时找不到可用的替代分类")?;
                     tx.execute(
                         "UPDATE projects SET category=?1,color=?2,updated_at=?3 WHERE category=?4",
-                        params![fallback_name, fallback_color, tombstone.deleted_at, tombstone.entity_id],
+                        params![
+                            fallback_name,
+                            fallback_color,
+                            tombstone.deleted_at,
+                            tombstone.entity_id
+                        ],
                     )?;
                     tx.execute(
                         "UPDATE work_sessions SET category=?1,updated_at=?2 WHERE category=?3",
@@ -469,6 +474,7 @@ impl AppDb {
         tx.commit()?;
         drop(conn);
         self.save_sync_devices(&snapshot.devices)?;
+        self.rebuild_personal_memory_from_confirmed()?;
         Ok(())
     }
 }
@@ -902,9 +908,7 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
         |item| item.name.clone(),
         |item| item.updated_at.as_str(),
     );
-    categories.retain(|item| {
-        !is_deleted(&tombstone_map, "category", &item.name, &item.updated_at)
-    });
+    categories.retain(|item| !is_deleted(&tombstone_map, "category", &item.name, &item.updated_at));
     let category_names: HashSet<String> = categories.iter().map(|item| item.name.clone()).collect();
     let fallback_category = if category_names.contains("杂务") {
         "杂务".to_string()

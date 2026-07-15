@@ -107,6 +107,8 @@ export interface QueueHealth {
   downgraded: number;
   tempStorageGb: number;
   tempStorageLimitGb: number;
+  personalMemoryCount: number;
+  personalMemoryUses: number;
 }
 
 export interface AppSettings {

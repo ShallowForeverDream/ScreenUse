@@ -266,6 +266,8 @@ pub struct QueueHealth {
     pub downgraded: u32,
     pub temp_storage_gb: f32,
     pub temp_storage_limit_gb: f32,
+    pub personal_memory_count: u32,
+    pub personal_memory_uses: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

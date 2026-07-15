@@ -136,9 +136,7 @@ pub async fn run_selected(
     Ok(result)
 }
 
-async fn run_pending_jobs(
-    db: &Arc<AppDb>,
-) -> Result<crate::models::AnalysisBatchRunResult> {
+async fn run_pending_jobs(db: &Arc<AppDb>) -> Result<crate::models::AnalysisBatchRunResult> {
     ensure_auto_review_enabled(db)?;
     let mut result = crate::models::AnalysisBatchRunResult::default();
     loop {
@@ -184,6 +182,7 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
     let categories = db.list_categories()?;
     let projects = db.list_projects()?;
     let tasks = db.list_tasks()?;
+    let memories = db.relevant_personal_memories(&targets, 3)?;
     let input = AiReviewInput {
         targets: &targets,
         context_sessions: &context_sessions,
@@ -191,6 +190,7 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
         categories: &categories,
         projects: &projects,
         tasks: &tasks,
+        memories: &memories,
     };
 
     let review_result: Result<AiAttributionBatch> = async {
@@ -203,10 +203,12 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
             &system_prompt,
             &user_prompt,
         )?;
-        let response = maybe_ai(&settings, &system_prompt, &user_prompt).await?;
+        let response = maybe_ai(&settings, &system_prompt, &user_prompt, &input).await?;
         let mut usage = response.usage;
         if settings.ai_provider == "codex-account" && usage.cost_usd.is_none() {
-            if let Some((credits, usd)) = crate::pricing::estimate_usage_cost(db, &settings.ai_model, &usage) {
+            if let Some((credits, usd)) =
+                crate::pricing::estimate_usage_cost(db, &settings.ai_model, &usage)
+            {
                 usage.cost_usd = Some(usd);
                 usage.cost_note = Some(format!(
                     "按调用时官方 Token/Credits 等值费率估算：{credits:.6} Credits"
@@ -336,9 +338,16 @@ async fn maybe_ai(
     settings: &crate::models::AppSettings,
     system_prompt: &str,
     user_prompt: &str,
+    input: &AiReviewInput<'_>,
 ) -> Result<AiResponse> {
     if settings.ai_provider == "codex-account" {
-        return request_with_codex_account(settings, system_prompt, user_prompt).await;
+        let session_ids = input
+            .targets
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        return request_with_codex_account(settings, system_prompt, user_prompt, &session_ids)
+            .await;
     }
     let secret_name = settings.ai_secret_ref.as_deref().unwrap_or_default().trim();
     if secret_name.is_empty() {
@@ -614,19 +623,17 @@ mod tests {
         let db = Arc::new(AppDb::open_in(data_dir.clone()).expect("open test database"));
         let mut settings = db.get_settings().expect("load settings");
         settings.ai_mode = "auto".into();
-        db.save_settings(&settings).expect("enable automatic review");
+        db.save_settings(&settings)
+            .expect("enable automatic review");
         let queued_at = now();
         for id in ["selected-a", "unselected-a", "selected-b", "unselected-b"] {
             db.create_analysis_job(&analysis_job(id, &queued_at))
                 .expect("create analysis job");
         }
 
-        let result = run_selected(
-            db.clone(),
-            &["selected-a".into(), "selected-b".into()],
-        )
-        .await
-        .expect("run selected jobs");
+        let result = run_selected(db.clone(), &["selected-a".into(), "selected-b".into()])
+            .await
+            .expect("run selected jobs");
 
         assert_eq!(result.processed, 2);
         assert_eq!(result.failed, 0);

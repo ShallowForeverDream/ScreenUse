@@ -17,6 +17,7 @@ mod github_sync;
 mod integration_server;
 mod integrations;
 mod maintenance;
+mod memory;
 mod models;
 mod pricing;
 mod secrets;
@@ -307,7 +308,14 @@ async fn run_analysis_once(state: State<'_, AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 fn start_analysis_queue(state: State<'_, AppState>) -> Result<(), String> {
-    if state.db.get_settings().map_err(map_err)?.normalized().ai_mode != "auto" {
+    if state
+        .db
+        .get_settings()
+        .map_err(map_err)?
+        .normalized()
+        .ai_mode
+        != "auto"
+    {
         return Err("请先开启 AI 自动复核".into());
     }
     run_optional_ai(state.db.clone());

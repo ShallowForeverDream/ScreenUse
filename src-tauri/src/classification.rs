@@ -22,9 +22,8 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     }
 
     let contextual_assignment = resolve_project_task(db, event, &session.category)?;
-    let is_complete = session.confidence >= 0.84
-        && session.project_id.is_some()
-        && session.task_id.is_some();
+    let is_complete =
+        session.confidence >= 0.84 && session.project_id.is_some() && session.task_id.is_some();
     let page_context_is_stronger = contextual_assignment.as_ref().is_some_and(|assignment| {
         assignment.confidence >= 0.92 && assignment.confidence > session.confidence + 0.01
     });
@@ -71,7 +70,8 @@ fn recent_task_assignment(db: &AppDb, session: &WorkSession) -> Result<Option<As
     let (Some(project_id), Some(task_id)) = (context.project_id, context.task_id) else {
         return Ok(None);
     };
-    if context.source == "collector-idle" || (!context.user_confirmed && context.confidence < 0.84) {
+    if context.source == "collector-idle" || (!context.user_confirmed && context.confidence < 0.84)
+    {
         return Ok(None);
     }
     let started = chrono::DateTime::parse_from_rfc3339(&session.started_at)?;
@@ -103,15 +103,24 @@ pub fn finalize_context(
     let settings = db.get_settings()?.normalized();
     if event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64 {
         let project_id = db.configure_idle_target(&settings)?;
-        let updated = db.update_session(&session.id, SessionPatch {
-            summary: Some("离开/空闲".into()), project_id: Some(project_id), task_id: None,
-            clear_project: Some(false), clear_task: Some(true), category: Some(settings.idle_category),
-            confidence: Some(0.99), user_confirmed: Some(false),
-        })?;
+        let updated = db.update_session(
+            &session.id,
+            SessionPatch {
+                summary: Some("离开/空闲".into()),
+                project_id: Some(project_id),
+                task_id: None,
+                clear_project: Some(false),
+                clear_task: Some(true),
+                category: Some(settings.idle_category),
+                confidence: Some(0.99),
+                user_confirmed: Some(false),
+            },
+        )?;
         db.mark_session_awaiting_confirmation(&updated.id)?;
         return db.get_session(&updated.id);
     }
-    let (local_category, local_confidence) = classify_category(event, settings.idle_threshold_seconds);
+    let (local_category, local_confidence) =
+        classify_category(event, settings.idle_threshold_seconds);
     let mut category = if session.confidence >= 0.84 {
         session.category.clone()
     } else {
@@ -122,10 +131,13 @@ pub fn finalize_context(
     let mut confidence = session.confidence.max(local_confidence);
 
     if let Some(assignment) = resolve_project_task(db, event, &category)? {
-        project_id = Some(assignment.project_id);
-        task_id = assignment.task_id;
-        category = assignment.category;
-        confidence = confidence.max(assignment.confidence);
+        let current_is_complete = project_id.is_some() && task_id.is_some() && confidence >= 0.84;
+        if !current_is_complete || assignment.confidence > confidence + 0.01 {
+            project_id = Some(assignment.project_id);
+            task_id = assignment.task_id;
+            category = assignment.category;
+            confidence = confidence.max(assignment.confidence);
+        }
     } else if category != session.category && session.project_id.is_some() {
         category = session.category.clone();
     }
@@ -147,7 +159,11 @@ pub fn finalize_context(
     db.coalesce_session_neighbors(&updated.id).map(Some)
 }
 
-fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) -> Result<Option<Assignment>> {
+fn resolve_project_task(
+    db: &AppDb,
+    event: &RawActivityEvent,
+    category: &str,
+) -> Result<Option<Assignment>> {
     if category == "离开" {
         return Ok(None);
     }
@@ -159,7 +175,13 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
 
     let mut best: Option<(&Project, i32)> = None;
     for project in &projects {
-        let score = project_score(project, category, &hay, page.as_deref(), workspace.as_deref());
+        let score = project_score(
+            project,
+            category,
+            &hay,
+            page.as_deref(),
+            workspace.as_deref(),
+        );
         if score > best.map(|(_, current)| current).unwrap_or(i32::MIN) {
             best = Some((project, score));
         }
@@ -169,13 +191,21 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
         Some((project, score)) => (project.id.clone(), score, false),
         None if should_create_workspace_project(event, workspace.as_deref()) => {
             let name = workspace.unwrap_or_else(|| "开发工作区".into());
-            (db.upsert_project_by_name(&name, category, "workspace-auto")?, 70, true)
+            (
+                db.upsert_project_by_name(&name, category, "workspace-auto")?,
+                70,
+                true,
+            )
         }
         None => return Ok(None),
     };
 
     let task_id = if auto_created {
-        Some(db.upsert_task_by_title(&project_id, default_task_title(category, event), "workspace-auto")?)
+        Some(db.upsert_task_by_title(
+            &project_id,
+            default_task_title(category, event),
+            "workspace-auto",
+        )?)
     } else {
         best_task(&tasks, &project_id, &hay, page.as_deref()).map(|task| task.id.clone())
     };
@@ -194,7 +224,12 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
         .find(|project| project.id == project_id)
         .map(|project| project.category.clone())
         .unwrap_or_else(|| category.to_string());
-    Ok(Some(Assignment { project_id, task_id, category: assigned_category, confidence }))
+    Ok(Some(Assignment {
+        project_id,
+        task_id,
+        category: assigned_category,
+        confidence,
+    }))
 }
 
 fn project_score(
@@ -244,7 +279,10 @@ fn best_task<'a>(
     hay: &str,
     page: Option<&str>,
 ) -> Option<&'a Task> {
-    let project_tasks: Vec<_> = tasks.iter().filter(|task| task.project_id == project_id).collect();
+    let project_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.project_id == project_id)
+        .collect();
     let scored = project_tasks
         .iter()
         .map(|task| {
@@ -263,9 +301,17 @@ fn best_task<'a>(
                 .filter(|token| !is_generic_token(token))
                 .map(|token| {
                     if page.is_some_and(|page| page.contains(&token)) {
-                        if token.chars().count() >= 6 { 32 } else { 20 }
+                        if token.chars().count() >= 6 {
+                            32
+                        } else {
+                            20
+                        }
                     } else if hay.contains(&token) {
-                        if token.chars().count() >= 6 { 20 } else { 10 }
+                        if token.chars().count() >= 6 {
+                            20
+                        } else {
+                            10
+                        }
                     } else {
                         0
                     }
@@ -277,22 +323,38 @@ fn best_task<'a>(
     match scored {
         Some((task, score)) if score > 0 => Some(task),
         _ => {
-            let active = project_tasks.into_iter().filter(|task| task.status == "active").collect::<Vec<_>>();
+            let active = project_tasks
+                .into_iter()
+                .filter(|task| task.status == "active")
+                .collect::<Vec<_>>();
             (active.len() == 1).then(|| active[0])
         }
     }
 }
 
 fn should_create_workspace_project(event: &RawActivityEvent, workspace: Option<&str>) -> bool {
-    let Some(workspace) = workspace else { return false; };
+    let Some(workspace) = workspace else {
+        return false;
+    };
     if workspace.chars().count() < 2 || is_generic_workspace(workspace) {
         return false;
     }
     let app = event.app.as_deref().unwrap_or_default().to_lowercase();
     event.source.contains("vscode")
-        || ["code", "cursor", "windsurf", "codium", "devenv", "idea", "pycharm", "webstorm", "rustrover", "clion"]
-            .iter()
-            .any(|needle| app.contains(needle))
+        || [
+            "code",
+            "cursor",
+            "windsurf",
+            "codium",
+            "devenv",
+            "idea",
+            "pycharm",
+            "webstorm",
+            "rustrover",
+            "clion",
+        ]
+        .iter()
+        .any(|needle| app.contains(needle))
 }
 
 fn default_task_title<'a>(category: &str, event: &'a RawActivityEvent) -> &'a str {
@@ -316,15 +378,29 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
     let app = event.app.as_deref().unwrap_or_default().to_lowercase();
     let hay = event_hay(event);
 
-    if ["code.exe", "cursor", "windsurf", "codium", "devenv", "idea", "pycharm", "webstorm", "rustrover", "clion"]
-        .iter()
-        .any(|needle| app.contains(needle))
+    if [
+        "code.exe",
+        "cursor",
+        "windsurf",
+        "codium",
+        "devenv",
+        "idea",
+        "pycharm",
+        "webstorm",
+        "rustrover",
+        "clion",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle))
     {
         return ("开发", 0.88);
     }
-    if ["wechat", "weixin", "qq.exe", "teams", "slack", "discord", "telegram", "feishu", "lark", "zoom"]
-        .iter()
-        .any(|needle| app.contains(needle))
+    if [
+        "wechat", "weixin", "qq.exe", "teams", "slack", "discord", "telegram", "feishu", "lark",
+        "zoom",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle))
     {
         return ("沟通", 0.88);
     }
@@ -341,19 +417,66 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
         return ("娱乐", 0.90);
     }
 
-    if contains_any(&hay, &["github.com", "gitlab", "stackoverflow", "docs.rs", "localhost", "127.0.0.1", "developer.", "devtools", "npmjs", "crates.io"]) {
+    if contains_any(
+        &hay,
+        &[
+            "github.com",
+            "gitlab",
+            "stackoverflow",
+            "docs.rs",
+            "localhost",
+            "127.0.0.1",
+            "developer.",
+            "devtools",
+            "npmjs",
+            "crates.io",
+        ],
+    ) {
         return ("开发", 0.80);
     }
-    if contains_any(&hay, &["gmail", "outlook", "mail.", "meeting", "会议", "飞书", "腾讯会议", "企业微信"]) {
+    if contains_any(
+        &hay,
+        &[
+            "gmail",
+            "outlook",
+            "mail.",
+            "meeting",
+            "会议",
+            "飞书",
+            "腾讯会议",
+            "企业微信",
+        ],
+    ) {
         return ("沟通", 0.80);
     }
-    if contains_any(&hay, &["markdown", ".md", "document", "文档", "写作", "稿件", "论文写作"]) {
+    if contains_any(
+        &hay,
+        &[
+            "markdown",
+            ".md",
+            "document",
+            "文档",
+            "写作",
+            "稿件",
+            "论文写作",
+        ],
+    ) {
         return ("写作", 0.76);
     }
-    if contains_any(&hay, &["course", "lecture", "tutorial", "arxiv", "知网", "课程", "学习", "教材", ".pdf", "pdf"]) {
+    if contains_any(
+        &hay,
+        &[
+            "course", "lecture", "tutorial", "arxiv", "知网", "课程", "学习", "教材", ".pdf", "pdf",
+        ],
+    ) {
         return ("学习", 0.76);
     }
-    if contains_any(&hay, &["youtube", "bilibili", "netflix", "douyin", "抖音", "游戏", "game", "video"]) {
+    if contains_any(
+        &hay,
+        &[
+            "youtube", "bilibili", "netflix", "douyin", "抖音", "游戏", "game", "video",
+        ],
+    ) {
         return ("娱乐", 0.72);
     }
     ("杂务", 0.56)
@@ -363,7 +486,10 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
     if category == "离开" {
         return "离开/空闲".into();
     }
-    if let Some(title) = chat_conversation_title(event).map(clean_title).filter(|title| !title.is_empty()) {
+    if let Some(title) = chat_conversation_title(event)
+        .map(clean_title)
+        .filter(|title| !title.is_empty())
+    {
         let project = event
             .metadata
             .get("chatgptProject")
@@ -382,10 +508,13 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
     let workspace = event.workspace.as_deref().and_then(path_label);
     let file = event.file_path.as_deref().and_then(path_label);
     if let Some(workspace) = workspace {
-        return cap(&match file {
-            Some(file) if file != workspace => format!("{workspace} · {file}"),
-            _ => workspace,
-        }, 96);
+        return cap(
+            &match file {
+                Some(file) if file != workspace => format!("{workspace} · {file}"),
+                _ => workspace,
+            },
+            96,
+        );
     }
 
     let title = clean_title(event.window_title.as_deref().unwrap_or_default());
@@ -453,10 +582,13 @@ fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            (event.metadata.get("activePageSource").and_then(serde_json::Value::as_str)
+            (event
+                .metadata
+                .get("activePageSource")
+                .and_then(serde_json::Value::as_str)
                 == Some("chatgpt-conversation"))
-                .then(|| event_current_page_title(event))
-                .flatten()
+            .then(|| event_current_page_title(event))
+            .flatten()
         })
 }
 
@@ -491,7 +623,13 @@ fn path_label(value: &str) -> Option<String> {
 
 fn host_label(url: &str) -> Option<String> {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let host = without_scheme.split('/').next()?.split('@').next_back()?.split(':').next()?;
+    let host = without_scheme
+        .split('/')
+        .next()?
+        .split('@')
+        .next_back()?
+        .split(':')
+        .next()?;
     let host = host.trim_start_matches("www.").trim();
     (!host.is_empty()).then(|| host.to_string())
 }
@@ -518,18 +656,37 @@ fn cap(value: &str, max_chars: usize) -> String {
     if cleaned.chars().count() <= max_chars {
         cleaned
     } else {
-        let mut output = cleaned.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+        let mut output = cleaned
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
         output.push('…');
         output
     }
 }
 
 fn is_generic_token(token: &str) -> bool {
-    matches!(token, "开发" | "学习" | "写作" | "沟通" | "娱乐" | "杂务" | "项目" | "工作" | "任务" | "daily" | "project")
+    matches!(
+        token,
+        "开发"
+            | "学习"
+            | "写作"
+            | "沟通"
+            | "娱乐"
+            | "杂务"
+            | "项目"
+            | "工作"
+            | "任务"
+            | "daily"
+            | "project"
+    )
 }
 
 fn is_generic_workspace(value: &str) -> bool {
-    matches!(normalize(value).as_str(), "desktop" | "documents" | "downloads" | "home" | "用户" | "桌面" | "文档" | "下载")
+    matches!(
+        normalize(value).as_str(),
+        "desktop" | "documents" | "downloads" | "home" | "用户" | "桌面" | "文档" | "下载"
+    )
 }
 
 #[cfg(test)]
@@ -555,22 +712,34 @@ mod tests {
 
     #[test]
     fn classifies_ide_as_development() {
-        assert_eq!(classify_category(&event("Code.exe", "ScreenUse"), 180).0, "开发");
+        assert_eq!(
+            classify_category(&event("Code.exe", "ScreenUse"), 180).0,
+            "开发"
+        );
     }
 
     #[test]
     fn extracts_windows_workspace_name() {
-        assert_eq!(path_label(r"C:\\Code\\ScreenUse").as_deref(), Some("ScreenUse"));
+        assert_eq!(
+            path_label(r"C:\\Code\\ScreenUse").as_deref(),
+            Some("ScreenUse")
+        );
     }
 
     #[test]
     fn strips_browser_suffix_from_title() {
-        assert_eq!(clean_title("ScreenUse - GitHub - Google Chrome"), "ScreenUse - GitHub");
+        assert_eq!(
+            clean_title("ScreenUse - GitHub - Google Chrome"),
+            "ScreenUse - GitHub"
+        );
     }
 
     #[test]
     fn qq_image_viewer_keeps_the_main_qq_summary() {
-        assert_eq!(summary_for_event(&event("QQ.exe", "图片查看器"), "杂务"), "QQ");
+        assert_eq!(
+            summary_for_event(&event("QQ.exe", "图片查看器"), "杂务"),
+            "QQ"
+        );
     }
 
     #[test]
@@ -585,10 +754,7 @@ mod tests {
             "chatgptProject": "HDU"
         });
 
-        assert_eq!(
-            summary_for_event(&event, "开发"),
-            "codex_work_bridge · HDU"
-        );
+        assert_eq!(summary_for_event(&event, "开发"), "codex_work_bridge · HDU");
     }
 
     #[test]
@@ -613,13 +779,8 @@ mod tests {
             Some(&page),
             Some("HDU"),
         );
-        let workspace_score = project_score(
-            &project("HDU"),
-            "开发",
-            &hay,
-            Some(&page),
-            Some("HDU"),
-        );
+        let workspace_score =
+            project_score(&project("HDU"), "开发", &hay, Some(&page), Some("HDU"));
         assert!(page_score > workspace_score);
         assert!(page_score >= 220);
     }

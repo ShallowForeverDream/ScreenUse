@@ -966,6 +966,8 @@ export default function App() {
             sessions={data.sessions}
             codexPlan={data.settings.codexPlan}
             aiMode={data.settings.aiMode}
+            memoryCount={data.queue.personalMemoryCount}
+            memoryUses={data.queue.personalMemoryUses}
             runAction={runAction}
             onToggleAuto={(enabled) => runAction(async () => {
               const next: AppSettings = {
@@ -1091,12 +1093,16 @@ function AiReviewView({
   sessions,
   codexPlan,
   aiMode,
+  memoryCount,
+  memoryUses,
   runAction,
   onToggleAuto,
 }: {
   sessions: WorkSession[];
   codexPlan: string;
   aiMode: string;
+  memoryCount: number;
+  memoryUses: number;
   runAction: ActionRunner;
   onToggleAuto: (enabled: boolean) => Promise<unknown>;
 }) {
@@ -1415,7 +1421,7 @@ function AiReviewView({
         </div>
       </section>
 
-      {usageSummary.totalTokens > 0 && (
+      {(usageSummary.totalTokens > 0 || memoryCount > 0) && (
         <section className="ai-usage-strip" aria-label="AI 用量估算">
           <div>
             <span>最近 {usageSummary.jobCount} 条 Codex 记录</span>
@@ -1432,6 +1438,10 @@ function AiReviewView({
           <div>
             <span>套餐</span>
             <strong>{codexPlanLabel(codexPlan)}</strong>
+          </div>
+          <div>
+            <span>个人记忆</span>
+            <strong>{memoryCount} 条 · 命中 {memoryUses} 次</strong>
           </div>
           {usageSummary.unmatched && <small>部分历史模型没有匹配费率，合计不包含这些记录。</small>}
         </section>
@@ -2005,7 +2015,12 @@ function TodayView({
       || left.index - right.index
     ))
     .map(({ item }) => item);
-  const projectDistributionRows = projectBreakdown(sessions, selectedDate)
+  const projectDistributionRows = projectBreakdown(
+    sessions.filter((session) => (
+      session.category !== '离开' && session.category !== idleCategory
+    )),
+    selectedDate,
+  )
     .filter((item) => item.minutes > 0)
     .map((item, index) => ({ item, index }))
     .sort((left, right) => (
@@ -5553,9 +5568,13 @@ function EditSessionModal({
         </div>
 
         <div className="correction-options">
+          <div className="correction-memory-note">
+            <Sparkles size={18} />
+            <span><strong>个人记忆会自动学习</strong><small>只用于之后的相似页面；遇到冲突会放弃判断</small></span>
+          </div>
           <label>
             <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
-            <span><strong>记住识别规则</strong><small>仅影响之后的新时间段，不会修改其他已有记录</small></span>
+            <span><strong>额外建立强规则</strong><small>仅在有明确识别词时使用</small></span>
           </label>
           <label className={!projectId ? 'disabled' : ''}>
             <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />
