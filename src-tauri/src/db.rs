@@ -52,6 +52,7 @@ struct ContextPropagationRow {
     ended_at: String,
     project_id: Option<String>,
     task_id: Option<String>,
+    summary: String,
     confidence: f32,
     user_confirmed: bool,
     source: String,
@@ -1369,7 +1370,7 @@ impl AppDb {
             let rows = {
                 let conn = self.conn.lock();
                 let mut stmt = conn.prepare(
-                    "SELECT id,started_at,ended_at,project_id,task_id,confidence,user_confirmed,source
+                    "SELECT id,started_at,ended_at,project_id,task_id,summary,confidence,user_confirmed,source
                      FROM work_sessions
                      WHERE started_at<=?2 AND ended_at>=?1
                      ORDER BY started_at ASC,ended_at ASC",
@@ -1381,9 +1382,10 @@ impl AppDb {
                         ended_at: row.get(2)?,
                         project_id: row.get(3)?,
                         task_id: row.get(4)?,
-                        confidence: row.get(5)?,
-                        user_confirmed: row.get::<_, i64>(6)? != 0,
-                        source: row.get(7)?,
+                        summary: row.get(5)?,
+                        confidence: row.get(6)?,
+                        user_confirmed: row.get::<_, i64>(7)? != 0,
+                        source: row.get(8)?,
                     })
                 })?;
                 collect_rows(mapped)?
@@ -1408,14 +1410,20 @@ impl AppDb {
                         && !same_assignment(row))
             };
             let mut update_row = |row: &ContextPropagationRow| -> Result<()> {
-                if same_assignment(row) || row.user_confirmed || changed_ids.contains(&row.id) {
+                let stale_idle_summary = row.summary == "离开/空闲" && anchor.summary != "离开/空闲";
+                if (same_assignment(row) && !stale_idle_summary)
+                    || row.user_confirmed
+                    || changed_ids.contains(&row.id)
+                {
                     return Ok(());
                 }
                 self.conn.lock().execute(
                     "UPDATE work_sessions
-                     SET project_id=?1,task_id=?2,category=?3,confidence=MAX(confidence,0.90),updated_at=?4
-                     WHERE id=?5 AND user_confirmed=0",
-                    params![project_id, task_id, anchor.category, now(), row.id],
+                     SET project_id=?1,task_id=?2,category=?3,
+                         summary=CASE WHEN summary='离开/空闲' THEN ?4 ELSE summary END,
+                         confidence=MAX(confidence,0.90),updated_at=?5
+                     WHERE id=?6 AND user_confirmed=0",
+                    params![project_id, task_id, anchor.category, anchor.summary, now(), row.id],
                 )?;
                 changed_ids.insert(row.id.clone());
                 Ok(())
@@ -4533,6 +4541,13 @@ mod tests {
         )
         .expect("ingest explorer")
         .expect("explorer session");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions SET summary='离开/空闲' WHERE id=?1",
+                params![&first.id],
+            )
+            .expect("mark stale idle summary");
         let anchor = classification::ingest_event(
             &db,
             &context_event(
@@ -4603,6 +4618,7 @@ mod tests {
             let repaired = db.get_session(id).expect("load repaired").expect("session");
             assert_eq!(repaired.project_id.as_deref(), Some(project.id.as_str()));
             assert_eq!(repaired.task_id.as_deref(), Some(task.id.as_str()));
+            assert_ne!(repaired.summary, "离开/空闲");
             assert!(!repaired.user_confirmed);
         }
         let untouched = db

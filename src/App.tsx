@@ -3104,8 +3104,8 @@ function SettingsView({
         <Toggle
           checked={settings.passiveContentCountsAsActive}
           onChange={(value) => update('passiveContentCountsAsActive', value)}
-          title="视频播放不计为离开"
-          detail="只在网页视频确认正在播放或前台为本地视频播放器时继续计时。"
+          title="会议和视频不计为离开"
+          detail="前台会议、确认播放的网页视频和本地播放器即使没有键鼠输入也继续计时。"
         />
         <Toggle
           checked={settings.autoMaintenance}

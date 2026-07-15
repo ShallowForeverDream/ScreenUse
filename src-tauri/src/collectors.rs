@@ -117,10 +117,13 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     }
                 };
                 context_store::enrich_event(&mut event);
-                if settings.passive_content_counts_as_active
-                    && event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64
-                    && is_passive_attention(&event)
-                {
+                let passive_attention = settings
+                    .passive_content_counts_as_active
+                    .then(|| passive_attention_reason(&event))
+                    .flatten();
+                if let Some(passive_attention_reason) = passive_attention.filter(|_| {
+                    event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64
+                }) {
                     let input_idle_seconds = event.input_stats.idle_seconds;
                     mark_metadata(
                         &mut event,
@@ -128,6 +131,11 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         serde_json::Value::from(input_idle_seconds),
                     );
                     mark_metadata(&mut event, "passiveAttention", serde_json::Value::Bool(true));
+                    mark_metadata(
+                        &mut event,
+                        "passiveAttentionReason",
+                        serde_json::Value::String(passive_attention_reason.into()),
+                    );
                     event.input_stats.idle_seconds = 0;
                 }
                 sanitize_event(&mut event);
@@ -525,15 +533,21 @@ fn cap(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn is_passive_attention(event: &RawActivityEvent) -> bool {
+fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
     let app = event.app.as_deref().unwrap_or_default().to_lowercase();
+    let title = event.window_title.as_deref().unwrap_or_default().trim().to_lowercase();
+    let url = event.url.as_deref().unwrap_or_default().to_lowercase();
     let browser_video_playing = event
         .metadata
         .get("browser")
         .and_then(|browser| browser.get("videoPlaying"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let video_player = [
+    if browser_video_playing {
+        return Some("browser-video-playing");
+    }
+
+    if [
         "vlc",
         "mpv",
         "potplayer",
@@ -544,8 +558,112 @@ fn is_passive_attention(event: &RawActivityEvent) -> bool {
         "smplayer",
     ]
     .iter()
+    .any(|needle| app.contains(needle))
+    {
+        return Some("media-player-foreground");
+    }
+
+    let meeting_only_app = [
+        "wemeetapp",
+        "voovmeeting",
+        "tencentmeeting",
+    ]
+    .iter()
     .any(|needle| app.contains(needle));
-    browser_video_playing || video_player
+    if meeting_only_app {
+        return Some("meeting-app-foreground");
+    }
+
+    let dedicated_meeting_app = [
+        "zoom.exe",
+        "ciscocollabhost",
+        "webexhost",
+        "webexmta",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    let generic_home_title = [
+        "腾讯会议",
+        "voov meeting",
+        "zoom",
+        "zoom workplace",
+        "webex",
+        "cisco webex",
+    ]
+    .iter()
+    .any(|candidate| title == *candidate);
+    if dedicated_meeting_app && !title.is_empty() && !generic_home_title {
+        return Some("meeting-app-foreground");
+    }
+
+    let meeting_marker = [
+        "会议",
+        "meeting",
+        "webinar",
+        "通话",
+        "正在共享",
+        "共享屏幕",
+        "screen sharing",
+        "飞书妙记",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle));
+    let collaboration_app = [
+        "teams",
+        "ms-teams",
+        "feishu",
+        "lark",
+        "dingtalk",
+        "wecom",
+        "wxwork",
+        "skype",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    if collaboration_app && meeting_marker {
+        return Some("collaboration-meeting-foreground");
+    }
+
+    let meeting_url = [
+        "meet.google.com",
+        "meeting.tencent.com",
+        "voovmeeting.com",
+        "zoom.us/wc/",
+        "teams.microsoft.com/l/meetup",
+        "vc.feishu.cn",
+    ]
+    .iter()
+    .any(|needle| url.contains(needle));
+    let browser_app = [
+        "chrome",
+        "msedge",
+        "firefox",
+        "brave",
+        "opera",
+        "vivaldi",
+        "arc.exe",
+        "tabbit",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    let meeting_browser_title = browser_app
+        && [
+            "google meet",
+            "腾讯会议",
+            "voov meeting",
+            "zoom meeting",
+            "microsoft teams meeting",
+            "飞书会议",
+            "钉钉会议",
+            "cisco webex",
+        ]
+        .iter()
+        .any(|needle| title.contains(needle));
+    if meeting_url || meeting_browser_title {
+        return Some("browser-meeting-foreground");
+    }
+
+    None
 }
 
 #[cfg(windows)]
@@ -1314,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn only_confirmed_video_playback_counts_as_passive_attention() {
+    fn confirmed_playback_and_foreground_meetings_count_as_passive_attention() {
         let event = RawActivityEvent {
             id: String::new(),
             source: "test".into(),
@@ -1327,25 +1445,55 @@ mod tests {
             input_stats: InputStats { idle_seconds: 900, ..Default::default() },
             metadata: json!({ "browser": { "videoPlaying": true } }),
         };
-        assert!(is_passive_attention(&event));
-        assert!(!is_passive_attention(&RawActivityEvent {
+        assert_eq!(passive_attention_reason(&event), Some("browser-video-playing"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("WeMeetApp.exe".into()),
+            window_title: Some("申书豪预定的会议".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), Some("meeting-app-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("Zoom.exe".into()),
             window_title: Some("Weekly sync".into()),
             metadata: json!({}),
             ..event.clone()
-        }));
-        assert!(is_passive_attention(&RawActivityEvent {
+        }), Some("meeting-app-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("ms-teams.exe".into()),
+            window_title: Some("产品周会 - Microsoft Teams meeting".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), Some("collaboration-meeting-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("ms-teams.exe".into()),
+            window_title: Some("与张三的聊天".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), None);
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            window_title: Some("项目周会 - Google Meet".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), Some("browser-meeting-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("wps.exe".into()),
+            window_title: Some("腾讯会议纪要.docx".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), None);
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("vlc.exe".into()),
             window_title: Some("recording.mp4".into()),
             metadata: json!({}),
             ..event.clone()
-        }));
-        assert!(!is_passive_attention(&RawActivityEvent {
+        }), Some("media-player-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("notepad.exe".into()),
             window_title: Some("notes.txt".into()),
             metadata: json!({}),
             ..event
-        }));
+        }), None);
     }
 
     #[test]
