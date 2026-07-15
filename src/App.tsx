@@ -1259,7 +1259,7 @@ function AiReviewView({
                           ? `${formatTimelineClock(session.startedAt, true)}–${formatTimelineClock(session.endedAt, true)}`
                           : id.slice(0, 8)}</time>
                         <span>
-                          <strong>{session?.summary || '时间段已被整理或删除'}</strong>
+                          <strong>{session ? displaySessionSummary(session) : '时间段已被整理或删除'}</strong>
                           <small>{session
                             ? [session.category, session.projectName, session.taskTitle].filter(Boolean).join(' · ')
                             : '仍保留原始复核记录'}</small>
@@ -1428,7 +1428,7 @@ function GlobalSearch({
       ...data.sessions.map((session) => ({
         id: `session:${session.id}`,
         kind: 'session' as const,
-        title: session.summary,
+        title: displaySessionSummary(session),
         meta: `${formatDateTime(session.startedAt)} · ${session.projectName || session.category}`,
         session,
         search: normalizeSearchText([
@@ -1752,7 +1752,7 @@ function TodayView({
               <button key={session.id} onClick={() => onEdit([session])} type="button">
                 <CircleAlert size={16} />
                 <span>
-                  <strong>{session.summary}</strong>
+                  <strong>{displaySessionSummary(session)}</strong>
                   <small>{Math.round(session.confidence * 100)}% 置信度</small>
                 </span>
                 <Pencil size={15} />
@@ -2083,6 +2083,7 @@ function DayActivityTimeline({
                     startedAt: group.startedAt,
                     endedAt: group.endedAt,
                     summary: primary.taskTitle || primary.summary,
+                    evidence: group.sessions[group.sessions.length - 1].evidence,
                   };
               const bounds = sessionBoundsOnDate(displaySession, selectedDate);
               const applications = [...new Set(group.sessions.map(sessionApplication))];
@@ -2098,8 +2099,8 @@ function DayActivityTimeline({
                 <button
                   aria-disabled={group.untracked}
                   aria-label={group.untracked
-                    ? `${timeRange}，${displaySession.summary}，${app}，悬浮查看原因`
-                    : `${timeRange}，${displaySession.summary}，${app}，${actionLabel}`}
+                    ? `${timeRange}，${displaySessionSummary(displaySession)}，${app}，悬浮查看原因`
+                    : `${timeRange}，${displaySessionSummary(displaySession)}，${app}，${actionLabel}`}
                   className={`day-track-block${group.untracked ? ' untracked' : ''}${!group.untracked && group.sessions.some(needsReview) ? ' needs-review' : ''}`}
                   key={group.id}
                   onBlur={() => setTooltip(null)}
@@ -2139,7 +2140,7 @@ function DayActivityTimeline({
           role="tooltip"
           style={{ left: tooltip.x, top: tooltip.y }}
         >
-          <strong>{tooltip.session.summary}</strong>
+          <strong>{displaySessionSummary(tooltip.session)}</strong>
           <span>{tooltip.timeRange}</span>
           <div>
             <i style={{ '--tooltip-color': categoryColor(tooltip.session.category) } as CSSProperties} />
@@ -2331,7 +2332,7 @@ function ProjectTodayDetailModal({
           <div className="category-session-list">
             {visibleSessions.map((session) => (
               <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
-                <label className="category-session-check" aria-label={`选择 ${session.summary}`}>
+                <label className="category-session-check" aria-label={`选择 ${displaySessionSummary(session)}`}>
                   <input className="themed-checkbox" checked={selected.has(session.id)} onChange={() => toggle(session.id)} type="checkbox" />
                 </label>
                 <button className="category-session-open" onClick={() => editSession(session)} type="button">
@@ -2340,7 +2341,7 @@ function ProjectTodayDetailModal({
                     <small>{formatTimelineClock(session.endedAt, true)}</small>
                   </span>
                   <span className="category-session-main">
-                    <strong>{session.summary}</strong>
+                    <strong>{displaySessionSummary(session)}</strong>
                     <small>{session.taskTitle || '未归属任务'}</small>
                   </span>
                   <span className="category-session-app">{sessionApplication(session)}</span>
@@ -2462,7 +2463,7 @@ function CategoryDetailModal({
           )}
           {sorted.map((session) => (
             <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
-              <label className="category-session-check" aria-label={`选择 ${session.summary}`}>
+              <label className="category-session-check" aria-label={`选择 ${displaySessionSummary(session)}`}>
                 <input
                   className="themed-checkbox"
                   checked={selected.has(session.id)}
@@ -2476,7 +2477,7 @@ function CategoryDetailModal({
                   <small>{formatSessionMoment(session.endedAt, showDate)}</small>
               </span>
               <span className="category-session-main">
-                <strong>{session.summary}</strong>
+                <strong>{displaySessionSummary(session)}</strong>
                 <small>{session.projectName || '未归类'}{session.taskTitle ? ` · ${session.taskTitle}` : ''}</small>
               </span>
               <span className="category-session-app">{sessionApplication(session)}</span>
@@ -2876,7 +2877,7 @@ function SessionRow({
           >
             {session.category}
           </span>
-          <strong>{session.summary}</strong>
+          <strong>{displaySessionSummary(session)}</strong>
           {session.userConfirmed && <CheckCircle2 size={16} className="confirmed" />}
         </div>
         <div className="session-path">
@@ -5236,6 +5237,29 @@ function sessionApplication(session: WorkSession) {
     session.evidence.find((item) => item.kind === 'app' || item.label === '应用')?.value ||
     '未知应用'
   );
+}
+
+function sessionCurrentPage(session: WorkSession) {
+  const page = [...session.evidence]
+    .reverse()
+    .find((item) => item.kind === 'page' || item.label === '当前页面')
+    ?.value.trim();
+  if (!page) return '';
+  return page.replace(
+    /\s+(?:-|—|–|·|\|)\s+(?:Google Chrome|Microsoft Edge|Mozilla Firefox|Brave|Tabbit(?: Browser)?|WPS Office)\s*$/i,
+    '',
+  ).trim();
+}
+
+function displaySessionSummary(session: WorkSession) {
+  const summary = session.summary.trim();
+  const page = sessionCurrentPage(session);
+  if (!page) return summary;
+
+  const normalizedSummary = normalizeSearchText(summary);
+  const normalizedPage = normalizeSearchText(page);
+  if (normalizedSummary.includes(normalizedPage)) return summary;
+  return `${summary} · ${page}`;
 }
 
 function minutesBetween(start: string, end: string) {
