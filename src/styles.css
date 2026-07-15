@@ -936,6 +936,11 @@ kbd {
 .project-search input { min-height: 38px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .project-search input:focus { border: 0; box-shadow: none; }
 .project-search button { width: 29px; height: 29px; padding: 0; border-color: transparent; background: transparent; }
+.project-date-range { margin: -2px 0 10px; display: flex; align-items: center; gap: 7px; }
+.project-date-range label { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.project-date-range input { width: 138px; min-height: 35px; padding: 5px 9px; color: var(--text-secondary); border-color: var(--border); border-radius: 10px; background: var(--input); font-size: 11px; }
+.project-date-range input:focus { border-color: color-mix(in srgb, var(--blue-strong) 34%, var(--border-strong)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-strong) 8%, transparent); }
+.project-date-separator { color: var(--subtle); font-size: 11px; }
 .project-range-toolbar { margin: -2px 0 13px; display: flex; align-items: center; justify-content: space-between; gap: 9px; }
 .project-range-tabs { min-width: 0; padding: 3px; display: flex; gap: 2px; overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-subtle); scrollbar-width: none; }
 .project-range-tabs::-webkit-scrollbar { display: none; }
@@ -1717,6 +1722,9 @@ kbd {
   .evidence-row { display: none; }
   .timeline-aside { grid-template-columns: 1fr; }
   .project-grid, .project-edit-fields, .field-grid, .data-actions, .project-create-row, .modal .field-grid, .correction-options { grid-template-columns: 1fr; }
+  .project-date-range { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+  .project-date-range label { display: grid; gap: 4px; }
+  .project-date-range input { width: 100%; }
   .project-range-toolbar { align-items: stretch; flex-direction: column; }
   .project-range-tabs { width: 100%; }
   .project-range-tabs button { flex: 1 0 auto; }

@@ -15,7 +15,14 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     let Some(session) = db.list_sessions(1)?.into_iter().next() else {
         return Ok(None);
     };
-    if session.user_confirmed || session.confidence >= 0.84 {
+    // A confident category-only rule is not a complete attribution. Continue
+    // resolving the project and task from the richer page/workspace context so
+    // specific work does not get stranded under “未归类”.
+    if session.user_confirmed
+        || (session.confidence >= 0.84
+            && session.project_id.is_some()
+            && session.task_id.is_some())
+    {
         return Ok(Some(session));
     }
 
@@ -47,7 +54,8 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
             user_confirmed: Some(false),
         },
     )?;
-    Ok(Some(updated))
+    db.mark_session_awaiting_confirmation(&updated.id)?;
+    db.get_session(&updated.id)
 }
 
 fn recent_task_assignment(db: &AppDb, session: &WorkSession) -> Result<Option<Assignment>> {

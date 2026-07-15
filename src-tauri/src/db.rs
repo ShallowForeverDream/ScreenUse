@@ -4645,6 +4645,46 @@ mod tests {
     }
 
     #[test]
+    fn category_only_rule_still_resolves_a_concrete_project_and_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-category-only-rule-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("icpc-trainer", "开发")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "开发与测试")
+            .expect("create task");
+        db.conn.lock().execute(
+            "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+             VALUES ('category-only-icpc','旧分类规则',90,?1,NULL,NULL,'杂务',1,1,?2)",
+            params![serde_json::json!({
+                "app": "chrome",
+                "keywords": ["icpc-trainer — 中文竞赛训练工作台 - Google Chrome"]
+            }).to_string(), now()],
+        ).expect("insert category-only rule");
+
+        let session = classification::ingest_event(
+            &db,
+            &context_event(
+                "category-only-icpc-event",
+                "chrome.exe",
+                "icpc-trainer — 中文竞赛训练工作台 - Google Chrome",
+                Utc::now() + Duration::minutes(5),
+            ),
+        ).expect("classify category-only match").expect("work session");
+
+        assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(session.category, "开发");
+        assert_eq!(session.source, "context-complete");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn repeated_confirmed_context_repairs_matching_unconfirmed_sessions() {
         let data_dir = std::env::temp_dir().join(format!("screenuse-context-memory-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");

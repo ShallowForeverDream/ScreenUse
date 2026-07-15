@@ -112,9 +112,10 @@ const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD = 0.8;
 const TASK_CHART_COLORS = ['#8b5cf6', '#60a5fa', '#ec4899', '#22c55e', '#f59e0b', '#06b6d4', '#f97316', '#a3e635'];
 const MAX_TIMELINE_GAP_SNAP_SECONDS = 10;
 
-type ProjectRange = 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all';
+type ProjectRange = 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all' | 'custom';
+type ProjectRangePreset = Exclude<ProjectRange, 'custom'>;
 
-const PROJECT_RANGE_OPTIONS: { id: ProjectRange; label: string }[] = [
+const PROJECT_RANGE_OPTIONS: { id: ProjectRangePreset; label: string }[] = [
   { id: 'today', label: '今天' },
   { id: 'week', label: '本周' },
   { id: 'month', label: '本月' },
@@ -2872,6 +2873,8 @@ function ProjectsView({
   const [busyTaskId, setBusyTaskId] = useState('');
   const [query, setQuery] = useState('');
   const [projectRange, setProjectRange] = useState<ProjectRange>('week');
+  const [customRangeStart, setCustomRangeStart] = useState(selectedDate);
+  const [customRangeEnd, setCustomRangeEnd] = useState(selectedDate);
   const [hideZeroProjects, setHideZeroProjects] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
@@ -2880,10 +2883,39 @@ function ProjectsView({
   >(null);
   const confirmation = useConfirmation();
   const rangeBounds = useMemo(
-    () => projectRangeBounds(projectRange, selectedDate),
-    [projectRange, selectedDate],
+    () => projectRange === 'custom'
+      ? customProjectRangeBounds(customRangeStart, customRangeEnd)
+      : projectRangeBounds(projectRange, selectedDate),
+    [customRangeEnd, customRangeStart, projectRange, selectedDate],
   );
-  const rangeLabel = PROJECT_RANGE_OPTIONS.find((item) => item.id === projectRange)?.label || '本周';
+  const allSessionDateRange = useMemo(() => {
+    if (!sessions.length) return { start: selectedDate, end: selectedDate };
+    let startedAt = Number.POSITIVE_INFINITY;
+    let endedAt = Number.NEGATIVE_INFINITY;
+    for (const session of sessions) {
+      const start = new Date(session.startedAt).getTime();
+      const end = new Date(session.endedAt).getTime();
+      if (Number.isFinite(start)) startedAt = Math.min(startedAt, start);
+      if (Number.isFinite(end)) endedAt = Math.max(endedAt, end);
+    }
+    return {
+      start: Number.isFinite(startedAt) ? localDateKey(new Date(startedAt)) : selectedDate,
+      end: Number.isFinite(endedAt) ? localDateKey(new Date(endedAt)) : selectedDate,
+    };
+  }, [selectedDate, sessions]);
+  const displayedRange = useMemo(() => {
+    if (projectRange === 'custom') {
+      return { start: customRangeStart, end: customRangeEnd };
+    }
+    if (!rangeBounds) return allSessionDateRange;
+    return {
+      start: localDateKey(new Date(rangeBounds.startedAt)),
+      end: localDateKey(new Date(rangeBounds.endedAt - 1)),
+    };
+  }, [allSessionDateRange, customRangeEnd, customRangeStart, projectRange, rangeBounds]);
+  const rangePresetLabel = PROJECT_RANGE_OPTIONS.find((item) => item.id === projectRange)?.label
+    || '自定义';
+  const rangeLabel = `${rangePresetLabel} · ${formatProjectDateRange(displayedRange.start, displayedRange.end)}`;
   const rangeSessions = useMemo(
     () => sessions.filter((session) => sessionMinutesInRange(session, rangeBounds) > 0),
     [rangeBounds, sessions],
@@ -2945,10 +2977,12 @@ function ProjectsView({
   const selectedProject = visibleProjects.find((project) => project.id === selectedProjectId)
     || visibleProjects[0];
   const selectedTasks = selectedProject
-    ? [...(tasksByProject.get(selectedProject.id) || [])].sort((left, right) => (
-        (taskStats.get(right.id)?.minutes || 0) - (taskStats.get(left.id)?.minutes || 0)
-        || left.title.localeCompare(right.title, 'zh-CN')
-      ))
+    ? [...(tasksByProject.get(selectedProject.id) || [])]
+      .filter((task) => !hideZeroProjects || (taskStats.get(task.id)?.minutes || 0) > 0)
+      .sort((left, right) => (
+          (taskStats.get(right.id)?.minutes || 0) - (taskStats.get(left.id)?.minutes || 0)
+          || left.title.localeCompare(right.title, 'zh-CN')
+        ))
     : [];
   const unassignedSessions = selectedProject
     ? rangeSessions.filter((session) => session.projectId === selectedProject.id && !session.taskId)
@@ -3066,6 +3100,37 @@ function ProjectsView({
           <Search size={16} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或任务" />
           {query && <button onClick={() => setQuery('')} type="button" aria-label="清空项目搜索"><X size={14} /></button>}
+        </div>
+        <div className="project-date-range" aria-label="项目统计起止时间">
+          <label>
+            <span>开始</span>
+            <input
+              type="date"
+              value={displayedRange.start}
+              onChange={(event) => {
+                const nextStart = event.target.value;
+                if (!nextStart) return;
+                setCustomRangeStart(nextStart);
+                setCustomRangeEnd(displayedRange.end < nextStart ? nextStart : displayedRange.end);
+                setProjectRange('custom');
+              }}
+            />
+          </label>
+          <span className="project-date-separator">至</span>
+          <label>
+            <span>结束</span>
+            <input
+              type="date"
+              value={displayedRange.end}
+              onChange={(event) => {
+                const nextEnd = event.target.value;
+                if (!nextEnd) return;
+                setCustomRangeEnd(nextEnd);
+                setCustomRangeStart(displayedRange.start > nextEnd ? nextEnd : displayedRange.start);
+                setProjectRange('custom');
+              }}
+            />
+          </label>
         </div>
         <div className="project-range-toolbar">
           <div className="project-range-tabs" role="radiogroup" aria-label="项目统计时间范围">
@@ -3185,7 +3250,7 @@ function ProjectsView({
       <section className="panel project-detail-panel">
         <PanelTitle
           title={selectedProject?.name || '项目任务'}
-          subtitle={selectedProject ? `${rangeLabel} · ${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
+          subtitle={selectedProject ? `${rangePresetLabel} · ${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
           action={selectedProject ? (
             <div className="project-detail-actions">
               <button
@@ -3260,7 +3325,12 @@ function ProjectsView({
                   </button>
                 </div>
               ))}
-              {!selectedTasks.length && !unassignedSessions.length && <EmptyState title="还没有任务" detail="直接在上方输入任务名并按 Enter。" />}
+              {!selectedTasks.length && !unassignedSessions.length && (
+                <EmptyState
+                  title={hideZeroProjects ? '当前区间没有投入' : '还没有任务'}
+                  detail={hideZeroProjects ? '关闭“隐藏 0 秒”可查看全部任务。' : '直接在上方输入任务名并按 Enter。'}
+                />
+              )}
             </div>
           )}
           {!selectedProject && <EmptyState title="还没有项目" detail="创建项目后即可添加任务。" />}
@@ -5020,7 +5090,7 @@ function sessionMinutesOnDate(session: WorkSession, dateKey: string) {
 
 type ProjectRangeBounds = { startedAt: number; endedAt: number } | null;
 
-function projectRangeBounds(range: ProjectRange, anchorDateKey: string): ProjectRangeBounds {
+function projectRangeBounds(range: ProjectRangePreset, anchorDateKey: string): ProjectRangeBounds {
   if (range === 'all') return null;
   const anchor = dateFromKey(anchorDateKey);
   let startedAt: Date;
@@ -5046,6 +5116,22 @@ function projectRangeBounds(range: ProjectRange, anchorDateKey: string): Project
   }
 
   return { startedAt: startedAt.getTime(), endedAt: endedAt.getTime() };
+}
+
+function customProjectRangeBounds(startDateKey: string, endDateKey: string): ProjectRangeBounds {
+  const start = dateFromKey(startDateKey);
+  const end = dateFromKey(endDateKey);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return null;
+  const startedAt = new Date(start.getFullYear(), start.getMonth(), start.getDate()).getTime();
+  const endedAt = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1).getTime();
+  return startedAt < endedAt ? { startedAt, endedAt } : null;
+}
+
+function formatProjectDateRange(startDateKey: string, endDateKey: string) {
+  const format = (value: string) => value.replace(/-/g, '/');
+  return startDateKey === endDateKey
+    ? format(startDateKey)
+    : `${format(startDateKey)} – ${format(endDateKey)}`;
 }
 
 function sessionMinutesInRange(session: WorkSession, bounds: ProjectRangeBounds) {
