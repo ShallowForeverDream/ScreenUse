@@ -15,18 +15,24 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     let Some(session) = db.list_sessions(1)?.into_iter().next() else {
         return Ok(None);
     };
-    // A confident category-only rule is not a complete attribution. Continue
-    // resolving the project and task from the richer page/workspace context so
-    // specific work does not get stranded under “未归类”.
-    if session.user_confirmed
-        || (session.confidence >= 0.84
-            && session.project_id.is_some()
-            && session.task_id.is_some())
-    {
+    // A generic app rule is not stronger than an exact page/project match. Resolve
+    // the current page before accepting a complete automatic attribution.
+    if session.user_confirmed {
         return Ok(Some(session));
     }
 
-    let assignment = match resolve_project_task(db, event, &session.category)? {
+    let contextual_assignment = resolve_project_task(db, event, &session.category)?;
+    let is_complete = session.confidence >= 0.84
+        && session.project_id.is_some()
+        && session.task_id.is_some();
+    let page_context_is_stronger = contextual_assignment.as_ref().is_some_and(|assignment| {
+        assignment.confidence >= 0.92 && assignment.confidence > session.confidence + 0.01
+    });
+    if is_complete && !page_context_is_stronger {
+        return Ok(Some(session));
+    }
+
+    let assignment = match contextual_assignment {
         Some(assignment) => Some(assignment),
         None => recent_task_assignment(db, &session)?,
     };
@@ -148,11 +154,12 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
     let projects = db.list_projects()?;
     let tasks = db.list_tasks()?;
     let hay = event_hay(event);
+    let page = event_current_page_title(event).map(normalize);
     let workspace = event.workspace.as_deref().and_then(path_label);
 
     let mut best: Option<(&Project, i32)> = None;
     for project in &projects {
-        let score = project_score(project, category, &hay, workspace.as_deref());
+        let score = project_score(project, category, &hay, page.as_deref(), workspace.as_deref());
         if score > best.map(|(_, current)| current).unwrap_or(i32::MIN) {
             best = Some((project, score));
         }
@@ -170,10 +177,12 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
     let task_id = if auto_created {
         Some(db.upsert_task_by_title(&project_id, default_task_title(category, event), "workspace-auto")?)
     } else {
-        best_task(&tasks, &project_id, &hay).map(|task| task.id.clone())
+        best_task(&tasks, &project_id, &hay, page.as_deref()).map(|task| task.id.clone())
     };
 
-    let confidence = if project_score >= 90 {
+    let confidence = if project_score >= 220 {
+        0.94
+    } else if project_score >= 90 {
         0.86
     } else if project_score >= 60 {
         0.78
@@ -188,9 +197,25 @@ fn resolve_project_task(db: &AppDb, event: &RawActivityEvent, category: &str) ->
     Ok(Some(Assignment { project_id, task_id, category: assigned_category, confidence }))
 }
 
-fn project_score(project: &Project, category: &str, hay: &str, workspace: Option<&str>) -> i32 {
+fn project_score(
+    project: &Project,
+    category: &str,
+    hay: &str,
+    page: Option<&str>,
+    workspace: Option<&str>,
+) -> i32 {
     let name = normalize(&project.name);
-    let mut score = if !name.is_empty() && hay.contains(&name) { 100 } else { 0 };
+    let mut score = if !name.is_empty() && page == Some(name.as_str()) {
+        240
+    } else if !name.is_empty()
+        && page.is_some_and(|page| page.contains(&name) || name.contains(page))
+    {
+        180
+    } else if !name.is_empty() && hay.contains(&name) {
+        100
+    } else {
+        0
+    };
     if project.category == category {
         score += 8;
     }
@@ -201,24 +226,52 @@ fn project_score(project: &Project, category: &str, hay: &str, workspace: Option
         }
     }
     for token in tokens(&project.name) {
-        if !is_generic_token(&token) && hay.contains(&token) {
+        if is_generic_token(&token) {
+            continue;
+        }
+        if page.is_some_and(|page| page.contains(&token)) {
+            score += if token.chars().count() >= 6 { 42 } else { 28 };
+        } else if hay.contains(&token) {
             score += if token.chars().count() >= 6 { 28 } else { 16 };
         }
     }
     score
 }
 
-fn best_task<'a>(tasks: &'a [Task], project_id: &str, hay: &str) -> Option<&'a Task> {
+fn best_task<'a>(
+    tasks: &'a [Task],
+    project_id: &str,
+    hay: &str,
+    page: Option<&str>,
+) -> Option<&'a Task> {
     let project_tasks: Vec<_> = tasks.iter().filter(|task| task.project_id == project_id).collect();
     let scored = project_tasks
         .iter()
         .map(|task| {
-            let score = tokens(&task.title)
+            let title = normalize(&task.title);
+            let exact_page_score = if !title.is_empty() && page == Some(title.as_str()) {
+                180
+            } else if !title.is_empty()
+                && page.is_some_and(|page| page.contains(&title) || title.contains(page))
+            {
+                120
+            } else {
+                0
+            };
+            let token_score = tokens(&task.title)
                 .into_iter()
-                .filter(|token| !is_generic_token(token) && hay.contains(token))
-                .map(|token| if token.chars().count() >= 6 { 20 } else { 10 })
+                .filter(|token| !is_generic_token(token))
+                .map(|token| {
+                    if page.is_some_and(|page| page.contains(&token)) {
+                        if token.chars().count() >= 6 { 32 } else { 20 }
+                    } else if hay.contains(&token) {
+                        if token.chars().count() >= 6 { 20 } else { 10 }
+                    } else {
+                        0
+                    }
+                })
                 .sum::<i32>();
-            (*task, score)
+            (*task, exact_page_score + token_score)
         })
         .max_by_key(|(_, score)| *score);
     match scored {
@@ -310,6 +363,22 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
     if category == "离开" {
         return "离开/空闲".into();
     }
+    if let Some(title) = chat_conversation_title(event).map(clean_title).filter(|title| !title.is_empty()) {
+        let project = event
+            .metadata
+            .get("chatgptProject")
+            .and_then(serde_json::Value::as_str)
+            .or(event.workspace.as_deref())
+            .map(str::trim)
+            .filter(|project| !project.is_empty());
+        return cap(
+            &project
+                .filter(|project| !normalize(&title).contains(&normalize(project)))
+                .map(|project| format!("{title} · {project}"))
+                .unwrap_or(title),
+            96,
+        );
+    }
     let workspace = event.workspace.as_deref().and_then(path_label);
     let file = event.file_path.as_deref().and_then(path_label);
     if let Some(workspace) = workspace {
@@ -359,6 +428,36 @@ fn event_hay(event: &RawActivityEvent) -> String {
         event.file_path.as_deref().unwrap_or_default(),
         event.workspace.as_deref().unwrap_or_default(),
     ))
+}
+
+fn event_current_page_title(event: &RawActivityEvent) -> Option<&str> {
+    event
+        .metadata
+        .get("activePageTitle")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .metadata
+                .get("chatgptConversationTitle")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
+    event
+        .metadata
+        .get("chatgptConversationTitle")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            (event.metadata.get("activePageSource").and_then(serde_json::Value::as_str)
+                == Some("chatgpt-conversation"))
+                .then(|| event_current_page_title(event))
+                .flatten()
+        })
 }
 
 fn normalize(value: &str) -> String {
@@ -472,5 +571,56 @@ mod tests {
     #[test]
     fn qq_image_viewer_keeps_the_main_qq_summary() {
         assert_eq!(summary_for_event(&event("QQ.exe", "图片查看器"), "杂务"), "QQ");
+    }
+
+    #[test]
+    fn chatgpt_summary_starts_with_the_current_conversation() {
+        let mut event = event("ChatGPT.exe", "codex_work_bridge");
+        event.workspace = Some("HDU".into());
+        event.file_path = Some(r"C:\Program Files\OpenAI\ChatGPT.exe".into());
+        event.metadata = json!({
+            "activePageTitle": "codex_work_bridge",
+            "activePageSource": "chatgpt-conversation",
+            "chatgptConversationTitle": "codex_work_bridge",
+            "chatgptProject": "HDU"
+        });
+
+        assert_eq!(
+            summary_for_event(&event, "开发"),
+            "codex_work_bridge · HDU"
+        );
+    }
+
+    #[test]
+    fn exact_current_page_project_outranks_workspace_project() {
+        let project = |name: &str| Project {
+            id: name.into(),
+            name: name.into(),
+            category: "开发".into(),
+            source: "manual".into(),
+            color: "#000000".into(),
+            description: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let hay = normalize("ChatGPT.exe codex_work_bridge HDU");
+        let page = normalize("codex_work_bridge");
+
+        let page_score = project_score(
+            &project("codex_work_bridge"),
+            "开发",
+            &hay,
+            Some(&page),
+            Some("HDU"),
+        );
+        let workspace_score = project_score(
+            &project("HDU"),
+            "开发",
+            &hay,
+            Some(&page),
+            Some("HDU"),
+        );
+        assert!(page_score > workspace_score);
+        assert!(page_score >= 220);
     }
 }

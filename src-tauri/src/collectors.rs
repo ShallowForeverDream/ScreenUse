@@ -1027,7 +1027,8 @@ fn chatgpt_selected_context(
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
-        UIA_NamePropertyId, UIA_TextControlTypeId,
+        UIA_ButtonControlTypeId, UIA_ControlTypePropertyId, UIA_NamePropertyId,
+        UIA_TextControlTypeId,
     };
 
     unsafe {
@@ -1036,6 +1037,7 @@ fn chatgpt_selected_context(
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
             let root = automation.ElementFromHandle(window)?;
+            let walker = automation.ControlViewWalker()?;
             let mut action: Option<IUIAutomationElement> = None;
             for label in [
                 "任务操作",
@@ -1055,24 +1057,33 @@ fn chatgpt_selected_context(
                     break;
                 }
             }
-            let Some(action) = action else { return Ok(None); };
-            let walker = automation.ControlViewWalker()?;
-            let parent = walker.GetParentElement(&action)?;
+            let mut header = action.and_then(|element| walker.GetParentElement(&element).ok());
+            if header.is_none() {
+                let value = VARIANT::from(UIA_ButtonControlTypeId.0);
+                let condition =
+                    automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &value)?;
+                let buttons = root.FindAll(TreeScope_Descendants, &condition)?;
+                for index in 0..buttons.Length()? {
+                    let button = buttons.GetElement(index)?;
+                    let name = button
+                        .CurrentName()
+                        .map(|value| value.to_string())
+                        .unwrap_or_default();
+                    if chatgpt_project_name(&name).is_some() {
+                        header = walker.GetParentElement(&button).ok();
+                        break;
+                    }
+                }
+            }
+            let Some(parent) = header else { return Ok(None); };
             let mut child = walker.GetFirstChildElement(&parent).ok();
             let mut title = None;
             let mut project = None;
             for _ in 0..10 {
                 let Some(element) = child else { break; };
                 let name = element.CurrentName().map(|value| value.to_string()).unwrap_or_default();
-                if let Some(value) = name
-                    .strip_prefix("项目：")
-                    .or_else(|| name.strip_prefix("Project: "))
-                    .or_else(|| name.strip_prefix("Project："))
-                {
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        project = Some(value.to_string());
-                    }
+                if let Some(value) = chatgpt_project_name(&name) {
+                    project = Some(value);
                 } else if element.CurrentControlType().ok() == Some(UIA_TextControlTypeId)
                     && valid_chatgpt_title(&name)
                 {
@@ -1091,6 +1102,17 @@ fn chatgpt_selected_context(
         }
         result.map_err(Into::into)
     }
+}
+
+#[cfg(windows)]
+fn chatgpt_project_name(value: &str) -> Option<String> {
+    value
+        .strip_prefix("项目：")
+        .or_else(|| value.strip_prefix("Project: "))
+        .or_else(|| value.strip_prefix("Project："))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(windows)]
@@ -1570,6 +1592,14 @@ mod tests {
         assert!(is_document_app("wps.exe"));
         assert!(is_document_app("EXCEL.EXE"));
         assert!(!is_document_app("steam.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_codex_project_from_the_active_header() {
+        assert_eq!(chatgpt_project_name("项目：HDU"), Some("HDU".into()));
+        assert_eq!(chatgpt_project_name("Project: ScreenUse"), Some("ScreenUse".into()));
+        assert_eq!(chatgpt_project_name("HDU"), None);
     }
 
     #[cfg(windows)]
