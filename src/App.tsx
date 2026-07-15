@@ -4235,7 +4235,7 @@ function EditSessionModal({
   const [projectBusy, setProjectBusy] = useState(false);
   const [taskBusy, setTaskBusy] = useState(false);
   const [categoryBusy, setCategoryBusy] = useState(false);
-  const [remember, setRemember] = useState(false);
+  const [remember, setRemember] = useState(true);
   const [keyword, setKeyword] = useState('');
   const [pin, setPin] = useState(false);
   const [renamingCategory, setRenamingCategory] = useState<CategoryOption | null>(null);
@@ -4679,7 +4679,7 @@ function EditSessionModal({
         <div className="correction-options">
           <label>
             <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
-            <span><strong>记住规则</strong><small>以后按上下文识别，不按应用名硬归类</small></span>
+            <span><strong>自动学习</strong><small>默认记住本次修正，之后不必重复修改</small></span>
           </label>
           <label className={!projectId ? 'disabled' : ''}>
             <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />

@@ -35,6 +35,14 @@ struct LastSessionAttribution {
     source: String,
 }
 
+struct ConfirmedContextVote {
+    count: u32,
+    project_id: String,
+    task_id: String,
+    category: String,
+    first_confirmed_at: String,
+}
+
 pub(crate) struct RecentTaskContext {
     pub project_id: Option<String>,
     pub task_id: Option<String>,
@@ -95,6 +103,7 @@ impl AppDb {
         db.migrate()?;
         db.seed_if_empty()?;
         db.normalize_correction_rules()?;
+        db.repair_sessions_from_confirmed_context()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
         db.configure_idle_target(&settings)?;
@@ -2062,7 +2071,7 @@ impl AppDb {
         .to_lowercase();
         let conn = self.conn.lock();
         let rules = {
-            let mut stmt = conn.prepare("SELECT matcher_json,project_id,task_id,category,name FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC")?;
+            let mut stmt = conn.prepare("SELECT matcher_json,project_id,task_id,category,name,priority,updated_at FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC,updated_at DESC")?;
             let mapped = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -2070,11 +2079,14 @@ impl AppDb {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, i32>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?;
             collect_rows(mapped)?
         };
-        for (matcher_json, project_id, task_id, category, _name) in rules {
+        let mut best_match = None;
+        for (matcher_json, project_id, task_id, category, _name, priority, updated_at) in rules {
             let matcher: serde_json::Value =
                 serde_json::from_str(&matcher_json).unwrap_or_default();
             let mut keywords = matcher
@@ -2110,8 +2122,14 @@ impl AppDb {
                 || !app.is_empty()
                 || !domain.is_empty()
                 || !workspace.is_empty();
+            let matched_keyword_length = keywords
+                .iter()
+                .filter(|keyword| hay.contains(keyword.as_str()))
+                .map(|keyword| keyword.chars().count())
+                .max()
+                .unwrap_or(0);
             let hit = has_constraint
-                && (keywords.is_empty() || keywords.iter().any(|keyword| hay.contains(keyword)))
+                && (keywords.is_empty() || matched_keyword_length > 0)
                 && (app.is_empty()
                     || event
                         .app
@@ -2134,14 +2152,23 @@ impl AppDb {
                         .to_lowercase()
                         .contains(&workspace));
             if hit {
-                return Ok(AttributionDecision {
-                    project_id,
-                    task_id,
-                    category: category.clone(),
-                    summary: classification::summary_for_event(event, &category),
-                    confidence: 0.84,
-                });
+                let constraint_count = usize::from(!app.is_empty())
+                    + usize::from(!domain.is_empty())
+                    + usize::from(!workspace.is_empty());
+                let rank = (priority, matched_keyword_length, constraint_count, updated_at);
+                if best_match.as_ref().map_or(true, |(best_rank, _)| rank > *best_rank) {
+                    best_match = Some((rank, AttributionDecision {
+                        project_id,
+                        task_id,
+                        category: category.clone(),
+                        summary: classification::summary_for_event(event, &category),
+                        confidence: 0.84,
+                    }));
+                }
             }
+        }
+        if let Some((_, decision)) = best_match {
+            return Ok(decision);
         }
         let category = if hay.contains("code")
             || hay.contains("rust")
@@ -2840,6 +2867,89 @@ impl AppDb {
         Ok(changed)
     }
 
+    fn repair_sessions_from_confirmed_context(&self) -> Result<u32> {
+        let confirmed = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT project_id,task_id,category,evidence_json,started_at
+                 FROM work_sessions
+                 WHERE user_confirmed=1 AND project_id IS NOT NULL AND task_id IS NOT NULL
+                 ORDER BY updated_at DESC LIMIT 5000",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+            )))?;
+            collect_rows(rows)?
+        };
+        let mut votes: HashMap<String, HashMap<String, ConfirmedContextVote>> = HashMap::new();
+        for (project_id, task_id, category, evidence_json, started_at) in confirmed {
+            let evidence = parse_json::<Vec<EvidenceItem>>(&evidence_json);
+            let Some(signature) = evidence_context_signature(&evidence) else { continue; };
+            let key = context_assignment_key(Some(&project_id), Some(&task_id), &category);
+            let vote = votes.entry(signature).or_default().entry(key)
+                .or_insert_with(|| ConfirmedContextVote {
+                    count: 0, project_id, task_id, category,
+                    first_confirmed_at: started_at.clone(),
+                });
+            vote.count += 1;
+            if started_at.as_str() < vote.first_confirmed_at.as_str() {
+                vote.first_confirmed_at = started_at;
+            }
+        }
+        let mut memory = HashMap::new();
+        for (signature, assignments) in votes {
+            if assignments.len() != 1 { continue; }
+            let Some(winner) = assignments.into_values().next() else { continue; };
+            if winner.count >= 3 {
+                memory.insert(signature, (
+                    winner.project_id, winner.task_id, winner.category, winner.first_confirmed_at,
+                ));
+            }
+        }
+        if memory.is_empty() { return Ok(0); }
+        let candidates = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id,project_id,task_id,category,evidence_json,started_at,summary,source FROM work_sessions
+                 WHERE user_confirmed=0 ORDER BY started_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![MAX_RECENT_MAINTENANCE_SESSIONS], |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?, row.get::<_, String>(7)?,
+            )))?;
+            collect_rows(rows)?
+        };
+        let mut repairs = Vec::new();
+        for (id, project_id, task_id, category, evidence_json, started_at, summary, source) in candidates {
+            if summary == "离开/空闲" || source == "collector-idle" { continue; }
+            let evidence = parse_json::<Vec<EvidenceItem>>(&evidence_json);
+            let Some(signature) = evidence_context_signature(&evidence) else { continue; };
+            let Some((remembered_project, remembered_task, remembered_category, first_confirmed_at)) = memory.get(&signature) else { continue; };
+            if started_at.as_str() < first_confirmed_at.as_str() { continue; }
+            if project_id.as_deref() == Some(remembered_project.as_str())
+                && task_id.as_deref() == Some(remembered_task.as_str())
+                && category == *remembered_category { continue; }
+            repairs.push((id, remembered_project.clone(), remembered_task.clone(), remembered_category.clone()));
+        }
+        if repairs.is_empty() { return Ok(0); }
+        let timestamp = now();
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        for (id, project_id, task_id, category) in &repairs {
+            transaction.execute(
+                "UPDATE work_sessions SET project_id=?1,task_id=?2,category=?3,
+                 confidence=MAX(confidence,0.92),source='context-memory',updated_at=?4
+                 WHERE id=?5 AND user_confirmed=0",
+                params![project_id, task_id, category, timestamp, id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(repairs.len() as u32)
+    }
+
     pub fn learn_rule_from_session(
         &self,
         id: &str,
@@ -2872,18 +2982,13 @@ impl AppDb {
             session.project_name.as_deref(),
             session.task_title.as_deref(),
         ] {
-            if let Some(candidate) = candidate
-                .map(str::trim)
-                .filter(|value| value.chars().count() >= 2)
-            {
+            if let Some(candidate) = candidate.and_then(context_memory_keyword) {
                 keywords.push(candidate.chars().take(48).collect());
             }
         }
-        let normalized_window = window.to_lowercase();
-        if !window.is_empty()
-            && normalized_window != app
-            && !is_generic_context_label(&normalized_window)
-        {
+        if let Some(window) = context_memory_keyword(&window).filter(|value| {
+            value.to_lowercase() != app && !is_generic_context_label(&value.to_lowercase())
+        }) {
             keywords.push(window.chars().take(64).collect());
         }
         keywords.sort();
@@ -2910,6 +3015,46 @@ impl AppDb {
             enabled: true,
         };
         let conn = self.conn.lock();
+        if rule.task_id.is_some() {
+            let existing = {
+                let mut stmt = conn.prepare(
+                    "SELECT id,matcher_json FROM attribution_rules
+                     WHERE created_from_correction=1 AND enabled=1
+                       AND COALESCE(project_id,'')=COALESCE(?1,'')
+                       AND COALESCE(task_id,'')=COALESCE(?2,'') AND category=?3
+                     ORDER BY updated_at DESC",
+                )?;
+                let rows = stmt.query_map(params![rule.project_id, rule.task_id, rule.category], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                collect_rows(rows)?
+            };
+            if let Some((keeper_id, _)) = existing.first() {
+                let mut merged = rule.matcher.get("keywords")
+                    .and_then(serde_json::Value::as_array).into_iter().flatten()
+                    .filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>();
+                for (_, matcher_json) in &existing {
+                    let matcher = serde_json::from_str::<serde_json::Value>(matcher_json).unwrap_or_default();
+                    merged.extend(matcher.get("keywords")
+                        .and_then(serde_json::Value::as_array).into_iter().flatten()
+                        .filter_map(serde_json::Value::as_str).map(ToOwned::to_owned));
+                }
+                let mut seen = HashSet::new();
+                merged.retain(|value| !is_context_memory_noise(value)
+                    && seen.insert(value.trim().to_lowercase()));
+                merged.truncate(48);
+                rule.matcher = serde_json::json!({ "keywords": merged });
+                conn.execute(
+                    "UPDATE attribution_rules SET name=?1,priority=?2,matcher_json=?3,updated_at=?4 WHERE id=?5",
+                    params![rule.name, rule.priority, rule.matcher.to_string(), now(), keeper_id],
+                )?;
+                for (duplicate_id, _) in existing.iter().skip(1) {
+                    conn.execute("DELETE FROM attribution_rules WHERE id=?1", params![duplicate_id])?;
+                }
+                rule.id = keeper_id.clone();
+                return Ok(rule);
+            }
+        }
         let matcher_json = rule.matcher.to_string();
         if let Some(existing_id) = conn
             .query_row(
@@ -2919,6 +3064,7 @@ impl AppDb {
                    AND COALESCE(project_id,'')=COALESCE(?2,'')
                    AND COALESCE(task_id,'')=COALESCE(?3,'')
                    AND category=?4
+                 ORDER BY updated_at DESC
                  LIMIT 1",
                 params![matcher_json, rule.project_id, rule.task_id, rule.category],
                 |row| row.get::<_, String>(0),
@@ -3502,11 +3648,21 @@ fn context_memory_keyword(value: &str) -> Option<String> {
     }
 }
 
+fn evidence_context_signature(evidence: &[EvidenceItem]) -> Option<String> {
+    let app = evidence.iter().find(|item| item.kind == "app")
+        .map(|item| item.value.trim().to_lowercase()).filter(|value| !value.is_empty())?;
+    let context = evidence.iter().find(|item| matches!(item.kind.as_str(), "page" | "window"))
+        .and_then(|item| context_memory_keyword(&item.value))?.to_lowercase();
+    Some(format!("{app}\u{1f}{context}"))
+}
+
 fn is_context_memory_noise(value: &str) -> bool {
     let normalized = value.trim().to_lowercase();
     matches!(
         normalized.as_str(),
-        "program manager" | "task switching" | "desktop"
+        "program manager" | "task switching" | "desktop" | "会议" | "腾讯会议"
+            | "加入会议" | "学习" | "开发" | "科研" | "工作" | "任务" | "沟通"
+            | "杂务" | "日常杂务" | "无效" | "离开" | "校内实习"
     ) || [
         "系统托盘溢出窗口",
         "任务视图",
@@ -4457,6 +4613,76 @@ mod tests {
     }
 
     #[test]
+    fn specific_correction_rule_beats_an_older_generic_rule() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-specific-rule-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let internship = db.create_project("校内实习", "学习").expect("create internship");
+        let meeting = db.create_task(&internship.id, "会议").expect("create meeting task");
+        let research = db.create_project("科研", "学习").expect("create research");
+        let iot = db.create_task(&research.id, "IOT").expect("create IOT task");
+        let base = Utc::now() + Duration::minutes(5);
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES ('generic-meeting','旧会议规则',90,?1,?2,?3,'学习',1,1,?4)",
+                params![serde_json::json!({"keywords": ["会议", "腾讯会议"]}).to_string(), internship.id, meeting.id, fmt(base - Duration::days(1))],
+            ).expect("insert generic rule");
+            conn.execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES ('specific-iot','IOT 会议规则',90,?1,?2,?3,'学习',1,1,?4)",
+                params![serde_json::json!({"keywords": ["申书豪预定的会议", "IOT"]}).to_string(), research.id, iot.id, fmt(base)],
+            ).expect("insert specific rule");
+        }
+        let session = classification::ingest_event(
+            &db,
+            &context_event("specific-meeting", "WeMeetApp.exe", "申书豪预定的会议", base + Duration::seconds(1)),
+        ).expect("classify meeting").expect("meeting session");
+        assert_eq!(session.project_id.as_deref(), Some(research.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(iot.id.as_str()));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn repeated_confirmed_context_repairs_matching_unconfirmed_sessions() {
+        let data_dir = std::env::temp_dir().join(format!("screenuse-context-memory-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let wrong_project = db.create_project("校内实习", "学习").expect("create wrong project");
+        let wrong_task = db.create_task(&wrong_project.id, "会议").expect("create wrong task");
+        let right_project = db.create_project("科研", "学习").expect("create right project");
+        let right_task = db.create_task(&right_project.id, "IOT").expect("create right task");
+        db.conn.lock().execute(
+            "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+             VALUES ('meeting-default','会议默认规则',90,?1,?2,?3,'学习',1,1,?4)",
+            params![serde_json::json!({"keywords": ["申书豪预定的会议"]}).to_string(), wrong_project.id, wrong_task.id, now()],
+        ).expect("insert wrong rule");
+        let base = Utc::now() + Duration::minutes(10);
+        let mut sessions = Vec::new();
+        for index in 0..4 {
+            sessions.push(classification::ingest_event(
+                &db,
+                &context_event(&format!("remembered-meeting-{index}"), "WeMeetApp.exe", "申书豪预定的会议", base + Duration::seconds(index * 10)),
+            ).expect("classify meeting").expect("meeting session"));
+        }
+        for session in sessions.iter().take(3) {
+            db.update_session(&session.id, SessionPatch {
+                summary: None, project_id: Some(right_project.id.clone()), task_id: Some(right_task.id.clone()),
+                clear_project: Some(false), clear_task: Some(false), category: Some("学习".into()),
+                confidence: Some(0.98), user_confirmed: Some(true),
+            }).expect("confirm right assignment");
+        }
+        assert_eq!(db.repair_sessions_from_confirmed_context().expect("repair contexts"), 1);
+        let repaired = db.get_session(&sessions[3].id).expect("load session").expect("session exists");
+        assert_eq!(repaired.project_id.as_deref(), Some(right_project.id.as_str()));
+        assert_eq!(repaired.task_id.as_deref(), Some(right_task.id.as_str()));
+        assert_eq!(repaired.source, "context-memory");
+        assert!(!repaired.user_confirmed);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn confirmed_task_context_follows_across_apps_but_yields_to_strong_context() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-cross-app-context-test-{}",
@@ -4786,8 +5012,8 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count rules before normalization");
-        assert_eq!(before, 2);
-        assert!(db.normalize_correction_rules().expect("normalize rules") >= 2);
+        assert_eq!(before, 1);
+        db.normalize_correction_rules().expect("normalize rules");
         let conn = db.conn.lock();
         let (after, matcher_json) = conn
             .query_row(
