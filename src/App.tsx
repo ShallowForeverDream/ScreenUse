@@ -88,6 +88,7 @@ const categoryColors: Record<string, string> = {
   杂务: '#fbbf24',
   无效: '#94a3b8',
   离开: '#94a3b8',
+  未记录: '#cbd5e1',
 };
 
 const THEME_STORAGE_KEY = 'screenuse-theme';
@@ -106,6 +107,8 @@ const TIMELINE_SCALES = [
 ] as const;
 const DEFAULT_TIMELINE_ZOOM = 2;
 const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD = 0.8;
+const TASK_CHART_COLORS = ['#8b5cf6', '#60a5fa', '#ec4899', '#22c55e', '#f59e0b', '#06b6d4', '#f97316', '#a3e635'];
+const MAX_TIMELINE_GAP_SNAP_SECONDS = 10;
 
 function normalizeTheme(value: unknown): ThemeMode {
   return value === 'system' || value === 'light' || value === 'dark' ? value : 'light';
@@ -837,15 +840,12 @@ export default function App() {
           <TodayView
             sessions={daySessions}
             projects={data.projects}
+            tasks={data.tasks}
             stats={stats}
             selectedDate={selectedDate}
             idleCategory={data.settings.idleCategory}
             onEdit={setEditing}
             onOpenTimeline={() => setActiveTab('timeline')}
-            onOpenProject={(projectId) => {
-              setProjectFocusId(projectId);
-              setActiveTab('projects');
-            }}
             planItems={data.planItems}
           />
         )}
@@ -969,13 +969,14 @@ function DateNavigator({
   );
 }
 
-type AiJobFilter = 'all' | 'pending' | 'running' | 'completed' | 'failed';
+type AiJobFilter = 'all' | 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
 
 const aiJobFilters: { id: AiJobFilter; label: string }[] = [
   { id: 'all', label: '全部' },
   { id: 'pending', label: '排队' },
   { id: 'running', label: '运行中' },
   { id: 'completed', label: '已复核' },
+  { id: 'skipped', label: '未调用' },
   { id: 'failed', label: '失败' },
 ];
 
@@ -1060,6 +1061,7 @@ function AiReviewView({
     pending: jobs.filter((job) => job.status === 'pending').length,
     running: jobs.filter((job) => job.status === 'running').length,
     completed: jobs.filter((job) => job.status === 'completed').length,
+    skipped: jobs.filter((job) => job.status === 'skipped').length,
     failed: jobs.filter((job) => job.status === 'failed' || job.status === 'downgraded').length,
   }), [jobs]);
   const sessionsById = useMemo(
@@ -1073,6 +1075,7 @@ function AiReviewView({
         <div><span>排队</span><strong>{counts.pending}</strong></div>
         <div><span>运行中</span><strong>{counts.running}</strong></div>
         <div><span>已复核</span><strong>{counts.completed}</strong></div>
+        <div><span>未调用</span><strong>{counts.skipped}</strong></div>
         <div><span>失败</span><strong>{counts.failed}</strong></div>
         <div className="ai-review-actions">
           <button
@@ -1186,7 +1189,15 @@ function AiReviewView({
 
               <AiTraceBlock title="系统提示词" value={detail.systemPrompt} empty={aiTraceEmptyText(detail)} />
               <AiTraceBlock title="发送给 AI 的提示词" value={detail.userPrompt} empty={aiTraceEmptyText(detail)} />
-              <AiTraceBlock title="AI 原始回复" value={detail.response} empty={detail.status === 'running' ? '正在等待回复' : '尚无回复'} />
+              <AiTraceBlock
+                title="AI 原始回复"
+                value={detail.response}
+                empty={detail.status === 'skipped'
+                  ? '未调用 AI，因此没有原始回复'
+                  : detail.status === 'running'
+                    ? '正在等待回复'
+                    : '尚无回复'}
+              />
             </>
           ) : (
             <div className="ai-detail-empty">
@@ -1241,6 +1252,7 @@ function aiJobStatusLabel(status: string) {
     pending: '排队中',
     running: '运行中',
     completed: '已复核',
+    skipped: '未调用 AI',
     failed: '失败',
     downgraded: '已降级',
   };
@@ -1254,6 +1266,7 @@ function aiProviderLabel(provider: string) {
 }
 
 function aiTraceEmptyText(job: AnalysisJob) {
+  if (job.status === 'skipped') return '该批时间段已人工修正，因此没有向 AI 发送提示词';
   return job.completedAt ? '详细内容已按轻量保留策略自动清理' : '任务运行后记录';
 }
 
@@ -1419,30 +1432,40 @@ function GlobalSearch({
 function TodayView({
   sessions,
   projects,
+  tasks,
   stats,
   selectedDate,
   idleCategory,
   onEdit,
   onOpenTimeline,
-  onOpenProject,
   planItems,
 }: {
   sessions: WorkSession[];
   projects: Project[];
+  tasks: Task[];
   stats: DayStats;
   selectedDate: string;
   idleCategory: string;
   onEdit: (sessions: WorkSession[]) => void;
   onOpenTimeline: () => void;
-  onOpenProject: (projectId: string) => void;
   planItems: DashboardData['planItems'];
 }) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(DEFAULT_TIMELINE_ZOOM);
   const [showDetailedSegments, setShowDetailedSegments] = useState(false);
   const review = sessions.filter(needsReview).slice(0, 4);
-  const projectRows = projectBreakdown(sessions, selectedDate).slice(0, 6);
-  const projectTotal = projectRows.reduce((sum, row) => sum + row.minutes, 0);
+  const allProjectRows = projectBreakdown(sessions, selectedDate).filter((row) => (
+    Boolean(row.id)
+    && row.category !== '无效'
+    && row.category !== '离开'
+    && row.category !== idleCategory
+  ));
+  const projectRows = allProjectRows.slice(0, 6);
+  const projectTotal = allProjectRows.reduce((sum, row) => sum + row.minutes, 0);
+  const selectedProject = selectedProjectId
+    ? projects.find((project) => project.id === selectedProjectId) || null
+    : null;
   const visiblePlanItems = planItems
     .filter((item) => item.status !== 'done')
     .slice(0, 5);
@@ -1518,7 +1541,7 @@ function TodayView({
       <section className="panel">
         <PanelTitle
           title="项目投入"
-          subtitle={projectTotal ? `${projectRows.length} 个项目 · ${formatDuration(projectTotal)}` : undefined}
+          subtitle={projectTotal ? `${allProjectRows.length} 个项目 · ${formatDuration(projectTotal)}` : undefined}
         />
         <div className="project-investment-list">
           {projectRows.length ? (
@@ -1529,9 +1552,8 @@ function TodayView({
               return (
                 <button
                   className="project-investment"
-                  disabled={!row.id}
-                  key={row.id || row.name}
-                  onClick={() => row.id && onOpenProject(row.id)}
+                  key={row.id}
+                  onClick={() => setSelectedProjectId(row.id)}
                   type="button"
                 >
                   <div className="project-investment-head">
@@ -1662,6 +1684,16 @@ function TodayView({
           onEdit={onEdit}
         />
       )}
+      {selectedProject && (
+        <ProjectTodayDetailModal
+          project={selectedProject}
+          sessions={sessions.filter((session) => session.projectId === selectedProject.id)}
+          tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
+          selectedDate={selectedDate}
+          onClose={() => setSelectedProjectId(null)}
+          onEdit={onEdit}
+        />
+      )}
     </div>
   );
 }
@@ -1703,12 +1735,14 @@ function DayActivityTimeline({
     [sessions],
   );
   const groups = useMemo(() => {
-    const result: Array<{
+    type TimelineGroup = {
       id: string;
       sessions: WorkSession[];
       startedAt: string;
       endedAt: string;
-    }> = [];
+      untracked: boolean;
+    };
+    const result: TimelineGroup[] = [];
     for (const session of sorted) {
       const previous = result[result.length - 1];
       const previousSession = previous?.sessions[previous.sessions.length - 1];
@@ -1726,10 +1760,50 @@ function DayActivityTimeline({
           sessions: [session],
           startedAt: session.startedAt,
           endedAt: session.endedAt,
+          untracked: false,
         });
       }
     }
-    return result;
+    const continuous: TimelineGroup[] = [];
+    for (const group of result) {
+      const previous = continuous[continuous.length - 1];
+      if (previous) {
+        const gapSeconds = Math.max(
+          0,
+          (new Date(group.startedAt).getTime() - new Date(previous.endedAt).getTime()) / 1000,
+        );
+        if (gapSeconds > 0 && gapSeconds <= MAX_TIMELINE_GAP_SNAP_SECONDS) {
+          previous.endedAt = group.startedAt;
+        } else if (gapSeconds > MAX_TIMELINE_GAP_SNAP_SECONDS) {
+          const gapId = `timeline-gap:${previous.endedAt}:${group.startedAt}`;
+          continuous.push({
+            id: gapId,
+            sessions: [{
+              id: gapId,
+              startedAt: previous.endedAt,
+              endedAt: group.startedAt,
+              projectName: '采集状态',
+              category: '未记录',
+              summary: '未记录/采集暂停',
+              confidence: 1,
+              evidence: [{
+                kind: 'system',
+                label: '原因',
+                value: 'ScreenUse 未运行、正在重启或自动记录曾暂停',
+                weight: 1,
+              }],
+              userConfirmed: true,
+              source: 'timeline-gap',
+            }],
+            startedAt: previous.endedAt,
+            endedAt: group.startedAt,
+            untracked: true,
+          });
+        }
+      }
+      continuous.push(group);
+    }
+    return continuous;
   }, [detailed, sorted]);
   const initialCenterSeconds = useMemo(() => {
     if (selectedDate === localDateKey(new Date())) {
@@ -1871,18 +1945,23 @@ function DayActivityTimeline({
                   };
               const bounds = sessionBoundsOnDate(displaySession, selectedDate);
               const applications = [...new Set(group.sessions.map(sessionApplication))];
-              const app = `${applications.slice(0, 3).join('、')}${applications.length > 3 ? ` 等 ${applications.length} 个应用` : ''}${group.sessions.length > 1 ? ` · 合并 ${group.sessions.length} 段` : ''}`;
+              const app = group.untracked
+                ? 'ScreenUse 未运行、正在重启或自动记录曾暂停'
+                : `${applications.slice(0, 3).join('、')}${applications.length > 3 ? ` 等 ${applications.length} 个应用` : ''}${group.sessions.length > 1 ? ` · 合并 ${group.sessions.length} 段` : ''}`;
               const blockWidth = Math.max(1, Math.max(5, bounds.durationSeconds) * pixelsPerSecond);
               const timeRange = `${formatTimelineClock(group.startedAt, true)}–${formatTimelineClock(group.endedAt, true)}`;
               return (
                 <button
-                  aria-label={`${timeRange}，${displaySession.summary}，${app}，点击修正`}
-                  className={`day-track-block${group.sessions.some(needsReview) ? ' needs-review' : ''}`}
+                  aria-disabled={group.untracked}
+                  aria-label={group.untracked
+                    ? `${timeRange}，${displaySession.summary}，${app}，悬浮查看原因`
+                    : `${timeRange}，${displaySession.summary}，${app}，点击修正`}
+                  className={`day-track-block${group.untracked ? ' untracked' : ''}${!group.untracked && group.sessions.some(needsReview) ? ' needs-review' : ''}`}
                   key={group.id}
                   onBlur={() => setTooltip(null)}
                   onClick={() => {
                     setTooltip(null);
-                    onEdit(group.sessions);
+                    if (!group.untracked) onEdit(group.sessions);
                   }}
                   onFocus={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
                   onMouseEnter={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
@@ -1892,7 +1971,7 @@ function DayActivityTimeline({
                     {
                       left: bounds.startSeconds * pixelsPerSecond,
                       width: blockWidth,
-                      '--block-color': categoryColor(primary.category),
+                      '--block-color': categoryColor(group.untracked ? '未记录' : primary.category),
                     } as CSSProperties
                   }
                 />
@@ -1919,6 +1998,192 @@ function DayActivityTimeline({
         document.body,
       )}
     </>
+  );
+}
+
+function ProjectTodayDetailModal({
+  project,
+  sessions,
+  tasks,
+  selectedDate,
+  onClose,
+  onEdit,
+}: {
+  project: Project;
+  sessions: WorkSession[];
+  tasks: Task[];
+  selectedDate: string;
+  onClose: () => void;
+  onEdit: (sessions: WorkSession[]) => void;
+}) {
+  const [selectedTaskKey, setSelectedTaskKey] = useState('all');
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
+  const sortedProjectSessions = useMemo(
+    () => [...sessions].sort(
+      (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+    ),
+    [sessions],
+  );
+  const taskRows = useMemo(() => {
+    const groups = new Map<string, { key: string; title: string; minutes: number; sessions: WorkSession[] }>();
+    for (const session of sortedProjectSessions) {
+      const key = session.taskId || 'unassigned';
+      const title = session.taskId
+        ? session.taskTitle || taskById.get(session.taskId)?.title || '已删除任务'
+        : '未归属任务';
+      const current = groups.get(key) || { key, title, minutes: 0, sessions: [] };
+      current.minutes += sessionMinutesOnDate(session, selectedDate);
+      current.sessions.push(session);
+      groups.set(key, current);
+    }
+    return [...groups.values()]
+      .filter((row) => row.minutes > 0)
+      .sort((left, right) => right.minutes - left.minutes)
+      .map((row, index) => ({ ...row, color: TASK_CHART_COLORS[index % TASK_CHART_COLORS.length] }));
+  }, [selectedDate, sortedProjectSessions, taskById]);
+  const total = taskRows.reduce((sum, row) => sum + row.minutes, 0);
+  const activeTask = taskRows.find((row) => row.key === selectedTaskKey) || null;
+  const visibleSessions = activeTask?.sessions || sortedProjectSessions;
+  const selectedSessions = visibleSessions.filter((session) => selected.has(session.id));
+  const allSelected = visibleSessions.length > 0 && selectedSessions.length === visibleSessions.length;
+  let pieCursor = 0;
+  const pieBackground = taskRows.length
+    ? `conic-gradient(${taskRows.map((row) => {
+      const start = pieCursor;
+      pieCursor += (row.minutes / Math.max(total, 0.001)) * 100;
+      return `${row.color} ${start.toFixed(2)}% ${pieCursor.toFixed(2)}%`;
+    }).join(', ')})`
+    : 'var(--track)';
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selectedSessions.length > 0 && !allSelected;
+    }
+  }, [allSelected, selectedSessions.length]);
+
+  const chooseTask = (key: string) => {
+    setSelectedTaskKey(key);
+    setSelected(new Set());
+  };
+  const toggle = (id: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const editSession = (session: WorkSession) => {
+    onEdit(selected.has(session.id) && selectedSessions.length > 1 ? selectedSessions : [session]);
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="modal project-today-detail" role="dialog" aria-modal="true" aria-label={`${project.name}今日投入`}>
+        <div className="modal-head project-today-head">
+          <div className="category-detail-title">
+            <span style={{ background: project.color || categoryColor(project.category) }} />
+            <div>
+              <h2>{project.name}</h2>
+              <p>{project.category} · {formatDuration(total)} · {sortedProjectSessions.length} 个时间段</p>
+            </div>
+          </div>
+          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
+            <X size={17} />
+          </button>
+        </div>
+
+        <section className="project-task-summary" aria-label="今日任务分布">
+          <div className="project-task-chart">
+            <div className="task-pie" style={{ background: pieBackground }} role="img" aria-label={`${project.name}今日任务饼图`}>
+              <span><strong>{formatCompactDuration(total)}</strong><small>今日投入</small></span>
+            </div>
+          </div>
+          <div className="project-task-breakdown">
+            <div className="project-task-breakdown-head">
+              <div><strong>任务分布</strong><span>{taskRows.length} 项</span></div>
+              <button className={selectedTaskKey === 'all' ? 'active' : ''} onClick={() => chooseTask('all')} type="button">
+                全部时间段
+              </button>
+            </div>
+            <div className="project-task-rows">
+              {taskRows.map((row) => {
+                const percent = Math.round((row.minutes / Math.max(total, 0.001)) * 100);
+                return (
+                  <button
+                    aria-pressed={selectedTaskKey === row.key}
+                    className={selectedTaskKey === row.key ? 'active' : ''}
+                    key={row.key}
+                    onClick={() => chooseTask(row.key)}
+                    type="button"
+                  >
+                    <i style={{ background: row.color }} />
+                    <span><strong>{row.title}</strong><small>{row.sessions.length} 个时间段</small></span>
+                    <b>{formatDuration(row.minutes)}</b>
+                    <em>{percent}%</em>
+                    <ChevronRight size={15} />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section className="project-session-detail">
+          <div className="project-session-detail-head">
+            <div>
+              <h3>{activeTask?.title || '全部时间段'}</h3>
+              <p>{formatDuration(activeTask?.minutes || total)} · {visibleSessions.length} 段</p>
+            </div>
+            <div className="category-detail-actions">
+              <label className="selection-toggle" title={`选择当前 ${visibleSessions.length} 个时间段`}>
+                <input
+                  className="themed-checkbox"
+                  ref={selectAllRef}
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={(event) => setSelected(
+                    event.target.checked ? new Set(visibleSessions.map((session) => session.id)) : new Set(),
+                  )}
+                />
+                全选
+              </label>
+              <button className="selection-clear" disabled={!selectedSessions.length} onClick={() => setSelected(new Set())} type="button">
+                全不选
+              </button>
+              <button disabled={!selectedSessions.length} onClick={() => onEdit(selectedSessions)} type="button">
+                <Pencil size={15} />批量修正 {selectedSessions.length || ''}
+              </button>
+            </div>
+          </div>
+          <div className="category-session-list">
+            {visibleSessions.map((session) => (
+              <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
+                <label className="category-session-check" aria-label={`选择 ${session.summary}`}>
+                  <input className="themed-checkbox" checked={selected.has(session.id)} onChange={() => toggle(session.id)} type="checkbox" />
+                </label>
+                <button className="category-session-open" onClick={() => editSession(session)} type="button">
+                  <span className="category-session-time">
+                    <strong>{formatTimelineClock(session.startedAt, true)}</strong>
+                    <small>{formatTimelineClock(session.endedAt, true)}</small>
+                  </span>
+                  <span className="category-session-main">
+                    <strong>{session.summary}</strong>
+                    <small>{session.taskTitle || '未归属任务'}</small>
+                  </span>
+                  <span className="category-session-app">{sessionApplication(session)}</span>
+                  <Pencil size={15} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      </section>
+    </div>
   );
 }
 
@@ -4463,6 +4728,12 @@ function formatDuration(minutes: number) {
     return minutePart ? `${hours} 小时 ${minutePart} 分钟` : `${hours} 小时`;
   }
   return secondPart ? `${minutePart} 分 ${secondPart} 秒` : `${minutePart} 分钟`;
+}
+
+function formatCompactDuration(minutes: number) {
+  const totalMinutes = Math.max(0, Math.round(minutes));
+  if (totalMinutes < 60) return `${totalMinutes}分`;
+  return `${Math.floor(totalMinutes / 60)}时${totalMinutes % 60}分`;
 }
 
 function formatClock(value: string) {

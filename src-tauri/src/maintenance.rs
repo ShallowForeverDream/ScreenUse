@@ -65,7 +65,7 @@ pub fn optimize_storage(db: &AppDb, aggressive: bool) -> Result<u32> {
     )? as u32;
     removed += conn.execute(
         "DELETE FROM analysis_jobs
-         WHERE status IN ('completed','failed','downgraded')
+         WHERE status IN ('completed','failed','downgraded','skipped')
            AND julianday(ended_at) < julianday('now', ?1)",
         params![retention],
     )? as u32;
@@ -73,7 +73,7 @@ pub fn optimize_storage(db: &AppDb, aggressive: bool) -> Result<u32> {
     removed += conn.execute(
         "UPDATE analysis_jobs
          SET system_prompt=NULL,user_prompt=NULL,response=NULL
-         WHERE status IN ('completed','failed','downgraded')
+         WHERE status IN ('completed','failed','downgraded','skipped')
            AND julianday(COALESCE(completed_at,ended_at)) < julianday('now', ?1)
            AND (system_prompt IS NOT NULL OR user_prompt IS NOT NULL OR response IS NOT NULL)",
         params![ai_trace_retention],
@@ -82,7 +82,7 @@ pub fn optimize_storage(db: &AppDb, aggressive: bool) -> Result<u32> {
         "DELETE FROM analysis_jobs
          WHERE id IN (
            SELECT id FROM analysis_jobs
-           WHERE status IN ('completed','failed','downgraded')
+           WHERE status IN ('completed','failed','downgraded','skipped')
            ORDER BY COALESCE(completed_at,queued_at,ended_at) DESC
            LIMIT -1 OFFSET ?1
          )",

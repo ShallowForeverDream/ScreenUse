@@ -110,7 +110,12 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
     let mut targets = load_job_targets(&db, &job)?;
     targets.retain(|session| !session.user_confirmed && session.source != "ai-review");
     if targets.is_empty() {
-        db.mark_analysis_job_status(&job.id, "completed", None, None)?;
+        db.mark_analysis_job_status(
+            &job.id,
+            "skipped",
+            None,
+            Some("目标时间段已被人工修正，未调用 AI".into()),
+        )?;
         return Ok(true);
     }
     targets.sort_by(|left, right| left.started_at.cmp(&right.started_at));

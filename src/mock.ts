@@ -49,13 +49,14 @@ export const fallbackDashboard: DashboardData = {
   ],
   tasks: [
     { id: 't1', projectId: 'p1', title: '日常开发', status: 'active', source: 'workspace-auto', plannedDueAt: null, createdAt: iso(700), updatedAt: iso(5) },
+    { id: 't4', projectId: 'p1', title: '界面优化', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(500), updatedAt: iso(3) },
     { id: 't2', projectId: 'p2', title: '资料阅读', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(1200), updatedAt: iso(45) },
     { id: 't3', projectId: 'p3', title: '日常事务', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(1800), updatedAt: iso(90) },
   ],
   sessions: [
     { id: 's1', startedAt: iso(188), endedAt: iso(126), projectId: 'p1', projectName: 'ScreenUse', taskId: 't1', taskTitle: '日常开发', category: '开发', summary: 'ScreenUse · collectors.rs', confidence: 0.91, userConfirmed: false, source: 'collector-rule', evidence: [{ kind: 'workspace', label: '工作区', value: 'ScreenUse', weight: 0.8 }, { kind: 'app', label: '应用', value: 'Code.exe', weight: 0.5 }] },
     { id: 's2', startedAt: iso(118), endedAt: iso(76), projectId: 'p2', projectName: '课程与论文', taskId: 't2', taskTitle: '资料阅读', category: '学习', summary: 'arxiv.org · 时间追踪研究', confidence: 0.79, userConfirmed: false, source: 'collector-rule', evidence: [{ kind: 'url', label: '网页', value: 'https://arxiv.org', weight: 0.7 }, { kind: 'app', label: '应用', value: 'msedge.exe', weight: 0.5 }] },
-    { id: 's3', startedAt: iso(68), endedAt: iso(39), projectId: 'p1', projectName: 'ScreenUse', taskId: 't1', taskTitle: '日常开发', category: '开发', summary: 'ScreenUse · App.tsx', confidence: 0.89, userConfirmed: true, source: 'collector-rule', evidence: [{ kind: 'file', label: '文件', value: 'src/App.tsx', weight: 0.8 }, { kind: 'app', label: '应用', value: 'Code.exe', weight: 0.5 }] },
+    { id: 's3', startedAt: iso(68), endedAt: iso(39), projectId: 'p1', projectName: 'ScreenUse', taskId: 't4', taskTitle: '界面优化', category: '开发', summary: 'ScreenUse · App.tsx', confidence: 0.89, userConfirmed: true, source: 'collector-rule', evidence: [{ kind: 'file', label: '文件', value: 'src/App.tsx', weight: 0.8 }, { kind: 'app', label: '应用', value: 'Code.exe', weight: 0.5 }] },
     { id: 's4', startedAt: iso(32), endedAt: iso(8), projectId: null, projectName: null, taskId: null, taskTitle: null, category: '杂务', summary: 'Chrome · 新标签页', confidence: 0.56, userConfirmed: false, source: 'context-complete', evidence: [{ kind: 'window', label: '窗口', value: '新标签页', weight: 0.5 }, { kind: 'app', label: '应用', value: 'chrome.exe', weight: 0.5 }] },
   ],
   planItems: [],

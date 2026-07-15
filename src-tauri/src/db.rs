@@ -315,6 +315,19 @@ impl AppDb {
              WHERE status='running'",
             [],
         )?;
+        conn.execute(
+            "UPDATE analysis_jobs
+             SET status='skipped',
+                 error=COALESCE(error, '目标时间段已被人工修正，未调用 AI'),
+                 completed_at=COALESCE(completed_at,queued_at)
+             WHERE status='completed'
+               AND result_count=0
+               AND processing_started_at IS NULL
+               AND system_prompt IS NULL
+               AND user_prompt IS NULL
+               AND response IS NULL",
+            [],
+        )?;
         for category in DEFAULT_CATEGORIES {
             conn.execute(
                 "INSERT OR IGNORE INTO activity_categories(name,color,is_builtin,created_at,updated_at)
@@ -2318,7 +2331,7 @@ impl AppDb {
         error: Option<String>,
     ) -> Result<()> {
         let conn = self.conn.lock();
-        let terminal = matches!(status, "completed" | "failed" | "downgraded");
+        let terminal = matches!(status, "completed" | "failed" | "downgraded" | "skipped");
         let completed_at = terminal.then(now);
         conn.execute(
             "UPDATE analysis_jobs
@@ -5347,6 +5360,52 @@ mod tests {
         assert!(detail.duration_ms.is_some());
 
         drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn completed_job_without_an_ai_request_is_migrated_to_skipped() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-job-skipped-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let queued_at = now();
+        db.create_analysis_job(&AnalysisJob {
+            id: "legacy-empty-completed-job".into(),
+            chunk_ids: vec!["already-corrected".into()],
+            metadata_range: TimeRange {
+                started_at: queued_at.clone(),
+                ended_at: queued_at.clone(),
+            },
+            mode: "metadata-context-review".into(),
+            provider: String::new(),
+            model: String::new(),
+            retry_count: 0,
+            status: "completed".into(),
+            error: None,
+            system_prompt: None,
+            user_prompt: None,
+            response: None,
+            queued_at,
+            processing_started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            result_count: 0,
+        })
+        .expect("insert legacy empty job");
+        drop(db);
+
+        let reopened = AppDb::open_in(data_dir.clone()).expect("reopen test database");
+        let migrated = reopened
+            .get_analysis_job("legacy-empty-completed-job")
+            .expect("load migrated job")
+            .expect("migrated job remains");
+        assert_eq!(migrated.status, "skipped");
+        assert!(migrated.error.as_deref().is_some_and(|value| value.contains("未调用 AI")));
+        assert!(migrated.completed_at.is_some());
+
+        drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }
 }
