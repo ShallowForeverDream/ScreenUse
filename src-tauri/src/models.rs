@@ -114,6 +114,13 @@ pub struct AnalysisJob {
     pub usage: AiUsage,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisBatchRunResult {
+    pub processed: u32,
+    pub failed: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeRange {

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, CodexRateCard, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, UndoStatus, WorkSession } from './types';
+import type { AnalysisBatchRunResult, AnalysisJob, AppSettings, AttributionRule, CategoryOption, CodexRateCard, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, UndoStatus, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -134,6 +134,12 @@ export const api = {
   mergeSessions: (ids: string[], summary?: string) => call<WorkSession>('merge_sessions', { ids, summary }),
   splitSession: (id: string, splitAt: string) => call<WorkSession[]>('split_session', { id, splitAt }),
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),
+  retryAnalysisJobs: (ids: string[]) => call<number>('retry_analysis_jobs', { ids }, ids.length),
+  runAnalysisJobs: (ids: string[]) => call<AnalysisBatchRunResult>(
+    'run_analysis_jobs',
+    { ids },
+    { processed: ids.length, failed: 0 },
+  ),
   listAnalysisJobs: (limit = 200) => call<AnalysisJob[]>('list_analysis_jobs', { limit }, []),
   getAnalysisJob: (id: string) => call<AnalysisJob | null>('get_analysis_job', { id }, null),
   getCodexRateCard: () => call<CodexRateCard>('get_codex_rate_card', undefined, previewCodexRateCard()),
@@ -142,6 +148,7 @@ export const api = {
     if (!isTauri()) return;
     await call<void>('delete_analysis_job', { id });
   },
+  deleteAnalysisJobs: (ids: string[]) => call<number>('delete_analysis_jobs', { ids }, ids.length),
   runAnalysisOnce: () => call<boolean>('run_analysis_once', undefined, false),
   compactSessions: () => call<number>('compact_sessions', undefined, 0),
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),

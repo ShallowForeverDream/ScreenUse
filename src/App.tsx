@@ -1097,11 +1097,13 @@ function AiReviewView({
 }) {
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(() => new Set());
   const [detail, setDetail] = useState<AnalysisJob | null>(null);
   const [filter, setFilter] = useState<AiJobFilter>('all');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [rateCard, setRateCard] = useState<CodexRateCard | null>(null);
+  const selectAllJobsRef = useRef<HTMLInputElement>(null);
   const confirmation = useConfirmation();
 
   const refresh = useCallback(async (quiet = false) => {
@@ -1109,6 +1111,10 @@ function AiReviewView({
     try {
       const next = await api.listAnalysisJobs(300);
       setJobs(next);
+      setSelectedJobIds((current) => {
+        const available = new Set(next.map((job) => job.id));
+        return new Set([...current].filter((id) => available.has(id)));
+      });
       setSelectedId((current) => current && next.some((job) => job.id === current)
         ? current
         : next[0]?.id || null);
@@ -1207,6 +1213,113 @@ function AiReviewView({
     if (filter === 'failed') return job.status === 'failed' || job.status === 'downgraded';
     return job.status === filter;
   }), [filter, jobs]);
+  const selectedJobs = useMemo(
+    () => jobs.filter((job) => selectedJobIds.has(job.id)),
+    [jobs, selectedJobIds],
+  );
+  const pendingSelectedJobs = selectedJobs.filter((job) => job.status === 'pending');
+  const retryableSelectedJobs = selectedJobs.filter(
+    (job) => job.status === 'failed' || job.status === 'downgraded',
+  );
+  const deletableSelectedJobs = selectedJobs.filter((job) => job.status === 'skipped');
+  const visibleSelectedCount = visibleJobs.reduce(
+    (count, job) => count + Number(selectedJobIds.has(job.id)),
+    0,
+  );
+  const allVisibleSelected = visibleJobs.length > 0 && visibleSelectedCount === visibleJobs.length;
+
+  useEffect(() => {
+    if (selectAllJobsRef.current) {
+      selectAllJobsRef.current.indeterminate = visibleSelectedCount > 0 && !allVisibleSelected;
+    }
+  }, [allVisibleSelected, visibleSelectedCount]);
+
+  const toggleSelectedJob = (id: string) => {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllVisibleJobs = (checked: boolean) => {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      visibleJobs.forEach((job) => {
+        if (checked) next.add(job.id);
+        else next.delete(job.id);
+      });
+      return next;
+    });
+  };
+
+  const retrySelectedJobs = async () => {
+    const ids = retryableSelectedJobs.map((job) => job.id);
+    if (!ids.length || busy) return;
+    setBusy(true);
+    try {
+      await runAction(
+        () => api.retryAnalysisJobs(ids),
+        `已将 ${ids.length} 条失败记录重新排队`,
+      );
+      setSelectedJobIds(new Set());
+      await refresh(true);
+      if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
+    } catch {
+      // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runSelectedJobs = async () => {
+    const ids = pendingSelectedJobs.map((job) => job.id);
+    if (!ids.length || busy) return;
+    setBusy(true);
+    try {
+      await runAction(
+        () => api.runAnalysisJobs(ids),
+        `已处理 ${ids.length} 条所选复核记录，失败项已保留`,
+      );
+      setSelectedJobIds(new Set());
+      await refresh(true);
+      if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
+    } catch {
+      // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteSelectedJobs = async () => {
+    const ids = deletableSelectedJobs.map((job) => job.id);
+    if (!ids.length || busy) return;
+    const chunkCount = deletableSelectedJobs.reduce((sum, job) => sum + job.chunkIds.length, 0);
+    const accepted = await confirmation.confirm({
+      title: `删除 ${ids.length} 条未调用 AI 的记录？`,
+      detail: `只删除复核历史，不会删除其中 ${chunkCount} 个原始时间段。`,
+    });
+    if (!accepted) return;
+
+    setBusy(true);
+    try {
+      await runAction(
+        () => api.deleteAnalysisJobs(ids),
+        `已删除 ${ids.length} 条未调用 AI 的复核记录`,
+      );
+      if (selectedId && ids.includes(selectedId)) {
+        setSelectedId(null);
+        setDetail(null);
+      }
+      setSelectedJobIds(new Set());
+      await refresh(true);
+    } catch {
+      // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
   const counts = useMemo(() => ({
     pending: jobs.filter((job) => job.status === 'pending').length,
     running: jobs.filter((job) => job.status === 'running').length,
@@ -1268,7 +1381,7 @@ function AiReviewView({
             onClick={() => void runAndRefresh(api.retryFailedJobs, '失败任务已重新排队')}
             type="button"
           >
-            <RefreshCw size={15} />重试失败
+            <RefreshCw size={15} />重试全部失败
           </button>
           <button disabled={loading} onClick={() => void refresh()} type="button" title="刷新列表">
             <RefreshCw className={loading ? 'spin' : ''} size={15} />刷新
@@ -1314,19 +1427,83 @@ function AiReviewView({
               </button>
             ))}
           </div>
-          <div className="ai-job-list">
-            {visibleJobs.map((job) => (
+          {jobs.length > 0 && <div className="ai-job-selection-bar">
+            <div>
+              <label className="selection-toggle" title={`选择当前筛选下的 ${visibleJobs.length} 条记录`}>
+                <input
+                  className="themed-checkbox"
+                  ref={selectAllJobsRef}
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  disabled={!visibleJobs.length}
+                  onChange={(event) => toggleAllVisibleJobs(event.target.checked)}
+                />
+                全选当前
+              </label>
+              <span>已选 {selectedJobs.length}</span>
               <button
-                className={selectedId === job.id ? 'active' : ''}
-                key={job.id}
-                onClick={() => setSelectedId(job.id)}
+                className="selection-clear"
+                disabled={!selectedJobs.length}
+                onClick={() => setSelectedJobIds(new Set())}
                 type="button"
               >
-                <span className={`ai-status ${job.status}`}>{aiJobStatusLabel(job.status)}</span>
-                <strong>{job.chunkIds.length} 个时间段</strong>
-                <small>{job.model || '等待读取模型'}</small>
-                <time>{formatAiDateTime(job.queuedAt)}</time>
+                全不选
               </button>
+            </div>
+            <div className="ai-job-batch-actions">
+              <button
+                className="primary"
+                disabled={busy || !pendingSelectedJobs.length}
+                onClick={() => void runSelectedJobs()}
+                type="button"
+                title="依次处理所选记录中的排队项"
+              >
+                <WandSparkles size={13} />复核 {pendingSelectedJobs.length || ''}
+              </button>
+              <button
+                disabled={busy || !retryableSelectedJobs.length}
+                onClick={() => void retrySelectedJobs()}
+                type="button"
+                title="只重试所选记录中的失败项"
+              >
+                <RefreshCw size={13} />重试 {retryableSelectedJobs.length || ''}
+              </button>
+              <button
+                className="danger-button"
+                disabled={busy || !deletableSelectedJobs.length}
+                onClick={() => void deleteSelectedJobs()}
+                type="button"
+                title="只删除所选记录中的未调用项"
+              >
+                <Trash2 size={13} />删除 {deletableSelectedJobs.length || ''}
+              </button>
+            </div>
+          </div>}
+          <div className="ai-job-list">
+            {visibleJobs.map((job) => (
+              <div
+                className={`ai-job-row ${selectedId === job.id ? 'active' : ''} ${selectedJobIds.has(job.id) ? 'checked' : ''}`}
+                key={job.id}
+              >
+                <label className="ai-job-check" aria-label={`选择 ${job.chunkIds.length} 个时间段的复核记录`}>
+                  <input
+                    className="themed-checkbox"
+                    type="checkbox"
+                    checked={selectedJobIds.has(job.id)}
+                    onChange={() => toggleSelectedJob(job.id)}
+                  />
+                </label>
+                <button
+                  className="ai-job-open"
+                  onClick={() => setSelectedId(job.id)}
+                  type="button"
+                >
+                  <span className={`ai-status ${job.status}`}>{aiJobStatusLabel(job.status)}</span>
+                  <strong>{job.chunkIds.length} 个时间段</strong>
+                  <small>{job.model || '等待读取模型'}</small>
+                  <time>{formatAiDateTime(job.queuedAt)}</time>
+                </button>
+              </div>
             ))}
             {!loading && visibleJobs.length === 0 && (
               <div className="ai-job-empty">

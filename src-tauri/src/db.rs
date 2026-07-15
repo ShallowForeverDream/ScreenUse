@@ -2599,26 +2599,36 @@ impl AppDb {
     }
 
     pub fn delete_skipped_analysis_job(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        let deleted = conn.execute(
-            "DELETE FROM analysis_jobs WHERE id=?1 AND status='skipped'",
-            params![id],
-        )?;
-        if deleted > 0 {
-            return Ok(());
-        }
+        self.delete_skipped_analysis_jobs(&[id.to_string()])?;
+        Ok(())
+    }
 
-        let status = conn
-            .query_row(
-                "SELECT status FROM analysis_jobs WHERE id=?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if status.is_some() {
-            bail!("只能删除未调用 AI 的复核记录");
+    pub fn delete_skipped_analysis_jobs(&self, ids: &[String]) -> Result<u32> {
+        if ids.is_empty() {
+            return Ok(0);
         }
-        bail!("复核记录不存在或已删除")
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut seen = HashSet::new();
+        let mut deleted = 0;
+        for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+            let status = tx
+                .query_row(
+                    "SELECT status FROM analysis_jobs WHERE id=?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match status.as_deref() {
+                Some("skipped") => {
+                    deleted += tx.execute("DELETE FROM analysis_jobs WHERE id=?1", params![id])?;
+                }
+                Some(_) => bail!("只能删除未调用 AI 的复核记录"),
+                None => bail!("复核记录不存在或已删除"),
+            }
+        }
+        tx.commit()?;
+        Ok(deleted as u32)
     }
 
     pub fn record_analysis_job_request(
@@ -2702,6 +2712,40 @@ impl AppDb {
                  completed_at=NULL, duration_ms=NULL
              WHERE id=?2 AND status='pending'",
             params![processing_started_at, job.id],
+        )?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        job.status = "running".into();
+        job.error = None;
+        job.processing_started_at = Some(processing_started_at);
+        job.completed_at = None;
+        job.duration_ms = None;
+        Ok(Some(job))
+    }
+
+    pub fn claim_analysis_job(&self, id: &str) -> Result<Option<AnalysisJob>> {
+        let conn = self.conn.lock();
+        let job = conn
+            .query_row(
+                "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
+                        provider,model,system_prompt,user_prompt,response,queued_at,
+                        processing_started_at,completed_at,duration_ms,result_count,usage_json
+                 FROM analysis_jobs WHERE id=?1 AND status='pending'",
+                params![id],
+                analysis_job_from_row,
+            )
+            .optional()?;
+        let Some(mut job) = job else {
+            return Ok(None);
+        };
+        let processing_started_at = now();
+        let claimed = conn.execute(
+            "UPDATE analysis_jobs
+             SET status='running', error=NULL, processing_started_at=?1,
+                 completed_at=NULL, duration_ms=NULL
+             WHERE id=?2 AND status='pending'",
+            params![processing_started_at, id],
         )?;
         if claimed == 0 {
             return Ok(None);
@@ -3429,6 +3473,40 @@ impl AppDb {
              WHERE status IN ('failed','downgraded')",
             [],
         )?;
+        Ok(changed as u32)
+    }
+
+    pub fn retry_analysis_jobs(&self, ids: &[String]) -> Result<u32> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut seen = HashSet::new();
+        let mut changed = 0;
+        for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+            let status = tx
+                .query_row(
+                    "SELECT status FROM analysis_jobs WHERE id=?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match status.as_deref() {
+                Some("failed" | "downgraded") => {
+                    changed += tx.execute(
+                        "UPDATE analysis_jobs
+                         SET status='pending', error=NULL, processing_started_at=NULL,
+                             completed_at=NULL, duration_ms=NULL, response=NULL, result_count=0
+                         WHERE id=?1",
+                        params![id],
+                    )?;
+                }
+                Some(_) => bail!("只能重试失败的 AI 复核记录"),
+                None => bail!("复核记录不存在或已删除"),
+            }
+        }
+        tx.commit()?;
         Ok(changed as u32)
     }
 
@@ -6195,6 +6273,85 @@ mod tests {
             .get_analysis_job("completed-job")
             .expect("load completed job")
             .is_some());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn analysis_jobs_support_atomic_batch_delete_and_retry() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-job-batch-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let queued_at = now();
+        for (id, status) in [
+            ("skipped-a", "skipped"),
+            ("skipped-b", "skipped"),
+            ("failed-a", "failed"),
+            ("downgraded-a", "downgraded"),
+            ("completed-a", "completed"),
+        ] {
+            db.create_analysis_job(&AnalysisJob {
+                id: id.into(),
+                chunk_ids: vec![format!("{id}-session")],
+                metadata_range: TimeRange {
+                    started_at: queued_at.clone(),
+                    ended_at: queued_at.clone(),
+                },
+                mode: "metadata-context-review".into(),
+                provider: String::new(),
+                model: String::new(),
+                retry_count: 0,
+                status: status.into(),
+                error: (status == "failed").then(|| "request failed".into()),
+                system_prompt: None,
+                user_prompt: None,
+                response: None,
+                queued_at: queued_at.clone(),
+                processing_started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                result_count: 0,
+                usage: AiUsage::default(),
+            })
+            .expect("create analysis job");
+        }
+
+        let mixed_delete = vec!["skipped-a".to_string(), "completed-a".to_string()];
+        assert!(db.delete_skipped_analysis_jobs(&mixed_delete).is_err());
+        assert!(db
+            .get_analysis_job("skipped-a")
+            .expect("load rolled back skipped job")
+            .is_some());
+
+        let deleted = db
+            .delete_skipped_analysis_jobs(&[
+                "skipped-a".to_string(),
+                "skipped-b".to_string(),
+            ])
+            .expect("delete skipped jobs");
+        assert_eq!(deleted, 2);
+
+        let retried = db
+            .retry_analysis_jobs(&[
+                "failed-a".to_string(),
+                "downgraded-a".to_string(),
+            ])
+            .expect("retry failed jobs");
+        assert_eq!(retried, 2);
+        for id in ["failed-a", "downgraded-a"] {
+            let job = db
+                .get_analysis_job(id)
+                .expect("load retried job")
+                .expect("retried job remains");
+            assert_eq!(job.status, "pending");
+            assert!(job.error.is_none());
+        }
+        assert!(db
+            .retry_analysis_jobs(&["completed-a".to_string()])
+            .is_err());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

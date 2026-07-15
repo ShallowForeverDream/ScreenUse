@@ -113,8 +113,36 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
     let Some(job) = db.claim_next_analysis_job()? else {
         return Ok(false);
     };
+    run_claimed_job(&db, job).await?;
+    Ok(true)
+}
+
+pub async fn run_selected(
+    db: Arc<AppDb>,
+    ids: &[String],
+) -> Result<crate::models::AnalysisBatchRunResult> {
+    let lock = AI_RUN_LOCK.get_or_init(|| AsyncMutex::new(()));
+    let Ok(_guard) = lock.try_lock() else {
+        return Err(anyhow!("已有 AI 复核正在运行，请稍后再试"));
+    };
+    let mut result = crate::models::AnalysisBatchRunResult::default();
+    let mut seen = HashSet::new();
+    for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+        let Some(job) = db.claim_analysis_job(id)? else {
+            continue;
+        };
+        result.processed += 1;
+        if let Err(error) = run_claimed_job(&db, job).await {
+            result.failed += 1;
+            eprintln!("ScreenUse selected AI review error: {error}");
+        }
+    }
+    Ok(result)
+}
+
+async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
     let settings = db.get_settings()?.normalized();
-    let mut targets = load_job_targets(&db, &job)?;
+    let mut targets = load_job_targets(db, &job)?;
     targets.retain(|session| !session.user_confirmed && session.source != "ai-review");
     if targets.is_empty() {
         db.mark_analysis_job_status(
@@ -123,12 +151,12 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
             None,
             Some("目标时间段已被人工修正，未调用 AI".into()),
         )?;
-        return Ok(true);
+        return Ok(());
     }
     targets.sort_by(|left, right| left.started_at.cmp(&right.started_at));
 
-    let context_sessions = load_context_sessions(&db, &targets)?;
-    let events = load_target_events(&db, &targets)?;
+    let context_sessions = load_context_sessions(db, &targets)?;
+    let events = load_target_events(db, &targets)?;
     let categories = db.list_categories()?;
     let projects = db.list_projects()?;
     let tasks = db.list_tasks()?;
@@ -154,7 +182,7 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
         let response = maybe_ai(&settings, &system_prompt, &user_prompt).await?;
         let mut usage = response.usage;
         if settings.ai_provider == "codex-account" && usage.cost_usd.is_none() {
-            if let Some((credits, usd)) = crate::pricing::estimate_usage_cost(&db, &settings.ai_model, &usage) {
+            if let Some((credits, usd)) = crate::pricing::estimate_usage_cost(db, &settings.ai_model, &usage) {
                 usage.cost_usd = Some(usd);
                 usage.cost_note = Some(format!(
                     "按调用时官方 Token/Credits 等值费率估算：{credits:.6} Credits"
@@ -168,8 +196,8 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
 
     match review_result {
         Ok(result) => {
-            persist_results(&db, &job, &targets, &events, result)?;
-            Ok(true)
+            persist_results(db, &job, &targets, &events, result)?;
+            Ok(())
         }
         Err(error) => {
             let retry_count = job.retry_count + 1;
@@ -479,6 +507,32 @@ mod tests {
         }
     }
 
+    fn analysis_job(id: &str, queued_at: &str) -> AnalysisJob {
+        AnalysisJob {
+            id: id.into(),
+            chunk_ids: vec![format!("{id}-missing-session")],
+            metadata_range: TimeRange {
+                started_at: queued_at.into(),
+                ended_at: queued_at.into(),
+            },
+            mode: "metadata-context-review".into(),
+            provider: String::new(),
+            model: String::new(),
+            retry_count: 0,
+            status: "pending".into(),
+            error: None,
+            system_prompt: None,
+            user_prompt: None,
+            response: None,
+            queued_at: queued_at.into(),
+            processing_started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            result_count: 0,
+            usage: AiUsage::default(),
+        }
+    }
+
     #[test]
     fn one_minute_is_the_minimum_ai_review_duration() {
         let queued = HashSet::new();
@@ -525,5 +579,53 @@ mod tests {
         assert!(!is_review_candidate(&value, 60, &queued));
         value.source = "collector-idle".into();
         assert!(!is_review_candidate(&value, 60, &queued));
+    }
+
+    #[tokio::test]
+    async fn selected_run_claims_only_requested_pending_jobs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-selected-run-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(AppDb::open_in(data_dir.clone()).expect("open test database"));
+        let queued_at = now();
+        for id in ["selected-a", "unselected", "selected-b"] {
+            db.create_analysis_job(&analysis_job(id, &queued_at))
+                .expect("create analysis job");
+        }
+
+        let result = run_selected(
+            db.clone(),
+            &["selected-a".into(), "selected-b".into()],
+        )
+        .await
+        .expect("run selected jobs");
+
+        assert_eq!(result.processed, 2);
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            db.get_analysis_job("selected-a")
+                .expect("load selected job")
+                .expect("selected job exists")
+                .status,
+            "skipped"
+        );
+        assert_eq!(
+            db.get_analysis_job("selected-b")
+                .expect("load selected job")
+                .expect("selected job exists")
+                .status,
+            "skipped"
+        );
+        assert_eq!(
+            db.get_analysis_job("unselected")
+                .expect("load unselected job")
+                .expect("unselected job exists")
+                .status,
+            "pending"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

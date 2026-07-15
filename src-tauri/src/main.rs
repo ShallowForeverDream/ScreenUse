@@ -251,6 +251,11 @@ fn retry_failed_jobs(state: State<AppState>) -> Result<u32, String> {
 }
 
 #[tauri::command]
+fn retry_analysis_jobs(state: State<AppState>, ids: Vec<String>) -> Result<u32, String> {
+    state.db.retry_analysis_jobs(&ids).map_err(map_err)
+}
+
+#[tauri::command]
 fn list_analysis_jobs(
     state: State<AppState>,
     limit: Option<u32>,
@@ -269,6 +274,11 @@ fn get_analysis_job(state: State<AppState>, id: String) -> Result<Option<Analysi
 #[tauri::command]
 fn delete_analysis_job(state: State<AppState>, id: String) -> Result<(), String> {
     state.db.delete_skipped_analysis_job(&id).map_err(map_err)
+}
+
+#[tauri::command]
+fn delete_analysis_jobs(state: State<AppState>, ids: Vec<String>) -> Result<u32, String> {
+    state.db.delete_skipped_analysis_jobs(&ids).map_err(map_err)
 }
 
 #[tauri::command]
@@ -291,6 +301,16 @@ async fn run_analysis_once(state: State<'_, AppState>) -> Result<bool, String> {
         }
     }
     analysis_worker::run_once(state.db.clone())
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+async fn run_analysis_jobs(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<models::AnalysisBatchRunResult, String> {
+    analysis_worker::run_selected(state.db.clone(), &ids)
         .await
         .map_err(map_err)
 }
@@ -556,12 +576,15 @@ fn main() {
             merge_sessions,
             split_session,
             retry_failed_jobs,
+            retry_analysis_jobs,
             list_analysis_jobs,
             get_analysis_job,
             delete_analysis_job,
+            delete_analysis_jobs,
             get_codex_rate_card,
             refresh_codex_rate_card,
             run_analysis_once,
+            run_analysis_jobs,
             compact_sessions,
             learn_rule_from_session,
             cleanup_media_cache,

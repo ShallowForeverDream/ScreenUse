@@ -172,6 +172,11 @@ export interface AnalysisJob {
   };
 }
 
+export interface AnalysisBatchRunResult {
+  processed: number;
+  failed: number;
+}
+
 export interface CodexModelRate {
   model: string;
   inputCreditsPerMillion: number;
