@@ -1717,6 +1717,11 @@ function DayActivityTimeline({
   const centerRef = useRef<{ date: string; seconds: number } | null>(null);
   const wheelAtRef = useRef(0);
   const [viewport, setViewport] = useState({ left: 0, width: 0 });
+  const [expandedGroup, setExpandedGroup] = useState<{
+    sessionIds: string[];
+    startedAt: string;
+    endedAt: string;
+  } | null>(null);
   const [tooltip, setTooltip] = useState<{
     session: WorkSession;
     app: string;
@@ -1805,6 +1810,15 @@ function DayActivityTimeline({
     }
     return continuous;
   }, [detailed, sorted]);
+  const expandedSessions = expandedGroup
+    ? sorted.filter((session) => expandedGroup.sessionIds.includes(session.id))
+    : [];
+  useEffect(() => {
+    setExpandedGroup(null);
+  }, [detailed, selectedDate]);
+  useEffect(() => {
+    if (expandedGroup && !expandedSessions.length) setExpandedGroup(null);
+  }, [expandedGroup, expandedSessions.length]);
   const initialCenterSeconds = useMemo(() => {
     if (selectedDate === localDateKey(new Date())) {
       const now = new Date();
@@ -1950,18 +1964,30 @@ function DayActivityTimeline({
                 : `${applications.slice(0, 3).join('、')}${applications.length > 3 ? ` 等 ${applications.length} 个应用` : ''}${group.sessions.length > 1 ? ` · 合并 ${group.sessions.length} 段` : ''}`;
               const blockWidth = Math.max(1, Math.max(5, bounds.durationSeconds) * pixelsPerSecond);
               const timeRange = `${formatTimelineClock(group.startedAt, true)}–${formatTimelineClock(group.endedAt, true)}`;
+              const actionLabel = group.sessions.length > 1
+                ? `点击查看 ${group.sessions.length} 个具体时间段`
+                : '点击修正';
               return (
                 <button
                   aria-disabled={group.untracked}
                   aria-label={group.untracked
                     ? `${timeRange}，${displaySession.summary}，${app}，悬浮查看原因`
-                    : `${timeRange}，${displaySession.summary}，${app}，点击修正`}
+                    : `${timeRange}，${displaySession.summary}，${app}，${actionLabel}`}
                   className={`day-track-block${group.untracked ? ' untracked' : ''}${!group.untracked && group.sessions.some(needsReview) ? ' needs-review' : ''}`}
                   key={group.id}
                   onBlur={() => setTooltip(null)}
                   onClick={() => {
                     setTooltip(null);
-                    if (!group.untracked) onEdit(group.sessions);
+                    if (group.untracked) return;
+                    if (group.sessions.length > 1) {
+                      setExpandedGroup({
+                        sessionIds: group.sessions.map((session) => session.id),
+                        startedAt: group.startedAt,
+                        endedAt: group.endedAt,
+                      });
+                    } else {
+                      onEdit(group.sessions);
+                    }
                   }}
                   onFocus={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
                   onMouseEnter={(event) => showSessionTooltip(event.currentTarget, displaySession, app, timeRange)}
@@ -1996,6 +2022,17 @@ function DayActivityTimeline({
           <small>{tooltip.app}</small>
         </div>,
         document.body,
+      )}
+      {expandedGroup && expandedSessions.length > 0 && (
+        <CategoryDetailModal
+          category={expandedSessions[0].category}
+          sessions={expandedSessions}
+          selectedDate={selectedDate}
+          title={expandedSessions[0].taskTitle || expandedSessions[0].projectName || '合并时间段'}
+          contextLabel={`${formatTimelineClock(expandedGroup.startedAt, true)}–${formatTimelineClock(expandedGroup.endedAt, true)}`}
+          onClose={() => setExpandedGroup(null)}
+          onEdit={onEdit}
+        />
       )}
     </>
   );
@@ -2191,12 +2228,16 @@ function CategoryDetailModal({
   category,
   sessions,
   selectedDate,
+  title,
+  contextLabel,
   onClose,
   onEdit,
 }: {
   category: string;
   sessions: WorkSession[];
   selectedDate: string;
+  title?: string;
+  contextLabel?: string;
   onClose: () => void;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
@@ -2228,17 +2269,18 @@ function CategoryDetailModal({
       return next;
     });
   };
+  const heading = title || category;
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
     }}>
-      <section className="modal category-detail" role="dialog" aria-modal="true" aria-label={`${category}时间段`}>
+      <section className="modal category-detail" role="dialog" aria-modal="true" aria-label={`${heading}时间段`}>
         <div className="modal-head category-detail-head">
           <div className="category-detail-title">
             <span style={{ background: categoryColor(category) }} />
             <div>
-              <h2>{category}</h2>
-              <p>{formatDuration(total)} · {sorted.length} 个时间段</p>
+              <h2>{heading}</h2>
+              <p>{formatDuration(total)} · {sorted.length} 个{title ? '具体' : ''}时间段{contextLabel ? ` · ${contextLabel}` : ''}</p>
             </div>
           </div>
           <div className="category-detail-actions">
