@@ -185,7 +185,7 @@ fn prune_plan_session_links(conn: &Connection) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::db::now;
-    use crate::models::{AnalysisJob, TimeRange};
+    use crate::models::{AiUsage, AnalysisJob, TimeRange};
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rusqlite::params;
     use uuid::Uuid;
@@ -220,6 +220,7 @@ mod tests {
             completed_at: Some(old),
             duration_ms: Some(1000),
             result_count: 1,
+            usage: AiUsage::default(),
         })
         .expect("insert AI trace");
 

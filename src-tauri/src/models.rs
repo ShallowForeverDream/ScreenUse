@@ -31,6 +31,19 @@ pub struct RawActivityEvent {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct AiUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub cost_note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisJob {
@@ -51,6 +64,7 @@ pub struct AnalysisJob {
     pub completed_at: Option<String>,
     pub duration_ms: Option<u64>,
     pub result_count: u32,
+    pub usage: AiUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

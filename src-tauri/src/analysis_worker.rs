@@ -1,9 +1,9 @@
 use crate::ai::{
     parse_and_validate, request_with_codex_account, review_instructions, review_prompt,
-    AiAttributionBatch, AiReviewInput, OpenAiCompatibleClient,
+    AiAttributionBatch, AiResponse, AiReviewInput, OpenAiCompatibleClient,
 };
 use crate::db::{now, AppDb};
-use crate::models::{AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession};
+use crate::models::{AiUsage, AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession};
 use crate::secrets;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -97,6 +97,7 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
             completed_at: None,
             duration_ms: None,
             result_count: 0,
+            usage: AiUsage::default(),
         })?;
     }
     Ok(true)
@@ -149,8 +150,8 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
             &user_prompt,
         )?;
         let response = maybe_ai(&settings, &system_prompt, &user_prompt).await?;
-        db.record_analysis_job_response(&job.id, &response)?;
-        parse_and_validate(&response, &input)
+        db.record_analysis_job_response(&job.id, &response.content, &response.usage)?;
+        parse_and_validate(&response.content, &input)
     }
     .await;
 
@@ -276,7 +277,7 @@ async fn maybe_ai(
     settings: &crate::models::AppSettings,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<String> {
+) -> Result<AiResponse> {
     if settings.ai_provider == "codex-account" {
         return request_with_codex_account(settings, system_prompt, user_prompt).await;
     }

@@ -160,6 +160,15 @@ export interface AnalysisJob {
   completedAt?: string | null;
   durationMs?: number | null;
   resultCount: number;
+  usage: {
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    totalTokens: number;
+    costUsd?: number | null;
+    costNote?: string | null;
+  };
 }
 
 export interface GithubSyncConfig {

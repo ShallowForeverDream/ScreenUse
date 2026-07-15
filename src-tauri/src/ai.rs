@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use crate::models::{
-    AppSettings, CategoryOption, EvidenceItem, Project, RawActivityEvent, Task, WorkSession,
+    AiUsage, AppSettings, CategoryOption, EvidenceItem, Project, RawActivityEvent, Task,
+    WorkSession,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Duration as ChronoDuration;
@@ -47,6 +48,12 @@ pub struct AiReviewInput<'a> {
     pub tasks: &'a [Task],
 }
 
+#[derive(Debug, Clone)]
+pub struct AiResponse {
+    pub content: String,
+    pub usage: AiUsage,
+}
+
 pub struct OpenAiCompatibleClient {
     client: Client,
     base_url: String,
@@ -78,11 +85,11 @@ impl OpenAiCompatibleClient {
         }
         let system_prompt = review_instructions();
         let user_prompt = review_prompt(input)?;
-        let content = self.request_review(system_prompt, &user_prompt).await?;
-        parse_and_validate(&content, input)
+        let response = self.request_review(system_prompt, &user_prompt).await?;
+        parse_and_validate(&response.content, input)
     }
 
-    pub async fn request_review(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    pub async fn request_review(&self, system_prompt: &str, user_prompt: &str) -> Result<AiResponse> {
         if self.model.is_empty() {
             return Err(anyhow!("AI model is empty"));
         }
@@ -115,8 +122,12 @@ impl OpenAiCompatibleClient {
         let value: Value = response.json().await?;
         let content = value["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or_else(|| anyhow!("missing AI response content"))?;
-        Ok(content.to_string())
+            .ok_or_else(|| anyhow!("missing AI response content"))?
+            .to_string();
+        Ok(AiResponse {
+            content,
+            usage: usage_from_api_response(&value),
+        })
     }
 }
 
@@ -129,15 +140,15 @@ pub async fn analyze_with_codex_account(
     }
     let system_prompt = review_instructions();
     let user_prompt = review_prompt(input)?;
-    let content = request_with_codex_account(settings, system_prompt, &user_prompt).await?;
-    parse_and_validate(&content, input)
+    let response = request_with_codex_account(settings, system_prompt, &user_prompt).await?;
+    parse_and_validate(&response.content, input)
 }
 
 pub async fn request_with_codex_account(
     settings: &AppSettings,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<String> {
+) -> Result<AiResponse> {
     let model = settings.ai_model.trim();
     if model.is_empty() {
         return Err(anyhow!("Codex model is empty"));
@@ -152,6 +163,7 @@ pub async fn request_with_codex_account(
     let mut command = codex_command();
     command
         .arg("exec")
+        .arg("--json")
         .arg("--ephemeral")
         .arg("--skip-git-repo-check")
         .arg("--ignore-user-config")
@@ -173,7 +185,7 @@ pub async fn request_with_codex_account(
         .env_remove("OPENAI_API_KEY")
         .env("RUST_LOG", "error")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     hide_console(&mut command);
@@ -202,11 +214,85 @@ pub async fn request_with_codex_account(
             ));
         }
         let content = fs::read_to_string(&output_path).context("Codex 未生成结构化复核结果")?;
-        Ok(content)
+        Ok(AiResponse {
+            content,
+            usage: usage_from_codex_jsonl(&output.stdout),
+        })
     }
     .await;
     let _ = fs::remove_dir_all(&work_dir);
     result
+}
+
+fn usage_from_codex_jsonl(stdout: &[u8]) -> AiUsage {
+    let mut usage = AiUsage::default();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"].as_str() != Some("turn.completed") {
+            continue;
+        }
+        let source = &value["usage"];
+        usage.input_tokens = json_u64(source, &["input_tokens"]);
+        usage.cached_input_tokens = json_u64(source, &["cached_input_tokens"]);
+        usage.output_tokens = json_u64(source, &["output_tokens"]);
+        usage.reasoning_output_tokens = json_u64(source, &["reasoning_output_tokens"]);
+        usage.total_tokens = json_u64(source, &["total_tokens"])
+            .max(usage.input_tokens.saturating_add(usage.output_tokens));
+        usage.cost_usd = json_f64(source, &["cost_usd"])
+            .or_else(|| json_f64(source, &["cost"]))
+            .or_else(|| json_f64(source, &["total_cost"]));
+    }
+    if usage.total_tokens > 0 && usage.cost_usd.is_none() {
+        usage.cost_note = Some("当前 Codex 账号未返回单次金额".into());
+    }
+    usage
+}
+
+fn usage_from_api_response(value: &Value) -> AiUsage {
+    let source = &value["usage"];
+    let input_tokens = json_u64(source, &["prompt_tokens"])
+        .max(json_u64(source, &["input_tokens"]));
+    let output_tokens = json_u64(source, &["completion_tokens"])
+        .max(json_u64(source, &["output_tokens"]));
+    let cached_input_tokens = json_u64(source, &["prompt_tokens_details", "cached_tokens"])
+        .max(json_u64(source, &["input_tokens_details", "cached_tokens"]));
+    let reasoning_output_tokens = json_u64(
+        source,
+        &["completion_tokens_details", "reasoning_tokens"],
+    )
+    .max(json_u64(
+        source,
+        &["output_tokens_details", "reasoning_tokens"],
+    ));
+    let total_tokens = json_u64(source, &["total_tokens"])
+        .max(input_tokens.saturating_add(output_tokens));
+    let cost_usd = json_f64(source, &["cost"])
+        .or_else(|| json_f64(source, &["total_cost"]))
+        .or_else(|| json_f64(source, &["cost_usd"]));
+    AiUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        cost_usd,
+        cost_note: (total_tokens > 0 && cost_usd.is_none())
+            .then(|| "接口未返回单次金额".into()),
+    }
+}
+
+fn json_u64(value: &Value, path: &[&str]) -> u64 {
+    json_path(value, path).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn json_f64(value: &Value, path: &[&str]) -> Option<f64> {
+    json_path(value, path).and_then(Value::as_f64)
+}
+
+fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, key| current.get(key))
 }
 
 pub async fn probe_codex_account() -> Result<String> {
@@ -495,30 +581,29 @@ fn validate_batch(batch: &mut AiAttributionBatch, input: &AiReviewInput<'_>) -> 
 }
 
 fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) -> Result<()> {
-    if !input.categories.iter().any(|item| item.name == result.category) {
-        return Err(anyhow!("AI returned unsupported category: {}", result.category));
-    }
-    if let Some(project_id) = result.project_id.as_deref() {
-        let project = input
-            .projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .ok_or_else(|| anyhow!("AI returned unknown projectId: {project_id}"))?;
-        if project.category != result.category {
-            return Err(anyhow!("AI returned a project outside the selected category"));
-        }
-    } else if result.task_id.is_some() {
-        return Err(anyhow!("AI returned taskId without projectId"));
-    }
     if let Some(task_id) = result.task_id.as_deref() {
         let task = input
             .tasks
             .iter()
             .find(|task| task.id == task_id)
             .ok_or_else(|| anyhow!("AI returned unknown taskId: {task_id}"))?;
-        if Some(task.project_id.as_str()) != result.project_id.as_deref() {
-            return Err(anyhow!("AI returned a task outside the selected project"));
-        }
+        let project = input
+            .projects
+            .iter()
+            .find(|project| project.id == task.project_id)
+            .ok_or_else(|| anyhow!("AI returned a task whose project is missing from catalog"))?;
+        result.project_id = Some(project.id.clone());
+        result.category = project.category.clone();
+    } else if let Some(project_id) = result.project_id.as_deref() {
+        let project = input
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .ok_or_else(|| anyhow!("AI returned unknown projectId: {project_id}"))?;
+        result.category = project.category.clone();
+    }
+    if !input.categories.iter().any(|item| item.name == result.category) {
+        return Err(anyhow!("AI returned unsupported category: {}", result.category));
     }
     result.summary = clean(&result.summary, "AI 元数据复核", 100);
     result.confidence = result.confidence.clamp(0.0, 0.98);
@@ -626,6 +711,43 @@ mod tests {
             last_path_parts(r"C:\\Users\\me\\Code\\ScreenUse\\src\\main.rs"),
             "ScreenUse/src/main.rs"
         );
+    }
+
+    #[test]
+    fn reads_token_usage_from_codex_json_events() {
+        let usage = usage_from_codex_jsonl(
+            br#"{"type":"turn.started"}
+{"type":"turn.completed","usage":{"input_tokens":14408,"cached_input_tokens":7936,"output_tokens":25,"reasoning_output_tokens":20}}
+"#,
+        );
+        assert_eq!(usage.input_tokens, 14_408);
+        assert_eq!(usage.cached_input_tokens, 7_936);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.reasoning_output_tokens, 20);
+        assert_eq!(usage.total_tokens, 14_433);
+        assert!(usage.cost_usd.is_none());
+        assert_eq!(usage.cost_note.as_deref(), Some("当前 Codex 账号未返回单次金额"));
+    }
+
+    #[test]
+    fn reads_usage_and_provider_cost_from_compatible_api() {
+        let usage = usage_from_api_response(&json!({
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 80,
+                "total_tokens": 1280,
+                "prompt_tokens_details": {"cached_tokens": 500},
+                "completion_tokens_details": {"reasoning_tokens": 32},
+                "cost": 0.0123
+            }
+        }));
+        assert_eq!(usage.input_tokens, 1_200);
+        assert_eq!(usage.cached_input_tokens, 500);
+        assert_eq!(usage.output_tokens, 80);
+        assert_eq!(usage.reasoning_output_tokens, 32);
+        assert_eq!(usage.total_tokens, 1_280);
+        assert_eq!(usage.cost_usd, Some(0.0123));
+        assert!(usage.cost_note.is_none());
     }
 
     #[test]
@@ -764,6 +886,61 @@ mod tests {
             evidence: vec![],
         };
         assert!(validate_result(&mut result, &input).is_err());
+    }
+
+    #[test]
+    fn repairs_category_and_project_from_the_selected_task() {
+        let target = WorkSession {
+            id: "target".into(),
+            started_at: "2026-07-14T10:00:00Z".into(),
+            ended_at: "2026-07-14T10:02:00Z".into(),
+            project_id: None,
+            project_name: None,
+            task_id: None,
+            task_title: None,
+            category: "杂务".into(),
+            summary: "会议".into(),
+            confidence: 0.55,
+            evidence: vec![],
+            user_confirmed: false,
+            source: "context-complete".into(),
+        };
+        let categories = vec![
+            CategoryOption { name: "学习".into(), color: "#fff".into(), is_builtin: true },
+            CategoryOption { name: "校内实习".into(), color: "#aaa".into(), is_builtin: false },
+        ];
+        let projects = vec![
+            Project {
+                id: "wrong-project".into(), name: "校内实习".into(), category: "校内实习".into(),
+                source: "manual".into(), color: "#aaa".into(), description: None,
+                created_at: "".into(), updated_at: "".into(),
+            },
+            Project {
+                id: "iot-project".into(), name: "科研".into(), category: "学习".into(),
+                source: "manual".into(), color: "#fff".into(), description: None,
+                created_at: "".into(), updated_at: "".into(),
+            },
+        ];
+        let tasks = vec![Task {
+            id: "iot-task".into(), project_id: "iot-project".into(), title: "IOT".into(),
+            status: "active".into(), source: "manual".into(), planned_due_at: None,
+            created_at: "".into(), updated_at: "".into(),
+        }];
+        let targets = vec![target];
+        let input = sample_input(&targets, &[], &[], &categories, &projects, &tasks);
+        let mut result = AiAttributionResult {
+            session_id: "target".into(),
+            project_id: Some("wrong-project".into()),
+            task_id: Some("iot-task".into()),
+            category: "校内实习".into(),
+            summary: "参加 IOT 科研会议".into(),
+            confidence: 0.9,
+            evidence: vec![],
+        };
+
+        validate_result(&mut result, &input).expect("repair hierarchy from task");
+        assert_eq!(result.project_id.as_deref(), Some("iot-project"));
+        assert_eq!(result.category, "学习");
     }
 
     #[tokio::test]

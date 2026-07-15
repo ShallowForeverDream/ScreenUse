@@ -1210,6 +1210,12 @@ function AiReviewView({
                 <AiFact label="完成" value={formatAiDateTime(detail.completedAt)} />
                 <AiFact label="耗时" value={formatAiDuration(detail.durationMs)} />
                 <AiFact label="重试" value={`${detail.retryCount} 次`} />
+                <AiFact label="总 Token" value={formatAiTokens(detail.usage.totalTokens)} />
+                <AiFact label="输入 Token" value={formatAiTokens(detail.usage.inputTokens)} />
+                <AiFact label="缓存 Token" value={formatAiTokens(detail.usage.cachedInputTokens)} />
+                <AiFact label="输出 Token" value={formatAiTokens(detail.usage.outputTokens)} />
+                <AiFact label="推理 Token" value={formatAiTokens(detail.usage.reasoningOutputTokens)} />
+                <AiFact label="开销" value={formatAiCost(detail.usage)} />
               </div>
 
               {detail.error && <div className="ai-job-error"><CircleAlert size={16} />{detail.error}</div>}
@@ -1330,6 +1336,18 @@ function formatAiDuration(value?: number | null) {
   if (value == null) return '—';
   if (value < 1000) return `${value} ms`;
   return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} 秒`;
+}
+
+function formatAiTokens(value?: number | null) {
+  if (!value) return '—';
+  return value.toLocaleString('zh-CN');
+}
+
+function formatAiCost(usage: AnalysisJob['usage']) {
+  if (usage.costUsd != null) {
+    return `$${usage.costUsd.toFixed(usage.costUsd < 0.01 ? 6 : 4)}`;
+  }
+  return usage.costNote || (usage.totalTokens > 0 ? '未返回金额' : '—');
 }
 
 type GlobalSearchResult =
@@ -4774,7 +4792,7 @@ function EditSessionModal({
 
         {!isBulk && (
           <>
-            <details className="modal-evidence">
+            <details className="modal-evidence" open>
               <summary>判断依据</summary>
               {session.evidence.length ? (
                 session.evidence.map((item, index) => (

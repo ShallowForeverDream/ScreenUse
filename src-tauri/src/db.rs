@@ -218,7 +218,8 @@ impl AppDb {
               processing_started_at TEXT,
               completed_at TEXT,
               duration_ms INTEGER,
-              result_count INTEGER NOT NULL DEFAULT 0
+              result_count INTEGER NOT NULL DEFAULT 0,
+              usage_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS attribution_rules (
               id TEXT PRIMARY KEY,
@@ -304,6 +305,12 @@ impl AppDb {
             "analysis_jobs",
             "result_count",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "analysis_jobs",
+            "usage_json",
+            "TEXT NOT NULL DEFAULT '{}'",
         )?;
         conn.execute(
             "UPDATE activity_categories SET updated_at=created_at WHERE updated_at=''",
@@ -2223,8 +2230,8 @@ impl AppDb {
             "INSERT OR REPLACE INTO analysis_jobs(
                id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
                provider,model,system_prompt,user_prompt,response,queued_at,
-               processing_started_at,completed_at,duration_ms,result_count
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+               processing_started_at,completed_at,duration_ms,result_count,usage_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 job.id,
                 serde_json::to_string(&job.chunk_ids)?,
@@ -2244,6 +2251,7 @@ impl AppDb {
                 job.completed_at,
                 job.duration_ms.map(|value| value as i64),
                 job.result_count as i64,
+                serde_json::to_string(&job.usage)?,
             ],
         )?;
         Ok(())
@@ -2254,7 +2262,7 @@ impl AppDb {
         let mut stmt = conn.prepare(
             "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
                     provider,model,NULL,NULL,NULL,queued_at,processing_started_at,
-                    completed_at,duration_ms,result_count
+                    completed_at,duration_ms,result_count,usage_json
              FROM analysis_jobs
              ORDER BY queued_at DESC, started_at DESC
              LIMIT ?1",
@@ -2268,7 +2276,7 @@ impl AppDb {
         conn.query_row(
             "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
                     provider,model,system_prompt,user_prompt,response,queued_at,
-                    processing_started_at,completed_at,duration_ms,result_count
+                    processing_started_at,completed_at,duration_ms,result_count,usage_json
              FROM analysis_jobs WHERE id=?1",
             params![id],
             analysis_job_from_row,
@@ -2311,18 +2319,19 @@ impl AppDb {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE analysis_jobs
-             SET provider=?1,model=?2,system_prompt=?3,user_prompt=?4,response=NULL,result_count=0
+             SET provider=?1,model=?2,system_prompt=?3,user_prompt=?4,response=NULL,
+                 result_count=0,usage_json='{}'
              WHERE id=?5",
             params![provider, model, system_prompt, user_prompt, id],
         )?;
         Ok(())
     }
 
-    pub fn record_analysis_job_response(&self, id: &str, response: &str) -> Result<()> {
+    pub fn record_analysis_job_response(&self, id: &str, response: &str, usage: &AiUsage) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE analysis_jobs SET response=?1 WHERE id=?2",
-            params![response, id],
+            "UPDATE analysis_jobs SET response=?1,usage_json=?2 WHERE id=?3",
+            params![response, serde_json::to_string(usage)?, id],
         )?;
         Ok(())
     }
@@ -2355,7 +2364,7 @@ impl AppDb {
         let job = conn.query_row(
             "SELECT id,chunk_ids_json,started_at,ended_at,mode,retry_count,status,error,
                     provider,model,system_prompt,user_prompt,response,queued_at,
-                    processing_started_at,completed_at,duration_ms,result_count
+                    processing_started_at,completed_at,duration_ms,result_count,usage_json
              FROM analysis_jobs WHERE status='pending'
              ORDER BY queued_at ASC, started_at ASC LIMIT 1",
             [],
@@ -3319,6 +3328,10 @@ fn analysis_job_from_row(row: &Row<'_>) -> rusqlite::Result<AnalysisJob> {
             .get::<_, Option<i64>>(16)?
             .map(|value| value.max(0) as u64),
         result_count: row.get::<_, i64>(17)?.max(0) as u32,
+        usage: row
+            .get::<_, Option<String>>(18)?
+            .map(|value| parse_json(&value))
+            .unwrap_or_default(),
     })
 }
 
@@ -5621,6 +5634,7 @@ mod tests {
             completed_at: None,
             duration_ms: None,
             result_count: 0,
+            usage: AiUsage::default(),
         })
         .expect("create job");
 
@@ -5643,7 +5657,16 @@ mod tests {
             "user prompt",
         )
         .expect("record request");
-        db.record_analysis_job_response(&claimed.id, "{\"results\":[]}")
+        let usage = AiUsage {
+            input_tokens: 1_200,
+            cached_input_tokens: 500,
+            output_tokens: 80,
+            reasoning_output_tokens: 32,
+            total_tokens: 1_280,
+            cost_usd: None,
+            cost_note: Some("当前 Codex 账号未返回单次金额".into()),
+        };
+        db.record_analysis_job_response(&claimed.id, "{\"results\":[]}", &usage)
             .expect("record response");
         db.set_analysis_job_result_count(&claimed.id, 2)
             .expect("record result count");
@@ -5661,6 +5684,9 @@ mod tests {
         assert_eq!(detail.user_prompt.as_deref(), Some("user prompt"));
         assert_eq!(detail.response.as_deref(), Some("{\"results\":[]}"));
         assert_eq!(detail.result_count, 2);
+        assert_eq!(detail.usage.total_tokens, 1_280);
+        assert_eq!(detail.usage.cached_input_tokens, 500);
+        assert_eq!(detail.usage.cost_note.as_deref(), Some("当前 Codex 账号未返回单次金额"));
         assert!(detail.completed_at.is_some());
         assert!(detail.duration_ms.is_some());
 
@@ -5706,6 +5732,7 @@ mod tests {
                 completed_at: Some(queued_at.clone()),
                 duration_ms: None,
                 result_count: 0,
+                usage: AiUsage::default(),
             })
             .expect("create analysis job");
         }
@@ -5759,6 +5786,7 @@ mod tests {
             completed_at: None,
             duration_ms: None,
             result_count: 0,
+            usage: AiUsage::default(),
         })
         .expect("insert legacy empty job");
         drop(db);
