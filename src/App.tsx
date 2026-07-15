@@ -1505,6 +1505,19 @@ function TodayView({
   const [timelineZoom, setTimelineZoom] = useState(DEFAULT_TIMELINE_ZOOM);
   const [showDetailedSegments, setShowDetailedSegments] = useState(false);
   const review = sessions.filter(needsReview).slice(0, 4);
+  const distributionRank = (category: string) => category === '无效'
+    ? 2
+    : category === '离开' || category === idleCategory
+      ? 1
+      : 0;
+  const distributionRows = stats.categories
+    .filter((item) => item.minutes > 0)
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => (
+      distributionRank(left.item.category) - distributionRank(right.item.category)
+      || left.index - right.index
+    ))
+    .map(({ item }) => item);
   const allProjectRows = projectBreakdown(sessions, selectedDate).filter((row) => (
     Boolean(row.id)
     && row.category !== '无效'
@@ -1548,41 +1561,39 @@ function TodayView({
                 ))}
             </div>
             <div className="distribution-list">
-              {stats.categories
-                .filter((item) => item.minutes > 0)
-                .map((item) => (
-                  <button
-                    key={item.category}
-                    className="distribution-row"
-                    onClick={() => setSelectedCategory(item.category)}
-                    type="button"
-                  >
+              {distributionRows.map((item) => (
+                <button
+                  key={item.category}
+                  className="distribution-row"
+                  onClick={() => setSelectedCategory(item.category)}
+                  type="button"
+                >
+                  <span
+                    className="legend-dot"
+                    style={{ background: categoryColor(item.category) }}
+                  />
+                  <strong>{item.category}</strong>
+                  <div className="mini-track">
                     <span
-                      className="legend-dot"
-                      style={{ background: categoryColor(item.category) }}
-                    />
-                    <strong>{item.category}</strong>
-                    <div className="mini-track">
-                      <span
-                        style={
-                          {
-                            width: `${Math.max(
-                              3,
-                              Math.round(
-                                (item.minutes /
-                                  Math.max(1, stats.activeMinutes + stats.idleMinutes)) *
-                                  100,
-                              ),
-                            )}%`,
-                            background: categoryColor(item.category),
-                          }
+                      style={
+                        {
+                          width: `${Math.max(
+                            3,
+                            Math.round(
+                              (item.minutes /
+                                Math.max(1, stats.activeMinutes + stats.idleMinutes)) *
+                                100,
+                            ),
+                          )}%`,
+                          background: categoryColor(item.category),
                         }
-                      />
-                    </div>
-                    <b>{formatDuration(item.minutes)}</b>
-                    <ChevronRight size={15} />
-                  </button>
-                ))}
+                      }
+                    />
+                  </div>
+                  <b>{formatDuration(item.minutes)}</b>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
             </div>
           </>
         )}
@@ -1607,9 +1618,6 @@ function TodayView({
                   type="button"
                 >
                   <div className="project-investment-head">
-                    <span className="project-mark" style={{ '--project-color': color } as CSSProperties}>
-                      <FolderKanban size={15} />
-                    </span>
                     <div>
                       <strong>{row.name}</strong>
                       <span>{row.category}</span>

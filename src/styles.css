@@ -507,19 +507,9 @@ kbd {
 .project-investment:disabled { cursor: default; opacity: 1; }
 .project-investment-head {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
-}
-.project-mark {
-  width: 28px;
-  height: 28px;
-  display: grid;
-  place-items: center;
-  color: var(--project-color);
-  border: 1px solid color-mix(in srgb, var(--project-color) 26%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--project-color) 11%, transparent);
 }
 .project-investment-head div { min-width: 0; }
 .project-investment-head strong, .project-investment-head span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
