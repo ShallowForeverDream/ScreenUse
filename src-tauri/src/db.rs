@@ -2250,6 +2250,29 @@ impl AppDb {
         .map_err(Into::into)
     }
 
+    pub fn delete_skipped_analysis_job(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let deleted = conn.execute(
+            "DELETE FROM analysis_jobs WHERE id=?1 AND status='skipped'",
+            params![id],
+        )?;
+        if deleted > 0 {
+            return Ok(());
+        }
+
+        let status = conn
+            .query_row(
+                "SELECT status FROM analysis_jobs WHERE id=?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if status.is_some() {
+            bail!("只能删除未调用 AI 的复核记录");
+        }
+        bail!("复核记录不存在或已删除")
+    }
+
     pub fn record_analysis_job_request(
         &self,
         id: &str,
@@ -5374,6 +5397,68 @@ mod tests {
         assert_eq!(detail.result_count, 2);
         assert!(detail.completed_at.is_some());
         assert!(detail.duration_ms.is_some());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn only_skipped_analysis_jobs_can_be_deleted() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-job-delete-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let queued_at = now();
+        for (id, status) in [("skipped-job", "skipped"), ("completed-job", "completed")] {
+            db.create_analysis_job(&AnalysisJob {
+                id: id.into(),
+                chunk_ids: vec![format!("{id}-session")],
+                metadata_range: TimeRange {
+                    started_at: queued_at.clone(),
+                    ended_at: queued_at.clone(),
+                },
+                mode: "metadata-context-review".into(),
+                provider: if status == "completed" {
+                    "codex-account".into()
+                } else {
+                    String::new()
+                },
+                model: if status == "completed" {
+                    "gpt-5.4".into()
+                } else {
+                    String::new()
+                },
+                retry_count: 0,
+                status: status.into(),
+                error: None,
+                system_prompt: None,
+                user_prompt: None,
+                response: None,
+                queued_at: queued_at.clone(),
+                processing_started_at: None,
+                completed_at: Some(queued_at.clone()),
+                duration_ms: None,
+                result_count: 0,
+            })
+            .expect("create analysis job");
+        }
+
+        db.delete_skipped_analysis_job("skipped-job")
+            .expect("delete skipped job");
+        assert!(db
+            .get_analysis_job("skipped-job")
+            .expect("load deleted job")
+            .is_none());
+
+        let error = db
+            .delete_skipped_analysis_job("completed-job")
+            .expect_err("completed job must remain");
+        assert!(error.to_string().contains("只能删除未调用 AI"));
+        assert!(db
+            .get_analysis_job("completed-job")
+            .expect("load completed job")
+            .is_some());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

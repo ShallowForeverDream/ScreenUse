@@ -920,6 +920,14 @@ kbd {
 .project-search input { min-height: 38px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .project-search input:focus { border: 0; box-shadow: none; }
 .project-search button { width: 29px; height: 29px; padding: 0; border-color: transparent; background: transparent; }
+.project-range-toolbar { margin: -2px 0 13px; display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+.project-range-tabs { min-width: 0; padding: 3px; display: flex; gap: 2px; overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-subtle); scrollbar-width: none; }
+.project-range-tabs::-webkit-scrollbar { display: none; }
+.project-range-tabs button { min-height: 29px; padding: 5px 9px; flex: 0 0 auto; border-color: transparent; border-radius: 8px; color: var(--muted); background: transparent; font-size: 11px; transform: none; }
+.project-range-tabs button:hover:not(:disabled) { border-color: transparent; color: var(--text); background: var(--control-hover); transform: none; }
+.project-range-tabs button.active { color: var(--text-strong); border-color: var(--border-strong); background: var(--panel-solid); box-shadow: 0 2px 8px rgba(53, 34, 65, .06); }
+.zero-project-toggle { min-height: 35px; padding: 6px 9px; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.zero-project-toggle.active { color: var(--accent-text); border-color: color-mix(in srgb, var(--blue-strong) 28%, var(--border)); background: color-mix(in srgb, var(--blue-strong) 7%, var(--control)); }
 .project-category-groups { display: grid; gap: 17px; }
 .project-category-group { min-width: 0; }
 .project-category-group > header {
@@ -1292,6 +1300,9 @@ kbd {
 .category-session-main small { margin-top: 3px; color: var(--subtle); font-size: 11px; }
 .category-session-app { color: var(--muted); font-size: 11px; }
 .category-session-open > svg { color: var(--subtle); }
+.category-detail.show-session-date .category-session-open { grid-template-columns: 112px minmax(0, 1fr) minmax(90px, 150px) 17px; }
+.category-detail.show-session-date .category-session-time strong { font-size: 11px; white-space: nowrap; }
+.category-detail.show-session-date .category-session-time small { white-space: nowrap; }
 .project-picker { display: grid; gap: 7px; }
 .project-picker-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .project-picker-actions.single { grid-template-columns: 1fr; }
@@ -1618,7 +1629,9 @@ kbd {
 .ai-job-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .ai-job-detail-head h2 { margin: 8px 0 4px; color: var(--text-strong); font-size: 19px; }
 .ai-job-detail-head p { margin: 0; color: var(--muted); font-size: 11px; }
-.ai-job-detail-head > code { padding: 5px 7px; border-radius: 7px; color: var(--subtle); background: var(--surface-subtle); font-size: 10px; }
+.ai-job-detail-tools { display: flex; align-items: center; gap: 7px; }
+.ai-job-detail-tools button { min-height: 31px; padding: 6px 8px; display: inline-flex; align-items: center; gap: 5px; font-size: 10px; white-space: nowrap; }
+.ai-job-detail-tools code { padding: 5px 7px; border-radius: 7px; color: var(--subtle); background: var(--surface-subtle); font-size: 10px; }
 .ai-job-facts { margin-top: 17px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; }
 .ai-job-facts > div { min-width: 0; padding: 9px 10px; border-radius: 11px; background: var(--surface-subtle); }
 .ai-job-facts span, .ai-job-facts strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1685,6 +1698,10 @@ kbd {
   .evidence-row { display: none; }
   .timeline-aside { grid-template-columns: 1fr; }
   .project-grid, .project-edit-fields, .field-grid, .data-actions, .project-create-row, .modal .field-grid, .correction-options { grid-template-columns: 1fr; }
+  .project-range-toolbar { align-items: stretch; flex-direction: column; }
+  .project-range-tabs { width: 100%; }
+  .project-range-tabs button { flex: 1 0 auto; }
+  .zero-project-toggle { justify-content: center; }
   .theme-selector { grid-template-columns: 1fr; }
   .sync-overview, .sync-columns { grid-template-columns: 1fr; }
   .sync-bottom { align-items: stretch; flex-direction: column; }

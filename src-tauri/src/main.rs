@@ -252,6 +252,11 @@ fn get_analysis_job(
 }
 
 #[tauri::command]
+fn delete_analysis_job(state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_skipped_analysis_job(&id).map_err(map_err)
+}
+
+#[tauri::command]
 async fn run_analysis_once(state: State<'_, AppState>) -> Result<bool, String> {
     let has_pending = state.db.queue_health().map_err(map_err)?.pending > 0;
     if !has_pending {
@@ -525,6 +530,7 @@ fn main() {
             retry_failed_jobs,
             list_analysis_jobs,
             get_analysis_job,
+            delete_analysis_job,
             run_analysis_once,
             compact_sessions,
             learn_rule_from_session,

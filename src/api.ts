@@ -108,6 +108,10 @@ export const api = {
   retryFailedJobs: () => call<number>('retry_failed_jobs', undefined, 0),
   listAnalysisJobs: (limit = 200) => call<AnalysisJob[]>('list_analysis_jobs', { limit }, []),
   getAnalysisJob: (id: string) => call<AnalysisJob | null>('get_analysis_job', { id }, null),
+  deleteAnalysisJob: async (id: string) => {
+    if (!isTauri()) return;
+    await call<void>('delete_analysis_job', { id });
+  },
   runAnalysisOnce: () => call<boolean>('run_analysis_once', undefined, false),
   compactSessions: () => call<number>('compact_sessions', undefined, 0),
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),

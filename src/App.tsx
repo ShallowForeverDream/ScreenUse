@@ -25,6 +25,7 @@ import {
   Copy,
   Database,
   Download,
+  EyeOff,
   FolderKanban,
   HardDrive,
   Github,
@@ -109,6 +110,17 @@ const DEFAULT_TIMELINE_ZOOM = 2;
 const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD = 0.8;
 const TASK_CHART_COLORS = ['#8b5cf6', '#60a5fa', '#ec4899', '#22c55e', '#f59e0b', '#06b6d4', '#f97316', '#a3e635'];
 const MAX_TIMELINE_GAP_SNAP_SECONDS = 10;
+
+type ProjectRange = 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all';
+
+const PROJECT_RANGE_OPTIONS: { id: ProjectRange; label: string }[] = [
+  { id: 'today', label: '今天' },
+  { id: 'week', label: '本周' },
+  { id: 'month', label: '本月' },
+  { id: 'quarter', label: '本季度' },
+  { id: 'year', label: '本年' },
+  { id: 'all', label: '全部' },
+];
 
 function normalizeTheme(value: unknown): ThemeMode {
   return value === 'system' || value === 'light' || value === 'dark' ? value : 'light';
@@ -864,7 +876,7 @@ export default function App() {
           <ProjectsView
             projects={data.projects}
             tasks={data.tasks}
-            sessions={daySessions}
+            sessions={data.sessions}
             selectedDate={selectedDate}
             runAction={runAction}
             categoryOptions={data.categoryOptions}
@@ -993,6 +1005,7 @@ function AiReviewView({
   const [filter, setFilter] = useState<AiJobFilter>('all');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const confirmation = useConfirmation();
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -1045,6 +1058,28 @@ function AiReviewView({
       await runAction(action, message);
       await refresh(true);
       if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
+    } catch {
+      // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteSkippedJob = async () => {
+    if (!detail || detail.status !== 'skipped' || busy) return;
+    const accepted = await confirmation.confirm({
+      title: '删除这条未调用 AI 的记录？',
+      detail: `只删除复核历史，不会删除其中 ${detail.chunkIds.length} 个原始时间段。`,
+    });
+    if (!accepted) return;
+
+    const deletedId = detail.id;
+    setBusy(true);
+    try {
+      await runAction(() => api.deleteAnalysisJob(deletedId), '未调用 AI 的复核记录已删除');
+      setDetail(null);
+      setSelectedId(null);
+      await refresh(true);
     } catch {
       // runAction already surfaces the backend message in the app toast.
     } finally {
@@ -1148,7 +1183,19 @@ function AiReviewView({
                   <h2>{detail.chunkIds.length} 个时间段的上下文复核</h2>
                   <p>{formatAiDateTime(detail.metadataRange.startedAt)} — {formatAiDateTime(detail.metadataRange.endedAt)}</p>
                 </div>
-                <code>{detail.id.slice(0, 8)}</code>
+                <div className="ai-job-detail-tools">
+                  {detail.status === 'skipped' && (
+                    <button
+                      className="danger-button"
+                      disabled={busy}
+                      onClick={() => void deleteSkippedJob()}
+                      type="button"
+                    >
+                      <Trash2 size={14} />删除记录
+                    </button>
+                  )}
+                  <code>{detail.id.slice(0, 8)}</code>
+                </div>
               </header>
 
               <div className="ai-job-facts">
@@ -1208,6 +1255,7 @@ function AiReviewView({
           )}
         </div>
       </section>
+      {confirmation.dialog}
     </div>
   );
 }
@@ -1889,6 +1937,22 @@ function DayActivityTimeline({
       const now = performance.now();
       if (now - wheelAtRef.current < 80 || event.deltaY === 0) return;
       wheelAtRef.current = now;
+      if (event.deltaY < 0) {
+        const bounds = element.getBoundingClientRect();
+        const pointerX = Math.min(
+          element.clientWidth,
+          Math.max(0, event.clientX - bounds.left),
+        );
+        centerRef.current = {
+          date: selectedDate,
+          seconds: (element.scrollLeft + pointerX) / pixelsPerSecond,
+        };
+      } else {
+        centerRef.current = {
+          date: selectedDate,
+          seconds: (element.scrollLeft + element.clientWidth / 2) / pixelsPerSecond,
+        };
+      }
       onZoomChange(Math.max(
         0,
         Math.min(TIMELINE_SCALES.length - 1, zoom + (event.deltaY < 0 ? 1 : -1)),
@@ -1896,7 +1960,7 @@ function DayActivityTimeline({
     };
     element.addEventListener('wheel', handleWheel, { passive: false });
     return () => element.removeEventListener('wheel', handleWheel);
-  }, [onZoomChange, zoom]);
+  }, [onZoomChange, pixelsPerSecond, selectedDate, zoom]);
 
   const axisLabelPadding = 34;
   const firstVisiblePixel = viewport.left > 0 ? viewport.left + axisLabelPadding : 0;
@@ -2230,6 +2294,8 @@ function CategoryDetailModal({
   selectedDate,
   title,
   contextLabel,
+  durationForSession,
+  showDate = false,
   onClose,
   onEdit,
 }: {
@@ -2238,6 +2304,8 @@ function CategoryDetailModal({
   selectedDate: string;
   title?: string;
   contextLabel?: string;
+  durationForSession?: (session: WorkSession) => number;
+  showDate?: boolean;
   onClose: () => void;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
@@ -2247,7 +2315,9 @@ function CategoryDetailModal({
   );
   const selectedSessions = sorted.filter((session) => selected.has(session.id));
   const total = sorted.reduce(
-    (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
+    (sum, session) => sum + (durationForSession
+      ? durationForSession(session)
+      : sessionMinutesOnDate(session, selectedDate)),
     0,
   );
   const allSelected = sorted.length > 0 && selected.size === sorted.length;
@@ -2274,7 +2344,7 @@ function CategoryDetailModal({
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
     }}>
-      <section className="modal category-detail" role="dialog" aria-modal="true" aria-label={`${heading}时间段`}>
+      <section className={`modal category-detail ${showDate ? 'show-session-date' : ''}`} role="dialog" aria-modal="true" aria-label={`${heading}时间段`}>
         <div className="modal-head category-detail-head">
           <div className="category-detail-title">
             <span style={{ background: categoryColor(category) }} />
@@ -2318,7 +2388,7 @@ function CategoryDetailModal({
         </div>
         <div className="category-session-list">
           {!sorted.length && (
-            <EmptyState title="当天没有时间段" detail="切换日期后可查看该项目或任务的其他记录。" />
+            <EmptyState title="所选区间没有时间段" detail="切换统计范围后可查看该项目或任务的其他记录。" />
           )}
           {sorted.map((session) => (
             <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
@@ -2332,8 +2402,8 @@ function CategoryDetailModal({
               </label>
               <button className="category-session-open" onClick={() => editSession(session)} type="button">
               <span className="category-session-time">
-                  <strong>{formatTimelineClock(session.startedAt, true)}</strong>
-                  <small>{formatTimelineClock(session.endedAt, true)}</small>
+                  <strong>{formatSessionMoment(session.startedAt, showDate)}</strong>
+                  <small>{formatSessionMoment(session.endedAt, showDate)}</small>
               </span>
               <span className="category-session-main">
                 <strong>{session.summary}</strong>
@@ -2665,29 +2735,67 @@ function ProjectsView({
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [busyTaskId, setBusyTaskId] = useState('');
   const [query, setQuery] = useState('');
+  const [projectRange, setProjectRange] = useState<ProjectRange>('week');
+  const [hideZeroProjects, setHideZeroProjects] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
   const [sessionDetail, setSessionDetail] = useState<
     { kind: 'project' | 'task' | 'unassigned'; id: string } | null
   >(null);
   const confirmation = useConfirmation();
-  const rows = projectBreakdown(sessions, selectedDate);
-  const minutesByProject = new Map(rows.map((row) => [row.id, row.minutes]));
-  const tasksByProject = groupBy(tasks, (task) => task.projectId);
+  const rangeBounds = useMemo(
+    () => projectRangeBounds(projectRange, selectedDate),
+    [projectRange, selectedDate],
+  );
+  const rangeLabel = PROJECT_RANGE_OPTIONS.find((item) => item.id === projectRange)?.label || '本周';
+  const rangeSessions = useMemo(
+    () => sessions.filter((session) => sessionMinutesInRange(session, rangeBounds) > 0),
+    [rangeBounds, sessions],
+  );
+  const minutesByProject = useMemo(() => {
+    const result = new Map<string, number>();
+    for (const session of rangeSessions) {
+      if (!session.projectId) continue;
+      result.set(
+        session.projectId,
+        (result.get(session.projectId) || 0) + sessionMinutesInRange(session, rangeBounds),
+      );
+    }
+    return result;
+  }, [rangeBounds, rangeSessions]);
+  const taskStats = useMemo(() => {
+    const result = new Map<string, { count: number; minutes: number }>();
+    for (const session of rangeSessions) {
+      if (!session.taskId) continue;
+      const current = result.get(session.taskId) || { count: 0, minutes: 0 };
+      current.count += 1;
+      current.minutes += sessionMinutesInRange(session, rangeBounds);
+      result.set(session.taskId, current);
+    }
+    return result;
+  }, [rangeBounds, rangeSessions]);
+  const tasksByProject = useMemo(() => groupBy(tasks, (task) => task.projectId), [tasks]);
   const needle = normalizeSearchText(query);
-  const visibleProjects = projects.filter((project) => !needle || normalizeSearchText([
-    project.name,
-    project.category,
-    project.description,
-    ...(tasksByProject.get(project.id) || []).map((task) => task.title),
-  ].filter(Boolean).join(' ')).includes(needle));
+  const visibleProjects = projects.filter((project) => {
+    const matchesSearch = !needle || normalizeSearchText([
+      project.name,
+      project.category,
+      project.description,
+      ...(tasksByProject.get(project.id) || []).map((task) => task.title),
+    ].filter(Boolean).join(' ')).includes(needle);
+    return matchesSearch && (!hideZeroProjects || (minutesByProject.get(project.id) || 0) > 0);
+  });
+  const maxProjectMinutes = Math.max(1, ...minutesByProject.values());
   const categoryOrder = new Map(categoryOptions.map((item, index) => [item.name, index]));
   const projectGroups = [...groupBy(visibleProjects, (project) => project.category).entries()]
     .map(([groupCategory, groupProjects]) => ({
       category: groupCategory,
       color: categoryOptions.find((item) => item.name === groupCategory)?.color
         || categoryColor(groupCategory),
-      projects: groupProjects,
+      projects: [...groupProjects].sort((left, right) => (
+        (minutesByProject.get(right.id) || 0) - (minutesByProject.get(left.id) || 0)
+        || left.name.localeCompare(right.name, 'zh-CN')
+      )),
       minutes: groupProjects.reduce(
         (sum, project) => sum + (minutesByProject.get(project.id) || 0),
         0,
@@ -2698,13 +2806,19 @@ function ProjectsView({
       - (categoryOrder.get(right.category) ?? Number.MAX_SAFE_INTEGER)
       || left.category.localeCompare(right.category, 'zh-CN')
     ));
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) || visibleProjects[0] || projects[0];
-  const selectedTasks = selectedProject ? tasksByProject.get(selectedProject.id) || [] : [];
+  const selectedProject = visibleProjects.find((project) => project.id === selectedProjectId)
+    || visibleProjects[0];
+  const selectedTasks = selectedProject
+    ? [...(tasksByProject.get(selectedProject.id) || [])].sort((left, right) => (
+        (taskStats.get(right.id)?.minutes || 0) - (taskStats.get(left.id)?.minutes || 0)
+        || left.title.localeCompare(right.title, 'zh-CN')
+      ))
+    : [];
   const unassignedSessions = selectedProject
-    ? sessions.filter((session) => session.projectId === selectedProject.id && !session.taskId)
+    ? rangeSessions.filter((session) => session.projectId === selectedProject.id && !session.taskId)
     : [];
   const unassignedMinutes = unassignedSessions.reduce(
-    (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
+    (sum, session) => sum + sessionMinutesInRange(session, rangeBounds),
     0,
   );
   const detailTask = sessionDetail?.kind === 'task'
@@ -2716,25 +2830,30 @@ function ProjectsView({
       ? projects.find((project) => project.id === detailTask.projectId)
       : undefined;
   const detailSessions = sessionDetail?.kind === 'task'
-    ? sessions.filter((session) => session.taskId === sessionDetail.id)
+    ? rangeSessions.filter((session) => session.taskId === sessionDetail.id)
     : sessionDetail?.kind === 'unassigned'
-      ? sessions.filter((session) => session.projectId === sessionDetail.id && !session.taskId)
+      ? rangeSessions.filter((session) => session.projectId === sessionDetail.id && !session.taskId)
     : sessionDetail?.kind === 'project'
-      ? sessions.filter((session) => session.projectId === sessionDetail.id)
+      ? rangeSessions.filter((session) => session.projectId === sessionDetail.id)
       : [];
 
   useEffect(() => {
     if (focusProjectId && projects.some((project) => project.id === focusProjectId)) {
+      setQuery('');
+      setHideZeroProjects(false);
       setSelectedProjectId(focusProjectId);
     }
-  }, [focusProjectId, projects]);
+  }, [focusProjectId]);
 
   useEffect(() => {
-    if (!selectedProjectId && projects[0]) setSelectedProjectId(projects[0].id);
-    if (selectedProjectId && !projects.some((project) => project.id === selectedProjectId)) {
-      setSelectedProjectId(projects[0]?.id || '');
+    if (!visibleProjects.length) {
+      if (selectedProjectId) setSelectedProjectId('');
+      return;
     }
-  }, [projects, selectedProjectId]);
+    if (!visibleProjects.some((project) => project.id === selectedProjectId)) {
+      setSelectedProjectId(visibleProjects[0].id);
+    }
+  }, [selectedProjectId, visibleProjects]);
 
   const createProject = async () => {
     const projectName = name.trim();
@@ -2800,7 +2919,7 @@ function ProjectsView({
       <section className="panel">
         <PanelTitle
           title="项目账本"
-          subtitle={`${projects.length} 个项目 · 点击卡片查看和管理任务`}
+          subtitle={`${rangeLabel} · 显示 ${visibleProjects.length}/${projects.length} 个项目`}
           action={(
             <button className="primary" onClick={() => setCreating((current) => !current)} type="button" aria-expanded={creating}>
               <Plus size={15} />新建项目
@@ -2811,6 +2930,30 @@ function ProjectsView({
           <Search size={16} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或任务" />
           {query && <button onClick={() => setQuery('')} type="button" aria-label="清空项目搜索"><X size={14} /></button>}
+        </div>
+        <div className="project-range-toolbar">
+          <div className="project-range-tabs" role="radiogroup" aria-label="项目统计时间范围">
+            {PROJECT_RANGE_OPTIONS.map((item) => (
+              <button
+                aria-checked={projectRange === item.id}
+                className={projectRange === item.id ? 'active' : ''}
+                key={item.id}
+                onClick={() => setProjectRange(item.id)}
+                role="radio"
+                type="button"
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <button
+            aria-pressed={hideZeroProjects}
+            className={`zero-project-toggle ${hideZeroProjects ? 'active' : ''}`}
+            onClick={() => setHideZeroProjects((current) => !current)}
+            type="button"
+          >
+            <EyeOff size={14} />隐藏 0 秒
+          </button>
         </div>
         {creating && (
           <div className="project-create-row">
@@ -2883,7 +3026,7 @@ function ProjectsView({
                           </button>
                         </div>
                       </div>
-                      <div className="project-progress"><span style={{ width: `${Math.min(100, Math.max(4, (minutes / Math.max(1, rows[0]?.minutes || 1)) * 100))}%` }} /></div>
+                      <div className="project-progress"><span style={{ width: `${minutes > 0 ? Math.min(100, Math.max(4, (minutes / maxProjectMinutes) * 100)) : 0}%` }} /></div>
                     </article>
                   );
                 })}
@@ -2891,7 +3034,14 @@ function ProjectsView({
             </section>
           ))}
           {!visibleProjects.length && (
-            <EmptyState title={projects.length ? '没有匹配项目' : '还没有项目'} detail={projects.length ? '换个项目名、分类或任务名试试。' : '打开一个代码工作区或修正一条会话即可自动建立。'} />
+            <EmptyState
+              title={projects.length ? '没有匹配项目' : '还没有项目'}
+              detail={projects.length
+                ? hideZeroProjects
+                  ? `${rangeLabel}没有非零项目，可关闭“隐藏 0 秒”或切换范围。`
+                  : '换个项目名、分类或任务名试试。'
+                : '打开一个代码工作区或修正一条会话即可自动建立。'}
+            />
           )}
         </div>
       </section>
@@ -2899,7 +3049,7 @@ function ProjectsView({
       <section className="panel project-detail-panel">
         <PanelTitle
           title={selectedProject?.name || '项目任务'}
-          subtitle={selectedProject ? `${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
+          subtitle={selectedProject ? `${rangeLabel} · ${selectedProject.category} · ${formatDuration(minutesByProject.get(selectedProject.id) || 0)}` : '先新建一个项目'}
           action={selectedProject ? (
             <div className="project-detail-actions">
               <button
@@ -2961,7 +3111,7 @@ function ProjectsView({
                   >
                     <TimerReset size={15} />
                     <span>{task.title}</span>
-                    <small>{sessions.filter((session) => session.taskId === task.id).length} 段</small>
+                    <small>{taskStats.get(task.id)?.count || 0} 段 · {formatDuration(taskStats.get(task.id)?.minutes || 0)}</small>
                   </button>
                   <button
                     className="task-delete"
@@ -3001,6 +3151,9 @@ function ProjectsView({
               : detailProject.name}
           sessions={detailSessions}
           selectedDate={selectedDate}
+          contextLabel={rangeLabel}
+          durationForSession={(session) => sessionMinutesInRange(session, rangeBounds)}
+          showDate={projectRange !== 'today'}
           onClose={() => setSessionDetail(null)}
           onEdit={onEdit}
         />
@@ -4729,6 +4882,45 @@ function sessionMinutesOnDate(session: WorkSession, dateKey: string) {
   return sessionSecondsOnDate(session, dateKey) / 60;
 }
 
+type ProjectRangeBounds = { startedAt: number; endedAt: number } | null;
+
+function projectRangeBounds(range: ProjectRange, anchorDateKey: string): ProjectRangeBounds {
+  if (range === 'all') return null;
+  const anchor = dateFromKey(anchorDateKey);
+  let startedAt: Date;
+  let endedAt: Date;
+
+  if (range === 'today') {
+    startedAt = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+    endedAt = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 1);
+  } else if (range === 'week') {
+    const mondayOffset = (anchor.getDay() + 6) % 7;
+    startedAt = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - mondayOffset);
+    endedAt = new Date(startedAt.getFullYear(), startedAt.getMonth(), startedAt.getDate() + 7);
+  } else if (range === 'month') {
+    startedAt = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+    endedAt = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1);
+  } else if (range === 'quarter') {
+    const firstMonth = Math.floor(anchor.getMonth() / 3) * 3;
+    startedAt = new Date(anchor.getFullYear(), firstMonth, 1);
+    endedAt = new Date(anchor.getFullYear(), firstMonth + 3, 1);
+  } else {
+    startedAt = new Date(anchor.getFullYear(), 0, 1);
+    endedAt = new Date(anchor.getFullYear() + 1, 0, 1);
+  }
+
+  return { startedAt: startedAt.getTime(), endedAt: endedAt.getTime() };
+}
+
+function sessionMinutesInRange(session: WorkSession, bounds: ProjectRangeBounds) {
+  const sessionStart = new Date(session.startedAt).getTime();
+  const sessionEnd = new Date(session.endedAt).getTime();
+  if (!Number.isFinite(sessionStart) || !Number.isFinite(sessionEnd)) return 0;
+  const startedAt = bounds ? Math.max(sessionStart, bounds.startedAt) : sessionStart;
+  const endedAt = bounds ? Math.min(sessionEnd, bounds.endedAt) : sessionEnd;
+  return Math.max(0, (endedAt - startedAt) / 60_000);
+}
+
 function sessionBoundsOnDate(session: WorkSession, dateKey: string) {
   const dayStart = dateFromKey(dateKey).getTime();
   const dayEnd = dayStart + 24 * 60 * 60 * 1000;
@@ -4810,6 +5002,14 @@ function formatDateTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function formatSessionMoment(value: string, showDate: boolean) {
+  if (!showDate) return formatTimelineClock(value, true);
+  const date = new Date(value);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${month}/${day} ${formatTimelineClock(value, true)}`;
 }
 
 function toDateTimeLocalValue(date: Date) {
