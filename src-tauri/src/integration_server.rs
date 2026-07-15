@@ -69,6 +69,19 @@ fn ingest_payload(path: &str, body: &str) -> Result<()> {
 
 fn browser_context(value: &Value) -> BrowserContext {
     let mut title = value.get("title").and_then(Value::as_str).map(ToOwned::to_owned);
+    let context_title = value
+        .get("contextTitle")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let context_type = value
+        .get("contextType")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if context_title.is_some() {
+        title.clone_from(&context_title);
+    }
     let mut url = value.get("url").and_then(Value::as_str).map(ToOwned::to_owned);
     let mut tab_id = value.get("tabId").and_then(Value::as_i64);
     let mut window_id = value.get("windowId").and_then(Value::as_i64);
@@ -113,6 +126,8 @@ fn browser_context(value: &Value) -> BrowserContext {
         event_id: cap(&event_id, 200),
         browser: cap(&browser, 80),
         title: title.map(|value| cap(&value, 320)),
+        context_title: context_title.map(|value| cap(&value, 320)),
+        context_type: context_type.map(|value| cap(&value, 80)),
         url: url.map(|value| cap(&value, 1200)),
         tab_id,
         window_id,
@@ -189,5 +204,21 @@ mod tests {
         }));
         assert_eq!(context.tab_id, Some(3));
         assert_eq!(context.title.as_deref(), Some("ScreenUse"));
+    }
+
+    #[test]
+    fn keeps_the_selected_chatgpt_conversation_title() {
+        let context = browser_context(&json!({
+            "title": "ICPC刷题网站功能需求",
+            "tabTitle": "ChatGPT",
+            "contextTitle": "ICPC刷题网站功能需求",
+            "contextType": "chatgpt-conversation",
+            "url": "https://chatgpt.com/c/current-id",
+            "tabId": 3,
+            "windowId": 1
+        }));
+        assert_eq!(context.title.as_deref(), Some("ICPC刷题网站功能需求"));
+        assert_eq!(context.context_title.as_deref(), Some("ICPC刷题网站功能需求"));
+        assert_eq!(context.context_type.as_deref(), Some("chatgpt-conversation"));
     }
 }

@@ -561,14 +561,42 @@ fn validate_batch(batch: &mut AiAttributionBatch, input: &AiReviewInput<'_>) -> 
         .map(|session| session.id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let mut returned = std::collections::HashSet::new();
-    for result in &mut batch.results {
-        if !expected.contains(result.session_id.as_str()) || !returned.insert(result.session_id.clone()) {
-            return Err(anyhow!("AI returned an unexpected or duplicate sessionId"));
+    let mut normalized = Vec::with_capacity(expected.len());
+    let mut unexpected = Vec::new();
+    for result in batch.results.drain(..) {
+        if expected.contains(result.session_id.as_str()) {
+            if returned.insert(result.session_id.clone()) {
+                normalized.push(result);
+            }
+        } else {
+            unexpected.push(result);
         }
-        validate_result(result, input)?;
     }
+    let mut missing = expected
+        .iter()
+        .filter(|session_id| !returned.contains(**session_id))
+        .copied()
+        .collect::<Vec<_>>();
+    for mut result in unexpected {
+        let candidates = missing
+            .iter()
+            .copied()
+            .filter(|session_id| session_id_typo_distance(&result.session_id, session_id) <= 1)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(anyhow!("AI returned an unexpected sessionId"));
+        }
+        result.session_id = candidates[0].to_string();
+        returned.insert(result.session_id.clone());
+        missing.retain(|session_id| *session_id != candidates[0]);
+        normalized.push(result);
+    }
+    batch.results = normalized;
     if returned.len() != expected.len() {
         return Err(anyhow!("AI did not return every target session"));
+    }
+    for result in &mut batch.results {
+        validate_result(result, input)?;
     }
     batch.results.sort_by_key(|result| {
         input
@@ -578,6 +606,16 @@ fn validate_batch(batch: &mut AiAttributionBatch, input: &AiReviewInput<'_>) -> 
             .unwrap_or(usize::MAX)
     });
     Ok(())
+}
+
+fn session_id_typo_distance(left: &str, right: &str) -> usize {
+    if left.len() != right.len() {
+        return usize::MAX;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .filter(|(left, right)| left != right)
+        .count()
 }
 
 fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) -> Result<()> {
@@ -748,6 +786,55 @@ mod tests {
         assert_eq!(usage.total_tokens, 1_280);
         assert_eq!(usage.cost_usd, Some(0.0123));
         assert!(usage.cost_note.is_none());
+    }
+
+    #[test]
+    fn repairs_one_character_session_id_typos_and_ignores_exact_duplicates() {
+        let session = |id: &str| WorkSession {
+            id: id.into(),
+            started_at: "2026-07-14T10:00:00Z".into(),
+            ended_at: "2026-07-14T10:02:00Z".into(),
+            project_id: None,
+            project_name: None,
+            task_id: None,
+            task_title: None,
+            category: "杂务".into(),
+            summary: "ChatGPT".into(),
+            confidence: 0.55,
+            evidence: vec![],
+            user_confirmed: false,
+            source: "context-complete".into(),
+        };
+        let first_id = "6c94a876-b1b6-44e2-83ab-bbe8c252f5c6";
+        let second_id = "37d6bb41-0f24-4411-89da-93a481e43510";
+        let targets = vec![session(first_id), session(second_id)];
+        let categories = vec![CategoryOption {
+            name: "杂务".into(),
+            color: "#fff".into(),
+            is_builtin: true,
+        }];
+        let input = sample_input(&targets, &[], &[], &categories, &[], &[]);
+        let result = |session_id: &str| AiAttributionResult {
+            session_id: session_id.into(),
+            project_id: None,
+            task_id: None,
+            category: "杂务".into(),
+            summary: "网页对话".into(),
+            confidence: 0.8,
+            evidence: vec![],
+        };
+        let mut batch = AiAttributionBatch {
+            results: vec![
+                result(first_id),
+                result(first_id),
+                result("37d6bb41-0f24-4411-89da-93a481a43510"),
+            ],
+        };
+
+        validate_batch(&mut batch, &input).expect("repair model session IDs");
+        assert_eq!(batch.results.len(), 2);
+        assert_eq!(batch.results[0].session_id, first_id);
+        assert_eq!(batch.results[1].session_id, second_id);
     }
 
     #[test]

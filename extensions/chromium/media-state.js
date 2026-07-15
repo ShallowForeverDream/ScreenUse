@@ -5,6 +5,12 @@ function videoPlaying() {
 }
 
 let lastState = videoPlaying();
+let lastContextSignature = '';
+let contextCheckScheduled = false;
+
+function pageContext() {
+  return globalThis.ScreenUsePageContext?.readPageContext?.() || null;
+}
 
 function publishIfChanged() {
   const nextState = videoPlaying();
@@ -19,8 +25,39 @@ for (const eventName of ['play', 'playing', 'pause', 'ended', 'emptied', 'stalle
 
 document.addEventListener('visibilitychange', publishIfChanged, true);
 
+function publishContextIfChanged() {
+  contextCheckScheduled = false;
+  const context = pageContext();
+  const signature = `${location.pathname}|${context?.type || ''}|${context?.title || ''}`;
+  if (signature === lastContextSignature) return;
+  lastContextSignature = signature;
+  void chrome.runtime.sendMessage({ type: 'screenuse-page-context-changed', context });
+}
+
+function scheduleContextCheck() {
+  if (contextCheckScheduled) return;
+  contextCheckScheduled = true;
+  setTimeout(publishContextIfChanged, 600);
+}
+
+if (['chatgpt.com', 'www.chatgpt.com', 'chat.openai.com'].includes(location.hostname)) {
+  const observer = new MutationObserver(scheduleContextCheck);
+  const roots = [document.querySelector('nav'), document.querySelector('aside'), document.querySelector('title')]
+    .filter((root, index, items) => root && items.indexOf(root) === index);
+  for (const root of roots) {
+    observer.observe(root, { childList: true, subtree: true, characterData: true });
+  }
+  window.addEventListener('popstate', scheduleContextCheck, true);
+  scheduleContextCheck();
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'screenuse-media-state') return false;
-  sendResponse({ videoPlaying: videoPlaying() });
+  const context = pageContext();
+  sendResponse({
+    videoPlaying: videoPlaying(),
+    contextTitle: context?.title || null,
+    contextType: context?.type || null,
+  });
   return false;
 });

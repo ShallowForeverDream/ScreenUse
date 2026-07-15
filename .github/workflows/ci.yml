@@ -47,7 +47,10 @@ jobs:
         shell: pwsh
         run: |
           node --check extensions/chromium/background.js
+          node --check extensions/chromium/page-context.js
+          node --check extensions/chromium/media-state.js
           node --check extensions/chromium/popup.js
+          node extensions/chromium/page-context.test.cjs
           Get-Content extensions/chromium/manifest.json | ConvertFrom-Json | Out-Null
       - name: Install VS Code extension dependencies
         run: npm install --prefix extensions/vscode --no-audit --no-fund

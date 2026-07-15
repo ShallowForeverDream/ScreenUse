@@ -11,6 +11,8 @@ pub struct BrowserContext {
     pub event_id: String,
     pub browser: String,
     pub title: Option<String>,
+    pub context_title: Option<String>,
+    pub context_type: Option<String>,
     pub url: Option<String>,
     pub tab_id: Option<i64>,
     pub window_id: Option<i64>,
@@ -58,8 +60,24 @@ pub fn enrich_event(event: &mut RawActivityEvent) {
     let app = event.app.as_deref().unwrap_or_default().to_lowercase();
 
     if is_browser_app(&app) && is_fresh(snapshot.browser.updated_at) {
-        if snapshot.browser.title.as_deref().is_some_and(|value| !value.trim().is_empty()) {
-            event.window_title = snapshot.browser.title.clone();
+        let active_title = snapshot
+            .browser
+            .context_title
+            .as_ref()
+            .or(snapshot.browser.title.as_ref())
+            .filter(|value| !value.trim().is_empty())
+            .cloned();
+        if let Some(title) = active_title {
+            event.window_title = Some(title.clone());
+            if !event.metadata.is_object() {
+                event.metadata = json!({});
+            }
+            if let Some(metadata) = event.metadata.as_object_mut() {
+                metadata.insert("activePageTitle".into(), Value::String(title.clone()));
+                if snapshot.browser.context_type.as_deref() == Some("chatgpt-conversation") {
+                    metadata.insert("chatgptConversationTitle".into(), Value::String(title));
+                }
+            }
         }
         if snapshot.browser.url.as_deref().is_some_and(|value| !value.trim().is_empty()) {
             event.url = snapshot.browser.url.clone();
@@ -72,6 +90,8 @@ pub fn enrich_event(event: &mut RawActivityEvent) {
                 "browser": snapshot.browser.browser,
                 "tabId": snapshot.browser.tab_id,
                 "windowId": snapshot.browser.window_id,
+                "contextTitle": snapshot.browser.context_title,
+                "contextType": snapshot.browser.context_type,
                 "audible": snapshot.browser.audible,
                 "videoPlaying": snapshot.browser.video_playing,
             }),
@@ -146,12 +166,14 @@ mod tests {
     use crate::models::InputStats;
 
     #[test]
-    fn enriches_browser_without_persisting_all_tabs() {
+    fn enriches_browser_with_the_selected_chatgpt_conversation() {
         update_browser(BrowserContext {
             event_id: "browser:1".into(),
             browser: "Chromium".into(),
-            title: Some("ScreenUse - GitHub".into()),
-            url: Some("https://github.com/ShallowForeverDream/ScreenUse".into()),
+            title: Some("ChatGPT".into()),
+            context_title: Some("ICPC刷题网站功能需求".into()),
+            context_type: Some("chatgpt-conversation".into()),
+            url: Some("https://chatgpt.com/c/current-id".into()),
             tab_id: Some(2),
             window_id: Some(1),
             audible: false,
@@ -171,7 +193,12 @@ mod tests {
             metadata: json!({}),
         };
         enrich_event(&mut event);
-        assert_eq!(event.url.as_deref(), Some("https://github.com/ShallowForeverDream/ScreenUse"));
+        assert_eq!(event.url.as_deref(), Some("https://chatgpt.com/c/current-id"));
+        assert_eq!(event.window_title.as_deref(), Some("ICPC刷题网站功能需求"));
+        assert_eq!(
+            event.metadata["chatgptConversationTitle"].as_str(),
+            Some("ICPC刷题网站功能需求")
+        );
         assert!(event.metadata.get("browser").is_some());
     }
 }

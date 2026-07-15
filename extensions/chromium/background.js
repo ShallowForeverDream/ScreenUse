@@ -36,20 +36,28 @@ async function readActiveContext() {
 
   const url = compactUrl(tab.url);
   let videoPlaying = false;
+  let contextTitle = null;
+  let contextType = null;
   try {
     const mediaState = await chrome.tabs.sendMessage(tab.id, { type: 'screenuse-media-state' });
     videoPlaying = Boolean(mediaState?.videoPlaying);
+    contextTitle = mediaState?.contextTitle || null;
+    contextType = mediaState?.contextType || null;
   } catch {
     // Browser-internal pages do not run content scripts.
   }
+  const title = contextTitle || tab.title || null;
   return {
     source: 'chromium-extension',
     capturedAt: new Date().toISOString(),
-    eventId: `${currentWindow.id}:${tab.id}:${url || tab.title || ''}`,
+    eventId: `${currentWindow.id}:${tab.id}:${url || title || ''}`,
     browser: browserName(),
     windowId: currentWindow.id,
     tabId: tab.id,
-    title: tab.title || null,
+    title,
+    tabTitle: tab.title || null,
+    contextTitle,
+    contextType,
     url,
     audible: Boolean(tab.audible),
     videoPlaying,
@@ -125,6 +133,11 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'screenuse-media-changed') {
     scheduleSync('media-state-changed', true);
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (message?.type === 'screenuse-page-context-changed') {
+    scheduleSync('page-context-changed', true);
     sendResponse({ ok: true });
     return false;
   }
