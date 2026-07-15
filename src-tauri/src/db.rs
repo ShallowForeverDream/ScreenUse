@@ -150,6 +150,7 @@ impl AppDb {
             data_dir,
         };
         db.migrate()?;
+        db.clear_obsolete_project_descriptions()?;
         db.seed_if_empty()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
@@ -158,6 +159,15 @@ impl AppDb {
         db.repair_session_timeline()?;
         db.compact_sessions()?;
         Ok(db)
+    }
+
+    fn clear_obsolete_project_descriptions(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE projects SET description=NULL WHERE description=?1",
+            params!["在修正归类时手动创建"],
+        )?;
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -904,7 +914,7 @@ impl AppDb {
             category: category.to_string(),
             source: "manual".into(),
             color: category_color,
-            description: Some("在修正归类时手动创建".into()),
+            description: None,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
@@ -4931,6 +4941,7 @@ mod tests {
         let project = db
             .create_project("ICPC", &category.name)
             .expect("create project");
+        assert!(project.description.is_none());
         let task = db
             .create_task(&project.id, "网站开发")
             .expect("create task");
@@ -4953,7 +4964,24 @@ mod tests {
             .find(|item| item.id == project.id)
             .expect("project remains");
         assert_eq!(updated.category, fallback);
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE projects SET description=?1 WHERE id=?2",
+                params!["在修正归类时手动创建", project.id],
+            )
+            .expect("restore obsolete project description");
         drop(db);
+
+        let reopened = AppDb::open_in(data_dir.clone()).expect("reopen test database");
+        let reopened_project = reopened
+            .list_projects()
+            .expect("list reopened projects")
+            .into_iter()
+            .find(|item| item.id == project.id)
+            .expect("reopened project remains");
+        assert!(reopened_project.description.is_none());
+        drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }
 

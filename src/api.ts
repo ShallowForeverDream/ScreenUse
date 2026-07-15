@@ -83,7 +83,7 @@ export const api = {
       category,
       source: 'manual',
       color: '#a78bfa',
-      description: '在修正归类时手动创建',
+      description: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }),

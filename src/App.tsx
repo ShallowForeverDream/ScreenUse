@@ -1985,8 +1985,10 @@ function TodayView({
   onOpenTimeline: () => void;
   planItems: DashboardData['planItems'];
 }) {
+  const [distributionMode, setDistributionMode] = useState<'category' | 'project'>('category');
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedUnclassifiedCategory, setSelectedUnclassifiedCategory] = useState<string | null>(null);
   const [timelineZoom, setTimelineZoom] = useState(DEFAULT_TIMELINE_ZOOM);
   const [showDetailedSegments, setShowDetailedSegments] = useState(false);
   const review = sessions.filter(needsReview).slice(0, 4);
@@ -1995,7 +1997,7 @@ function TodayView({
     : category === '离开' || category === idleCategory
       ? 1
       : 0;
-  const distributionRows = stats.categories
+  const categoryDistributionRows = stats.categories
     .filter((item) => item.minutes > 0)
     .map((item, index) => ({ item, index }))
     .sort((left, right) => (
@@ -2003,14 +2005,36 @@ function TodayView({
       || left.index - right.index
     ))
     .map(({ item }) => item);
-  const allProjectRows = projectBreakdown(sessions, selectedDate).filter((row) => (
-    Boolean(row.id)
-    && row.category !== '无效'
-    && row.category !== '离开'
-    && row.category !== idleCategory
-  ));
-  const projectRows = allProjectRows.slice(0, 6);
-  const projectTotal = allProjectRows.reduce((sum, row) => sum + row.minutes, 0);
+  const projectDistributionRows = projectBreakdown(sessions, selectedDate)
+    .filter((item) => item.minutes > 0)
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => (
+      distributionRank(left.item.category) - distributionRank(right.item.category)
+      || left.index - right.index
+    ))
+    .map(({ item }) => ({
+      ...item,
+      color: projects.find((project) => project.id === item.id)?.color
+        || categoryColor(item.category),
+    }));
+  const visibleDistributionRows = distributionMode === 'category'
+    ? categoryDistributionRows.map((item) => ({
+        key: `category:${item.category}`,
+        label: item.category,
+        category: item.category,
+        minutes: item.minutes,
+        color: categoryColor(item.category),
+        projectId: '',
+      }))
+    : projectDistributionRows.map((item) => ({
+        key: item.id || `unclassified:${item.category}`,
+        label: item.id ? item.name : `${item.name} · ${item.category}`,
+        category: item.category,
+        minutes: item.minutes,
+        color: item.color,
+        projectId: item.id,
+      }));
+  const distributionTotal = visibleDistributionRows.reduce((sum, item) => sum + item.minutes, 0);
   const selectedProject = selectedProjectId
     ? projects.find((project) => project.id === selectedProjectId) || null
     : null;
@@ -2020,25 +2044,54 @@ function TodayView({
 
   return (
     <div className="dashboard-grid">
-      <section className="panel span-2">
-        <PanelTitle title="时间分布" />
+      <section className="panel span-3">
+        <PanelTitle
+          title="时间分布"
+          subtitle={`${visibleDistributionRows.length} 个${distributionMode === 'category' ? '分类' : '项目'} · ${formatDuration(distributionTotal)}`}
+          action={(
+            <div className="distribution-mode-tabs" role="radiogroup" aria-label="时间分布聚合方式">
+              <button
+                aria-checked={distributionMode === 'category'}
+                className={distributionMode === 'category' ? 'active' : ''}
+                onClick={() => setDistributionMode('category')}
+                role="radio"
+                type="button"
+              >
+                分类
+              </button>
+              <button
+                aria-checked={distributionMode === 'project'}
+                className={distributionMode === 'project' ? 'active' : ''}
+                onClick={() => setDistributionMode('project')}
+                role="radio"
+                type="button"
+              >
+                项目
+              </button>
+            </div>
+          )}
+        />
         {stats.activeMinutes === 0 && stats.idleMinutes === 0 ? (
           <EmptyState title="这一天还没有记录" detail="保持 ScreenUse 在托盘运行即可自动出现数据。" />
         ) : (
           <>
-            <div className="distribution-bar" aria-label="分类时间分布">
-              {stats.categories
-                .filter((item) => item.minutes > 0 && item.category !== '离开' && item.category !== idleCategory)
+            <div className="distribution-bar" aria-label={`${distributionMode === 'category' ? '分类' : '项目'}时间分布`}>
+              {visibleDistributionRows
+                .filter((item) => item.category !== '离开' && item.category !== idleCategory)
                 .map((item) => (
                   <button
-                    key={item.category}
-                    title={`${item.category} ${formatDuration(item.minutes)}`}
-                    aria-label={`查看${item.category}的具体时间段`}
-                    onClick={() => setSelectedCategory(item.category)}
+                    key={item.key}
+                    title={`${item.label} ${formatDuration(item.minutes)}`}
+                    aria-label={`查看${item.label}的具体时间段`}
+                    onClick={() => {
+                      if (distributionMode === 'category') setSelectedCategory(item.category);
+                      else if (item.projectId) setSelectedProjectId(item.projectId);
+                      else setSelectedUnclassifiedCategory(item.category);
+                    }}
                     type="button"
                     style={
                       {
-                        '--segment-color': categoryColor(item.category),
+                        '--segment-color': item.color,
                         flexGrow: item.minutes,
                       } as CSSProperties
                     }
@@ -2046,18 +2099,22 @@ function TodayView({
                 ))}
             </div>
             <div className="distribution-list">
-              {distributionRows.map((item) => (
+              {visibleDistributionRows.map((item) => (
                 <button
-                  key={item.category}
-                  className="distribution-row"
-                  onClick={() => setSelectedCategory(item.category)}
+                  key={item.key}
+                  className={`distribution-row ${distributionMode}`}
+                  onClick={() => {
+                    if (distributionMode === 'category') setSelectedCategory(item.category);
+                    else if (item.projectId) setSelectedProjectId(item.projectId);
+                    else setSelectedUnclassifiedCategory(item.category);
+                  }}
                   type="button"
                 >
                   <span
                     className="legend-dot"
-                    style={{ background: categoryColor(item.category) }}
+                    style={{ background: item.color }}
                   />
-                  <strong>{item.category}</strong>
+                  <strong title={item.label}>{item.label}</strong>
                   <div className="mini-track">
                     <span
                       style={
@@ -2066,11 +2123,11 @@ function TodayView({
                             3,
                             Math.round(
                               (item.minutes /
-                                Math.max(1, stats.activeMinutes + stats.idleMinutes)) *
+                                Math.max(1, distributionTotal)) *
                                 100,
                             ),
                           )}%`,
-                          background: categoryColor(item.category),
+                          background: item.color,
                         }
                       }
                     />
@@ -2082,46 +2139,6 @@ function TodayView({
             </div>
           </>
         )}
-      </section>
-
-      <section className="panel">
-        <PanelTitle
-          title="项目投入"
-          subtitle={projectTotal ? `${allProjectRows.length} 个项目 · ${formatDuration(projectTotal)}` : undefined}
-        />
-        <div className="project-investment-list">
-          {projectRows.length ? (
-            projectRows.map((row) => {
-              const project = projects.find((item) => item.id === row.id);
-              const color = project?.color || categoryColor(row.category);
-              const percent = Math.max(2, Math.round((row.minutes / Math.max(1, projectTotal)) * 100));
-              return (
-                <button
-                  className="project-investment"
-                  key={row.id}
-                  onClick={() => setSelectedProjectId(row.id)}
-                  type="button"
-                >
-                  <div className="project-investment-head">
-                    <div>
-                      <strong>{row.name}</strong>
-                      <span>{row.category}</span>
-                    </div>
-                    <b>{formatDuration(row.minutes)}</b>
-                  </div>
-                  <div className="project-progress-row">
-                    <div className="project-progress">
-                      <span style={{ width: `${percent}%`, background: color }} />
-                    </div>
-                    <small>{percent}%</small>
-                  </div>
-                </button>
-              );
-            })
-          ) : (
-            <EmptyState title="暂无项目时间" detail="为时间段选择项目后会在这里显示。" />
-          )}
-        </div>
       </section>
 
       <section className="panel span-3 day-track-panel">
@@ -2237,6 +2254,18 @@ function TodayView({
           selectedDate={selectedDate}
           selectionResetKey={selectionResetKey}
           onClose={() => setSelectedProjectId(null)}
+          onEdit={onEdit}
+        />
+      )}
+      {selectedUnclassifiedCategory && (
+        <CategoryDetailModal
+          category={`未归类 · ${selectedUnclassifiedCategory}`}
+          sessions={sessions.filter((session) => (
+            !session.projectId && session.category === selectedUnclassifiedCategory
+          ))}
+          selectedDate={selectedDate}
+          selectionResetKey={selectionResetKey}
+          onClose={() => setSelectedUnclassifiedCategory(null)}
           onEdit={onEdit}
         />
       )}
@@ -3489,8 +3518,10 @@ function ProjectsView({
   onEdit: (sessions: WorkSession[]) => void;
 }) {
   const [creating, setCreating] = useState(false);
+  const [creatingCategory, setCreatingCategory] = useState(false);
   const [name, setName] = useState('');
   const [category, setCategory] = useState('开发');
+  const [categoryName, setCategoryName] = useState('');
   const [busyProjectId, setBusyProjectId] = useState('');
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [busyTaskId, setBusyTaskId] = useState('');
@@ -3648,9 +3679,26 @@ function ProjectsView({
     }
   }, [selectedProjectId, visibleProjects]);
 
+  useEffect(() => {
+    if (categoryOptions.some((item) => item.name === category)) return;
+    setCategory(categoryOptions[0]?.name || '');
+  }, [category, categoryOptions]);
+
+  const createCategory = async () => {
+    const nextCategoryName = categoryName.trim();
+    if (!nextCategoryName) return;
+    const created = (await runAction(
+      () => api.createCategory(nextCategoryName),
+      `分类“${nextCategoryName}”已创建`,
+    )) as CategoryOption;
+    setCategory(created.name);
+    setCategoryName('');
+    setCreatingCategory(false);
+  };
+
   const createProject = async () => {
     const projectName = name.trim();
-    if (!projectName) return;
+    if (!projectName || !category) return;
     await runAction(() => api.createProject(projectName, category), `项目“${projectName}”已创建`);
     setName('');
     setCreating(false);
@@ -3714,9 +3762,29 @@ function ProjectsView({
           title="项目账本"
           subtitle={`${rangeLabel} · 显示 ${visibleProjects.length}/${projects.length} 个项目`}
           action={(
-            <button className="primary" onClick={() => setCreating((current) => !current)} type="button" aria-expanded={creating}>
-              <Plus size={15} />新建项目
-            </button>
+            <div className="project-header-actions">
+              <button
+                aria-expanded={creatingCategory}
+                onClick={() => {
+                  setCreatingCategory((current) => !current);
+                  setCreating(false);
+                }}
+                type="button"
+              >
+                <Plus size={15} />新建分类
+              </button>
+              <button
+                aria-expanded={creating}
+                className="primary"
+                onClick={() => {
+                  setCreating((current) => !current);
+                  setCreatingCategory(false);
+                }}
+                type="button"
+              >
+                <Plus size={15} />新建项目
+              </button>
+            </div>
           )}
         />
         <div className="project-search">
@@ -3779,6 +3847,30 @@ function ProjectsView({
             <EyeOff size={14} />隐藏 0 秒
           </button>
         </div>
+        {creatingCategory && (
+          <div className="project-create-row category-create-row">
+            <input
+              autoFocus
+              onChange={(event) => setCategoryName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  void createCategory();
+                }
+              }}
+              placeholder="分类名称"
+              value={categoryName}
+            />
+            <button
+              className="primary"
+              disabled={!categoryName.trim()}
+              onClick={() => void createCategory()}
+              type="button"
+            >
+              <Check size={15} />创建分类
+            </button>
+          </div>
+        )}
         {creating && (
           <div className="project-create-row">
             <input
@@ -3796,7 +3888,7 @@ function ProjectsView({
             <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="项目分类">
               {categoryOptions.map((item) => <option key={item.name}>{item.name}</option>)}
             </select>
-            <button className="primary" disabled={!name.trim()} onClick={() => void createProject()} type="button">
+            <button className="primary" disabled={!name.trim() || !category} onClick={() => void createProject()} type="button">
               <Check size={15} />创建
             </button>
           </div>
@@ -3821,7 +3913,10 @@ function ProjectsView({
                       style={{ '--project-color': project.color || group.color } as CSSProperties}
                     >
                       <button className="project-card-main" onClick={() => setSelectedProjectId(project.id)} type="button">
-                        <span><strong>{project.name}</strong><small>{project.description || '个人项目'}</small></span>
+                        <span>
+                          <strong>{project.name}</strong>
+                          <small>{project.description === '在修正归类时手动创建' ? '个人项目' : project.description || '个人项目'}</small>
+                        </span>
                         <ChevronRight size={16} />
                       </button>
                       <div className="project-card-head">
