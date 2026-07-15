@@ -287,8 +287,8 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     pub quick_pause_enabled: bool,
 
-    // AI is optional and disabled by default. "manual" analyzes one uncertain
-    // completed session when explicitly requested; "auto" also processes queued jobs.
+    // AI is optional and disabled by default. When enabled, queued reviews run
+    // sequentially so only one model request is active at a time.
     pub ai_mode: String,
     pub ai_provider: String,
     pub min_ai_session_minutes: u32,
@@ -367,8 +367,9 @@ impl AppSettings {
         }
         .into();
         self.ai_mode = match self.ai_mode.as_str() {
-            "manual" => "manual",
-            "auto" => "auto",
+            // v0.2 briefly exposed a manual mode. Preserve the user's enabled
+            // choice while migrating to the simpler on/off automatic workflow.
+            "manual" | "auto" => "auto",
             _ => "off",
         }
         .into();
@@ -465,6 +466,12 @@ mod tests {
             ..AppSettings::default()
         };
         assert_eq!(review_all.normalized().min_ai_session_minutes, 0);
+
+        let legacy_manual = AppSettings {
+            ai_mode: "manual".into(),
+            ..AppSettings::default()
+        };
+        assert_eq!(legacy_manual.normalized().ai_mode, "auto");
 
         let invalid = AppSettings {
             theme: "unknown".into(),

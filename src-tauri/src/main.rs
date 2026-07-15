@@ -306,6 +306,15 @@ async fn run_analysis_once(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn start_analysis_queue(state: State<'_, AppState>) -> Result<(), String> {
+    if state.db.get_settings().map_err(map_err)?.normalized().ai_mode != "auto" {
+        return Err("请先开启 AI 自动复核".into());
+    }
+    run_optional_ai(state.db.clone());
+    Ok(())
+}
+
+#[tauri::command]
 async fn run_analysis_jobs(
     state: State<'_, AppState>,
     ids: Vec<String>,
@@ -438,7 +447,7 @@ fn delete_secret(name: String) -> Result<(), String> {
 async fn test_ai_config(settings: AppSettings, secret_name: String) -> Result<String, String> {
     let settings = settings.normalized();
     if settings.ai_mode == "off" {
-        return Err("AI 模式当前为关闭；请先选择手动复核或自动复核".into());
+        return Err("AI 自动复核当前为关闭；请先开启".into());
     }
     if settings.ai_model.trim().is_empty() {
         return Err("模型名不能为空".into());
@@ -584,6 +593,7 @@ fn main() {
             get_codex_rate_card,
             refresh_codex_rate_card,
             run_analysis_once,
+            start_analysis_queue,
             run_analysis_jobs,
             compact_sessions,
             learn_rule_from_session,

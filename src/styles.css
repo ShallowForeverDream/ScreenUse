@@ -1701,6 +1701,9 @@ kbd {
 .ai-review-summary strong { color: var(--text-strong); font-size: 20px; }
 .ai-review-actions { display: flex; justify-content: flex-end; gap: 7px; }
 .ai-review-actions button { min-height: 38px; }
+.ai-auto-toggle { white-space: nowrap; }
+.ai-auto-toggle.active { border-color: var(--green); color: var(--green); background: color-mix(in srgb, var(--green) 9%, var(--panel)); }
+.ai-auto-toggle.active:hover:not(:disabled) { border-color: var(--green); background: color-mix(in srgb, var(--green) 14%, var(--panel)); }
 .ai-usage-strip {
   padding: 10px 13px;
   display: grid;

@@ -150,6 +150,7 @@ export const api = {
   },
   deleteAnalysisJobs: (ids: string[]) => call<number>('delete_analysis_jobs', { ids }, ids.length),
   runAnalysisOnce: () => call<boolean>('run_analysis_once', undefined, false),
+  startAnalysisQueue: () => call<void>('start_analysis_queue'),
   compactSessions: () => call<number>('compact_sessions', undefined, 0),
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),
   cleanupMediaCache: () => call<number>('cleanup_media_cache', undefined, 0),

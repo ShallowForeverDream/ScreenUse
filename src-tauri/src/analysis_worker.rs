@@ -33,14 +33,9 @@ pub fn start_analysis_worker(db: Arc<AppDb>) {
                 if let Err(error) = run_once(db.clone()).await {
                     eprintln!("ScreenUse optional AI worker error: {error}");
                 }
-                sleep(Duration::from_secs(60)).await;
-            } else if settings.ai_mode == "manual" {
-                if let Err(error) = enqueue_recent_uncertain(&db) {
-                    eprintln!("ScreenUse optional AI enqueue error: {error}");
-                }
-                sleep(Duration::from_secs(60)).await;
+                sleep(Duration::from_secs(5)).await;
             } else {
-                sleep(Duration::from_secs(120)).await;
+                sleep(Duration::from_secs(15)).await;
             }
         }
     });
@@ -110,17 +105,15 @@ pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
     let Ok(_guard) = lock.try_lock() else {
         return Ok(false);
     };
-    let Some(job) = db.claim_next_analysis_job()? else {
-        return Ok(false);
-    };
-    run_claimed_job(&db, job).await?;
-    Ok(true)
+    let result = run_pending_jobs(&db).await?;
+    Ok(result.processed > 0)
 }
 
 pub async fn run_selected(
     db: Arc<AppDb>,
     ids: &[String],
 ) -> Result<crate::models::AnalysisBatchRunResult> {
+    ensure_auto_review_enabled(&db)?;
     let lock = AI_RUN_LOCK.get_or_init(|| AsyncMutex::new(()));
     let Ok(_guard) = lock.try_lock() else {
         return Err(anyhow!("已有 AI 复核正在运行，请稍后再试"));
@@ -128,6 +121,9 @@ pub async fn run_selected(
     let mut result = crate::models::AnalysisBatchRunResult::default();
     let mut seen = HashSet::new();
     for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+        if db.get_settings()?.normalized().ai_mode != "auto" {
+            break;
+        }
         let Some(job) = db.claim_analysis_job(id)? else {
             continue;
         };
@@ -138,6 +134,34 @@ pub async fn run_selected(
         }
     }
     Ok(result)
+}
+
+async fn run_pending_jobs(
+    db: &Arc<AppDb>,
+) -> Result<crate::models::AnalysisBatchRunResult> {
+    ensure_auto_review_enabled(db)?;
+    let mut result = crate::models::AnalysisBatchRunResult::default();
+    loop {
+        if db.get_settings()?.normalized().ai_mode != "auto" {
+            break;
+        }
+        let Some(job) = db.claim_next_analysis_job()? else {
+            break;
+        };
+        result.processed += 1;
+        if let Err(error) = run_claimed_job(db, job).await {
+            result.failed += 1;
+            eprintln!("ScreenUse automatic AI review error: {error}");
+        }
+    }
+    Ok(result)
+}
+
+fn ensure_auto_review_enabled(db: &AppDb) -> Result<()> {
+    if db.get_settings()?.normalized().ai_mode != "auto" {
+        return Err(anyhow!("请先开启 AI 自动复核"));
+    }
+    Ok(())
 }
 
 async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
@@ -582,14 +606,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_run_claims_only_requested_pending_jobs() {
+    async fn selected_and_automatic_runs_process_jobs_sequentially() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-analysis-selected-run-test-{}",
             Uuid::new_v4()
         ));
         let db = Arc::new(AppDb::open_in(data_dir.clone()).expect("open test database"));
+        let mut settings = db.get_settings().expect("load settings");
+        settings.ai_mode = "auto".into();
+        db.save_settings(&settings).expect("enable automatic review");
         let queued_at = now();
-        for id in ["selected-a", "unselected", "selected-b"] {
+        for id in ["selected-a", "unselected-a", "selected-b", "unselected-b"] {
             db.create_analysis_job(&analysis_job(id, &queued_at))
                 .expect("create analysis job");
         }
@@ -617,13 +644,27 @@ mod tests {
                 .status,
             "skipped"
         );
-        assert_eq!(
-            db.get_analysis_job("unselected")
-                .expect("load unselected job")
-                .expect("unselected job exists")
-                .status,
-            "pending"
-        );
+        for id in ["unselected-a", "unselected-b"] {
+            assert_eq!(
+                db.get_analysis_job(id)
+                    .expect("load unselected job")
+                    .expect("unselected job exists")
+                    .status,
+                "pending"
+            );
+        }
+
+        assert!(run_once(db.clone()).await.expect("drain automatic queue"));
+        for id in ["unselected-a", "unselected-b"] {
+            assert_eq!(
+                db.get_analysis_job(id)
+                    .expect("load automatically processed job")
+                    .expect("automatically processed job exists")
+                    .status,
+                "skipped"
+            );
+        }
+        assert!(!run_once(db.clone()).await.expect("queue is empty"));
 
         drop(db);
         let _ = std::fs::remove_dir_all(data_dir);

@@ -858,17 +858,15 @@ export default function App() {
                   <Ellipsis size={17} /><span>更多</span>
                 </summary>
                 <div className="top-more-menu">
-                  {data.settings.aiMode !== 'off' && (
-                    <button
-                      onClick={(event) => {
-                        event.currentTarget.closest('details')?.removeAttribute('open');
-                        void runAction(api.runAnalysisOnce, '已复核一条低置信会话');
-                      }}
-                      type="button"
-                    >
-                      <WandSparkles size={16} />AI 复核
-                    </button>
-                  )}
+                  <button
+                    onClick={(event) => {
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                      setActiveTab('ai');
+                    }}
+                    type="button"
+                  >
+                    <WandSparkles size={16} />AI 自动复核
+                  </button>
                   <button
                     onClick={(event) => {
                       event.currentTarget.closest('details')?.removeAttribute('open');
@@ -969,7 +967,14 @@ export default function App() {
             codexPlan={data.settings.codexPlan}
             aiMode={data.settings.aiMode}
             runAction={runAction}
-            onOpenSettings={() => setActiveTab('settings')}
+            onToggleAuto={(enabled) => runAction(async () => {
+              const next: AppSettings = {
+                ...data.settings,
+                aiMode: enabled ? 'auto' : 'off',
+              };
+              await api.saveSettings(next);
+              if (enabled) await api.startAnalysisQueue();
+            }, enabled ? 'AI 自动复核已开启' : 'AI 自动复核已关闭')}
           />
         )}
         {activeTab === 'settings' && (
@@ -1087,13 +1092,13 @@ function AiReviewView({
   codexPlan,
   aiMode,
   runAction,
-  onOpenSettings,
+  onToggleAuto,
 }: {
   sessions: WorkSession[];
   codexPlan: string;
   aiMode: string;
   runAction: ActionRunner;
-  onOpenSettings: () => void;
+  onToggleAuto: (enabled: boolean) => Promise<unknown>;
 }) {
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1169,6 +1174,23 @@ function AiReviewView({
       if (selectedId) setDetail(await api.getAnalysisJob(selectedId));
     } catch {
       // runAction already surfaces the backend message in the app toast.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleAutoReview = async () => {
+    if (busy) return;
+    const enable = aiMode !== 'auto';
+    setBusy(true);
+    try {
+      await onToggleAuto(enable);
+      await refresh(true);
+      if (enable) {
+        window.setTimeout(() => void refresh(true), 1200);
+      }
+    } catch {
+      // The shared action runner already displays the backend message.
     } finally {
       setBusy(false);
     }
@@ -1275,7 +1297,7 @@ function AiReviewView({
 
   const runSelectedJobs = async () => {
     const ids = pendingSelectedJobs.map((job) => job.id);
-    if (!ids.length || busy) return;
+    if (!ids.length || busy || aiMode !== 'auto') return;
     setBusy(true);
     try {
       await runAction(
@@ -1366,12 +1388,16 @@ function AiReviewView({
         <div><span>失败</span><strong>{counts.failed}</strong></div>
         <div className="ai-review-actions">
           <button
-            className="primary"
+            className={`ai-auto-toggle ${aiMode === 'auto' ? 'active' : ''}`}
             disabled={busy}
-            onClick={() => void runAndRefresh(api.runAnalysisOnce, 'AI 复核已完成')}
+            onClick={() => void toggleAutoReview()}
             type="button"
+            title={aiMode === 'auto'
+              ? '关闭后会让当前请求完成，但不会继续处理下一条'
+              : '开启后按排队顺序逐条复核，无需重复点击'}
           >
-            <WandSparkles size={15} />立即复核
+            {aiMode === 'auto' ? <Pause size={15} /> : <Play size={15} />}
+            自动复核·{aiMode === 'auto' ? '已开启' : '已关闭'}
           </button>
           <button disabled={busy} onClick={() => void refreshRateCard()} type="button">
             <RefreshCw size={15} />更新费率
@@ -1453,10 +1479,12 @@ function AiReviewView({
             <div className="ai-job-batch-actions">
               <button
                 className="primary"
-                disabled={busy || !pendingSelectedJobs.length}
+                disabled={busy || aiMode !== 'auto' || !pendingSelectedJobs.length}
                 onClick={() => void runSelectedJobs()}
                 type="button"
-                title="依次处理所选记录中的排队项"
+                title={aiMode === 'auto'
+                  ? '依次处理所选记录中的排队项'
+                  : '请先开启 AI 自动复核'}
               >
                 <WandSparkles size={13} />复核 {pendingSelectedJobs.length || ''}
               </button>
@@ -1632,15 +1660,13 @@ function AiReviewView({
                 : '可查看模型、完整提示词、原始回复和运行状态。'}</span>
               {jobs.length === 0 && (
                 <button
-                  className={aiMode === 'off' ? '' : 'primary'}
+                  className={aiMode === 'auto' ? 'ai-auto-toggle active' : 'ai-auto-toggle'}
                   disabled={busy}
-                  onClick={() => aiMode === 'off'
-                    ? onOpenSettings()
-                    : void runAndRefresh(api.runAnalysisOnce, 'AI 复核已完成')}
+                  onClick={() => void toggleAutoReview()}
                   type="button"
                 >
-                  {aiMode === 'off' ? <Settings size={15} /> : <WandSparkles size={15} />}
-                  {aiMode === 'off' ? '先开启 AI 复核' : '立即复核'}
+                  {aiMode === 'auto' ? <Pause size={15} /> : <Play size={15} />}
+                  自动复核·{aiMode === 'auto' ? '已开启' : '开启'}
                 </button>
               )}
             </div>
@@ -4005,6 +4031,7 @@ function SettingsView({
       next = { ...next, aiSecretRef: secretName };
     }
     await api.saveSettings(next);
+    if (next.aiMode === 'auto') await api.startAnalysisQueue();
     savedFingerprintRef.current = JSON.stringify(next);
     setSavedSettings(next);
     setSettings(next);
@@ -4169,16 +4196,15 @@ function SettingsView({
       <section className="panel settings-panel" id="settings-ai">
         <PanelTitle
           title="可选 AI 复核"
-          subtitle="本地规则始终先运行；不开 AI 也能完整使用。"
+          subtitle="开启后按排队顺序逐条运行；同一时间只调用一个模型。"
         />
-        <Field label="AI 模式" hint="复核未归到具体任务，或低于 80% 且达到最低时长的已结束会话。">
-          <select value={settings.aiMode} onChange={(event) => update('aiMode', event.target.value)}>
-            <option value="off">关闭（零费用）</option>
-            <option value="manual">手动复核待复核会话</option>
-            <option value="auto">自动复核待复核会话</option>
-          </select>
-        </Field>
-        {settings.aiMode !== 'off' && (
+        <Toggle
+          checked={settings.aiMode === 'auto'}
+          onChange={(enabled) => update('aiMode', enabled ? 'auto' : 'off')}
+          title="AI 自动复核"
+          detail="开启后自动发现待复核会话，一个完成后继续下一个；关闭时当前请求会安全结束，但不再开始下一条。"
+        />
+        {settings.aiMode === 'auto' && (
           <div className="ai-fields">
             <Field label="AI 来源" hint="Codex 模式直接复用当前 ChatGPT 登录，不读取或复制账号令牌。">
               <select
