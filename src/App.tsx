@@ -2401,6 +2401,60 @@ function DayActivityTimeline({
   );
 }
 
+function matchesSessionSearch(session: WorkSession, query: string) {
+  if (!query) return true;
+  const searchable = normalizeSearchText([
+    session.summary,
+    session.category,
+    session.projectName,
+    session.taskTitle,
+    sessionApplication(session),
+    formatSessionMoment(session.startedAt, true),
+    formatSessionMoment(session.endedAt, true),
+    session.source,
+    ...session.evidence.flatMap((item) => [item.label, item.value]),
+  ].filter(Boolean).join(' '));
+  return query.split(' ').filter(Boolean).every((token) => searchable.includes(token));
+}
+
+function SessionDetailSearch({
+  value,
+  resultCount,
+  totalCount,
+  onChange,
+}: {
+  value: string;
+  resultCount: number;
+  totalCount: number;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="detail-search-row">
+      <label className="search-field detail-search">
+        <Search size={15} />
+        <input
+          aria-label="搜索时间段"
+          placeholder="搜索摘要、当前页面、应用、项目或任务"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && value) {
+              event.preventDefault();
+              onChange('');
+            }
+          }}
+        />
+        {value && (
+          <button aria-label="清空时间段搜索" onClick={() => onChange('')} type="button">
+            <X size={14} />
+          </button>
+        )}
+      </label>
+      {value && <span className="detail-search-count">{resultCount}/{totalCount} 段</span>}
+    </div>
+  );
+}
+
 function ProjectTodayDetailModal({
   project,
   sessions,
@@ -2420,6 +2474,7 @@ function ProjectTodayDetailModal({
 }) {
   const [selectedTaskKey, setSelectedTaskKey] = useState('all');
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [query, setQuery] = useState('');
   const selectAllRef = useRef<HTMLInputElement>(null);
   const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
   const sortedProjectSessions = useMemo(
@@ -2447,9 +2502,19 @@ function ProjectTodayDetailModal({
   }, [selectedDate, sortedProjectSessions, taskById]);
   const total = taskRows.reduce((sum, row) => sum + row.minutes, 0);
   const activeTask = taskRows.find((row) => row.key === selectedTaskKey) || null;
-  const visibleSessions = activeTask?.sessions || sortedProjectSessions;
-  const selectedSessions = visibleSessions.filter((session) => selected.has(session.id));
-  const allSelected = visibleSessions.length > 0 && selectedSessions.length === visibleSessions.length;
+  const taskSessions = activeTask?.sessions || sortedProjectSessions;
+  const normalizedQuery = normalizeSearchText(query);
+  const visibleSessions = taskSessions.filter((session) => matchesSessionSearch(session, normalizedQuery));
+  const selectedSessions = taskSessions.filter((session) => selected.has(session.id));
+  const visibleSelectedCount = visibleSessions.reduce(
+    (count, session) => count + Number(selected.has(session.id)),
+    0,
+  );
+  const allSelected = visibleSessions.length > 0 && visibleSelectedCount === visibleSessions.length;
+  const visibleMinutes = visibleSessions.reduce(
+    (sum, session) => sum + sessionMinutesOnDate(session, selectedDate),
+    0,
+  );
   let pieCursor = 0;
   const pieBackground = taskRows.length
     ? `conic-gradient(${taskRows.map((row) => {
@@ -2461,14 +2526,25 @@ function ProjectTodayDetailModal({
 
   useEffect(() => {
     if (selectAllRef.current) {
-      selectAllRef.current.indeterminate = selectedSessions.length > 0 && !allSelected;
+      selectAllRef.current.indeterminate = visibleSelectedCount > 0 && !allSelected;
     }
-  }, [allSelected, selectedSessions.length]);
+  }, [allSelected, visibleSelectedCount]);
   useEffect(() => setSelected(new Set()), [selectionResetKey]);
 
   const chooseTask = (key: string) => {
     setSelectedTaskKey(key);
     setSelected(new Set());
+    setQuery('');
+  };
+  const toggleAllVisible = (checked: boolean) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      visibleSessions.forEach((session) => {
+        if (checked) next.add(session.id);
+        else next.delete(session.id);
+      });
+      return next;
+    });
   };
   const toggle = (id: string) => {
     setSelected((current) => {
@@ -2540,7 +2616,7 @@ function ProjectTodayDetailModal({
           <div className="project-session-detail-head">
             <div>
               <h3>{activeTask?.title || '全部时间段'}</h3>
-              <p>{formatDuration(activeTask?.minutes || total)} · {visibleSessions.length} 段</p>
+              <p>{formatDuration(normalizedQuery ? visibleMinutes : activeTask?.minutes || total)} · {visibleSessions.length}{normalizedQuery ? `/${taskSessions.length}` : ''} 段</p>
             </div>
             <div className="category-detail-actions">
               <label className="selection-toggle" title={`选择当前 ${visibleSessions.length} 个时间段`}>
@@ -2549,9 +2625,7 @@ function ProjectTodayDetailModal({
                   ref={selectAllRef}
                   type="checkbox"
                   checked={allSelected}
-                  onChange={(event) => setSelected(
-                    event.target.checked ? new Set(visibleSessions.map((session) => session.id)) : new Set(),
-                  )}
+                  onChange={(event) => toggleAllVisible(event.target.checked)}
                 />
                 全选
               </label>
@@ -2563,7 +2637,19 @@ function ProjectTodayDetailModal({
               </button>
             </div>
           </div>
+          <SessionDetailSearch
+            value={query}
+            resultCount={visibleSessions.length}
+            totalCount={taskSessions.length}
+            onChange={setQuery}
+          />
           <div className="category-session-list">
+            {!visibleSessions.length && (
+              <EmptyState
+                title="没有匹配的时间段"
+                detail="可以搜索摘要、当前页面、应用、项目或任务名称。"
+              />
+            )}
             {visibleSessions.map((session) => (
               <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>
                 <label className="category-session-check" aria-label={`选择 ${displaySessionSummary(session)}`}>
@@ -2614,23 +2700,33 @@ function CategoryDetailModal({
   onEdit: (sessions: WorkSession[]) => void;
 }) {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
-  const sorted = [...sessions].sort(
-    (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+  const [query, setQuery] = useState('');
+  const allSorted = useMemo(
+    () => [...sessions].sort(
+      (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+    ),
+    [sessions],
   );
-  const selectedSessions = sorted.filter((session) => selected.has(session.id));
+  const normalizedQuery = normalizeSearchText(query);
+  const sorted = allSorted.filter((session) => matchesSessionSearch(session, normalizedQuery));
+  const selectedSessions = allSorted.filter((session) => selected.has(session.id));
+  const visibleSelectedCount = sorted.reduce(
+    (count, session) => count + Number(selected.has(session.id)),
+    0,
+  );
   const total = sorted.reduce(
     (sum, session) => sum + (durationForSession
       ? durationForSession(session)
       : sessionMinutesOnDate(session, selectedDate)),
     0,
   );
-  const allSelected = sorted.length > 0 && selected.size === sorted.length;
+  const allSelected = sorted.length > 0 && visibleSelectedCount === sorted.length;
   const selectAllRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (selectAllRef.current) {
-      selectAllRef.current.indeterminate = selected.size > 0 && !allSelected;
+      selectAllRef.current.indeterminate = visibleSelectedCount > 0 && !allSelected;
     }
-  }, [allSelected, selected.size]);
+  }, [allSelected, visibleSelectedCount]);
   useEffect(() => setSelected(new Set()), [selectionResetKey]);
   const editSession = (session: WorkSession) => {
     const belongsToSelection = selected.has(session.id);
@@ -2641,6 +2737,16 @@ function CategoryDetailModal({
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      return next;
+    });
+  };
+  const toggleAllVisible = (checked: boolean) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      sorted.forEach((session) => {
+        if (checked) next.add(session.id);
+        else next.delete(session.id);
+      });
       return next;
     });
   };
@@ -2655,7 +2761,7 @@ function CategoryDetailModal({
             <span style={{ background: categoryColor(category) }} />
             <div>
               <h2>{heading}</h2>
-              <p>{formatDuration(total)} · {sorted.length} 个{title ? '具体' : ''}时间段{contextLabel ? ` · ${contextLabel}` : ''}</p>
+              <p>{formatDuration(total)} · {sorted.length}{normalizedQuery ? `/${allSorted.length}` : ''} 个{title ? '具体' : ''}时间段{contextLabel ? ` · ${contextLabel}` : ''}</p>
             </div>
           </div>
           <div className="category-detail-actions">
@@ -2665,9 +2771,7 @@ function CategoryDetailModal({
                 ref={selectAllRef}
                 type="checkbox"
                 checked={allSelected}
-                onChange={(event) => setSelected(
-                  event.target.checked ? new Set(sorted.map((session) => session.id)) : new Set(),
-                )}
+                onChange={(event) => toggleAllVisible(event.target.checked)}
               />
               全选
             </label>
@@ -2691,9 +2795,20 @@ function CategoryDetailModal({
             <X size={17} />
           </button>
         </div>
+        <SessionDetailSearch
+          value={query}
+          resultCount={sorted.length}
+          totalCount={allSorted.length}
+          onChange={setQuery}
+        />
         <div className="category-session-list">
           {!sorted.length && (
-            <EmptyState title="所选区间没有时间段" detail="切换统计范围后可查看该项目或任务的其他记录。" />
+            <EmptyState
+              title={normalizedQuery ? '没有匹配的时间段' : '所选区间没有时间段'}
+              detail={normalizedQuery
+                ? '可以搜索摘要、当前页面、应用、项目或任务名称。'
+                : '切换统计范围后可查看该项目或任务的其他记录。'}
+            />
           )}
           {sorted.map((session) => (
             <div className={selected.has(session.id) ? 'selected' : ''} key={session.id}>

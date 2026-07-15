@@ -107,10 +107,11 @@ button:hover:not(:disabled) {
 }
 button:active:not(:disabled) { transform: translateY(0); }
 button:disabled { opacity: .38; cursor: not-allowed; }
-button:focus-visible, input:focus-visible, select:focus-visible {
+button:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--blue-strong) 55%, transparent);
   outline-offset: 2px;
 }
+input:focus-visible, select:focus-visible { outline: 0; }
 button.primary {
   color: #fff;
   border-color: var(--blue-strong);
@@ -134,8 +135,8 @@ input, select {
   transition: border-color .16s ease, box-shadow .16s ease;
 }
 input:focus, select:focus {
-  border-color: color-mix(in srgb, var(--blue-strong) 72%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue-strong) 13%, transparent);
+  border-color: var(--muted);
+  box-shadow: none;
 }
 input[type="checkbox"] { min-height: auto; }
 .themed-checkbox {
@@ -964,7 +965,7 @@ kbd {
 .project-date-range { margin: -2px 0 10px; display: flex; align-items: center; gap: 7px; }
 .project-date-range label { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; font-weight: 700; }
 .project-date-range input { width: 138px; min-height: 35px; padding: 5px 9px; color: var(--text-secondary); border-color: var(--border); border-radius: 10px; background: var(--input); font-size: 11px; }
-.project-date-range input:focus { border-color: color-mix(in srgb, var(--blue-strong) 34%, var(--border-strong)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-strong) 8%, transparent); }
+.project-date-range input:focus { border-color: var(--muted); box-shadow: none; }
 .project-date-separator { color: var(--subtle); font-size: 11px; }
 .project-range-toolbar { margin: -2px 0 13px; display: flex; align-items: center; justify-content: space-between; gap: 9px; }
 .project-range-tabs { min-width: 0; padding: 3px; display: flex; gap: 2px; overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-subtle); scrollbar-width: none; }
@@ -1334,6 +1335,25 @@ kbd {
 .project-session-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .project-session-detail-head h3 { font-size: 14px; }
 .project-session-detail-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+.detail-search-row { display: flex; align-items: center; gap: 9px; }
+.detail-search { width: 100%; min-height: 38px; }
+.detail-search button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: 0 0 auto;
+  border-color: transparent;
+  color: var(--subtle);
+  background: transparent;
+  transform: none;
+}
+.detail-search button:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--text-secondary);
+  background: var(--control-hover);
+  transform: none;
+}
+.detail-search-count { flex: 0 0 auto; color: var(--subtle); font-size: 11px; white-space: nowrap; }
 .category-session-list { display: grid; gap: 7px; }
 .category-session-list > div {
   display: grid;
@@ -1345,6 +1365,7 @@ kbd {
 }
 .category-session-list > div.selected { border-color: color-mix(in srgb, var(--blue-strong) 38%, var(--border)); }
 .category-session-list > div:not(.selected) { border-color: transparent; box-shadow: none; }
+.category-session-list > .empty-state { grid-template-columns: 1fr; border: 0; background: transparent; }
 .category-session-check { height: 100%; display: grid; place-items: center; cursor: pointer; }
 .category-session-open {
   width: 100%;
