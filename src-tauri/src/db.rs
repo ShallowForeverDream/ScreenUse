@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -16,6 +16,53 @@ const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
+const LAST_CORRECTION_UNDO_FILE: &str = "last-correction-undo.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UndoSessionRow {
+    id: String,
+    started_at: String,
+    ended_at: String,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    category: String,
+    summary: String,
+    confidence: f32,
+    evidence_json: String,
+    user_confirmed: bool,
+    source: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UndoRuleRow {
+    id: String,
+    name: String,
+    priority: i32,
+    matcher_json: String,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    category: String,
+    created_from_correction: bool,
+    enabled: bool,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UndoContextPinRow {
+    project_id: String,
+    task_id: Option<String>,
+    expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionCorrectionUndo {
+    label: String,
+    created_at: String,
+    sessions: Vec<UndoSessionRow>,
+    correction_rules: Vec<UndoRuleRow>,
+    context_pin: Option<UndoContextPinRow>,
+}
 
 struct AttributionDecision {
     project_id: Option<String>,
@@ -35,6 +82,7 @@ struct LastSessionAttribution {
     source: String,
 }
 
+#[cfg(test)]
 struct ConfirmedContextVote {
     count: u32,
     project_id: String,
@@ -53,6 +101,7 @@ pub(crate) struct RecentTaskContext {
     pub ended_at: String,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct ContextPropagationRow {
     id: String,
@@ -103,7 +152,6 @@ impl AppDb {
         db.migrate()?;
         db.seed_if_empty()?;
         db.normalize_correction_rules()?;
-        db.repair_sessions_from_confirmed_context()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
         db.configure_idle_target(&settings)?;
@@ -1341,6 +1389,270 @@ impl AppDb {
         Ok(updated)
     }
 
+    pub fn apply_session_correction(
+        &self,
+        ids: &[String],
+        patch: SessionPatch,
+        remember: bool,
+        keyword: Option<&str>,
+        pin_minutes: Option<u32>,
+    ) -> Result<Vec<WorkSession>> {
+        if ids.is_empty() {
+            bail!("请至少选择一条会话");
+        }
+        let label = if ids.len() > 1 {
+            format!("统一修正 {} 个时间段", ids.len())
+        } else {
+            let summary = self
+                .get_session(&ids[0])?
+                .map(|session| session.summary)
+                .unwrap_or_else(|| "时间段".into());
+            format!("修正“{}”", summary.chars().take(32).collect::<String>())
+        };
+        let snapshot = self.capture_session_correction_undo(ids, label)?;
+        let result = (|| {
+            let updated = self.update_sessions(ids, patch)?;
+            if remember {
+                for session in &updated {
+                    self.learn_rule_from_session(&session.id, keyword)?;
+                }
+            }
+            if let Some(minutes) = pin_minutes {
+                let session = updated.first().context("修正后没有可固定的时间段")?;
+                let project_id = session
+                    .project_id
+                    .as_deref()
+                    .context("只有已归属项目的时间段才能固定当前事务")?;
+                self.pin_context(project_id, session.task_id.as_deref(), minutes)?;
+            }
+            Ok(updated)
+        })();
+
+        match result {
+            Ok(updated) => {
+                if let Err(error) = self.write_session_correction_undo(&snapshot) {
+                    self.restore_session_correction_undo(&snapshot).with_context(|| {
+                        format!("无法保存撤销记录，且回滚修正失败：{error}")
+                    })?;
+                    return Err(error.context("无法保存撤销记录，本次修正已回滚"));
+                }
+                Ok(updated)
+            }
+            Err(error) => {
+                self.restore_session_correction_undo(&snapshot)
+                    .with_context(|| format!("修正失败，且自动回滚失败：{error}"))?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn undo_status(&self) -> UndoStatus {
+        match self.read_session_correction_undo() {
+            Ok(snapshot) => UndoStatus {
+                available: true,
+                label: Some(snapshot.label),
+                created_at: Some(snapshot.created_at),
+            },
+            Err(_) => UndoStatus {
+                available: false,
+                label: None,
+                created_at: None,
+            },
+        }
+    }
+
+    pub fn undo_last_session_correction(&self) -> Result<String> {
+        let snapshot = self
+            .read_session_correction_undo()
+            .context("没有可以撤销的修正")?;
+        self.restore_session_correction_undo(&snapshot)?;
+        let path = self.data_dir.join(LAST_CORRECTION_UNDO_FILE);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(snapshot.label)
+    }
+
+    fn capture_session_correction_undo(
+        &self,
+        ids: &[String],
+        label: String,
+    ) -> Result<SessionCorrectionUndo> {
+        let conn = self.conn.lock();
+        let mut sessions = Vec::new();
+        for id in ids {
+            let row = conn
+                .query_row(
+                    "SELECT id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                            evidence_json,user_confirmed,source,updated_at
+                     FROM work_sessions WHERE id=?1",
+                    params![id],
+                    |row| {
+                        Ok(UndoSessionRow {
+                            id: row.get(0)?,
+                            started_at: row.get(1)?,
+                            ended_at: row.get(2)?,
+                            project_id: row.get(3)?,
+                            task_id: row.get(4)?,
+                            category: row.get(5)?,
+                            summary: row.get(6)?,
+                            confidence: row.get(7)?,
+                            evidence_json: row.get(8)?,
+                            user_confirmed: row.get::<_, i64>(9)? != 0,
+                            source: row.get(10)?,
+                            updated_at: row.get(11)?,
+                        })
+                    },
+                )
+                .optional()?
+                .with_context(|| format!("会话不存在或已经删除：{id}"))?;
+            if !sessions.iter().any(|item: &UndoSessionRow| item.id == row.id) {
+                sessions.push(row);
+            }
+        }
+        let correction_rules = {
+            let mut stmt = conn.prepare(
+                "SELECT id,name,priority,matcher_json,project_id,task_id,category,
+                        created_from_correction,enabled,updated_at
+                 FROM attribution_rules WHERE created_from_correction=1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(UndoRuleRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    priority: row.get(2)?,
+                    matcher_json: row.get(3)?,
+                    project_id: row.get(4)?,
+                    task_id: row.get(5)?,
+                    category: row.get(6)?,
+                    created_from_correction: row.get::<_, i64>(7)? != 0,
+                    enabled: row.get::<_, i64>(8)? != 0,
+                    updated_at: row.get(9)?,
+                })
+            })?;
+            collect_rows(rows)?
+        };
+        let context_pin = conn
+            .query_row(
+                "SELECT project_id,task_id,expires_at FROM context_pin WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(UndoContextPinRow {
+                        project_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        expires_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(SessionCorrectionUndo {
+            label,
+            created_at: now(),
+            sessions,
+            correction_rules,
+            context_pin,
+        })
+    }
+
+    fn write_session_correction_undo(&self, snapshot: &SessionCorrectionUndo) -> Result<()> {
+        let path = self.data_dir.join(LAST_CORRECTION_UNDO_FILE);
+        let temp = self.data_dir.join(format!("{LAST_CORRECTION_UNDO_FILE}.tmp"));
+        let previous = self
+            .data_dir
+            .join(format!("{LAST_CORRECTION_UNDO_FILE}.previous"));
+        fs::write(&temp, serde_json::to_vec(snapshot)?)?;
+        if previous.exists() {
+            fs::remove_file(&previous)?;
+        }
+        if path.exists() {
+            fs::rename(&path, &previous)?;
+        }
+        if let Err(error) = fs::rename(&temp, &path) {
+            if previous.exists() {
+                let _ = fs::rename(&previous, &path);
+            }
+            return Err(error.into());
+        }
+        if previous.exists() {
+            let _ = fs::remove_file(previous);
+        }
+        Ok(())
+    }
+
+    fn read_session_correction_undo(&self) -> Result<SessionCorrectionUndo> {
+        let path = self.data_dir.join(LAST_CORRECTION_UNDO_FILE);
+        let bytes = fs::read(path)?;
+        serde_json::from_slice(&bytes).context("撤销记录已损坏")
+    }
+
+    fn restore_session_correction_undo(&self, snapshot: &SessionCorrectionUndo) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for row in &snapshot.sessions {
+            tx.execute(
+                "INSERT INTO work_sessions(
+                    id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                    evidence_json,user_confirmed,source,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                    started_at=excluded.started_at,ended_at=excluded.ended_at,
+                    project_id=excluded.project_id,task_id=excluded.task_id,
+                    category=excluded.category,summary=excluded.summary,
+                    confidence=excluded.confidence,evidence_json=excluded.evidence_json,
+                    user_confirmed=excluded.user_confirmed,source=excluded.source,
+                    updated_at=excluded.updated_at",
+                params![
+                    row.id,
+                    row.started_at,
+                    row.ended_at,
+                    row.project_id,
+                    row.task_id,
+                    row.category,
+                    row.summary,
+                    row.confidence,
+                    row.evidence_json,
+                    row.user_confirmed as i64,
+                    row.source,
+                    row.updated_at,
+                ],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM attribution_rules WHERE created_from_correction=1",
+            [],
+        )?;
+        for row in &snapshot.correction_rules {
+            tx.execute(
+                "INSERT INTO attribution_rules(
+                    id,name,priority,matcher_json,project_id,task_id,category,
+                    created_from_correction,enabled,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    row.id,
+                    row.name,
+                    row.priority,
+                    row.matcher_json,
+                    row.project_id,
+                    row.task_id,
+                    row.category,
+                    row.created_from_correction as i64,
+                    row.enabled as i64,
+                    row.updated_at,
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM context_pin", [])?;
+        if let Some(pin) = &snapshot.context_pin {
+            tx.execute(
+                "INSERT INTO context_pin(singleton,project_id,task_id,expires_at)
+                 VALUES(1,?1,?2,?3)",
+                params![pin.project_id, pin.task_id, pin.expires_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn apply_ai_review(
         &self,
         id: &str,
@@ -1361,7 +1673,8 @@ impl AppDb {
             .context("AI-reviewed session disappeared")
     }
 
-    pub fn propagate_context_from_sessions(&self, anchor_ids: &[String]) -> Result<u32> {
+    #[cfg(test)]
+    fn propagate_context_from_sessions(&self, anchor_ids: &[String]) -> Result<u32> {
         let mut changed_ids = HashSet::new();
         for anchor_id in anchor_ids {
             let Some(anchor) = self.get_session(anchor_id)? else {
@@ -2876,6 +3189,7 @@ impl AppDb {
         Ok(changed)
     }
 
+    #[cfg(test)]
     fn repair_sessions_from_confirmed_context(&self) -> Result<u32> {
         let confirmed = {
             let conn = self.conn.lock();
@@ -3404,6 +3718,7 @@ fn within_gap_seconds(left_end: &str, right_start: &str, max_seconds: i64) -> bo
     }
 }
 
+#[cfg(test)]
 fn context_gap_seconds(left_end: &str, right_start: &str) -> Option<i64> {
     let left = DateTime::parse_from_rfc3339(left_end)
         .ok()?
@@ -3414,6 +3729,7 @@ fn context_gap_seconds(left_end: &str, right_start: &str) -> Option<i64> {
     Some((right - left).num_seconds().max(0))
 }
 
+#[cfg(test)]
 fn context_is_disconnected(left_end: &str, right_start: &str, max_seconds: i64) -> bool {
     match context_gap_seconds(left_end, right_start) {
         Some(gap) => gap > max_seconds,
@@ -3661,6 +3977,7 @@ fn context_memory_keyword(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn evidence_context_signature(evidence: &[EvidenceItem]) -> Option<String> {
     let app = evidence.iter().find(|item| item.kind == "app")
         .map(|item| item.value.trim().to_lowercase()).filter(|value| !value.is_empty())?;
@@ -4301,6 +4618,100 @@ mod tests {
         assert!(updated.iter().all(|session| session.project_id.is_none()));
         assert!(updated.iter().all(|session| session.task_id.is_none()));
         assert!(updated.iter().all(|session| session.user_confirmed));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn one_correction_changes_only_the_selected_session_and_can_be_undone() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-single-correction-undo-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("浪费时间", "无效")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "无目的浏览")
+            .expect("create task");
+        let sessions = db.list_sessions(2).expect("list sessions");
+        let selected_before = sessions[0].clone();
+        let untouched_before = sessions[1].clone();
+        let rule_count_before: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM attribution_rules WHERE created_from_correction=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rules");
+
+        let updated = db
+            .apply_session_correction(
+                std::slice::from_ref(&selected_before.id),
+                SessionPatch {
+                    summary: Some("浪费".into()),
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some("无效".into()),
+                    confidence: Some(0.98),
+                    user_confirmed: Some(true),
+                },
+                true,
+                Some("无目的浏览"),
+                Some(30),
+            )
+            .expect("apply correction");
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].summary, "浪费");
+        assert_eq!(updated[0].task_id.as_deref(), Some(task.id.as_str()));
+        let untouched_after = db
+            .get_session(&untouched_before.id)
+            .expect("load untouched session")
+            .expect("untouched session exists");
+        assert_eq!(untouched_after.summary, untouched_before.summary);
+        assert_eq!(untouched_after.category, untouched_before.category);
+        assert_eq!(untouched_after.project_id, untouched_before.project_id);
+        assert_eq!(untouched_after.task_id, untouched_before.task_id);
+        assert_eq!(untouched_after.user_confirmed, untouched_before.user_confirmed);
+        assert!(db.undo_status().available);
+        assert_eq!(
+            db.active_context()
+                .expect("load pin")
+                .expect("pin exists")
+                .project_id,
+            project.id
+        );
+
+        db.undo_last_session_correction().expect("undo correction");
+        let restored = db
+            .get_session(&selected_before.id)
+            .expect("load restored session")
+            .expect("restored session exists");
+        assert_eq!(restored.summary, selected_before.summary);
+        assert_eq!(restored.category, selected_before.category);
+        assert_eq!(restored.project_id, selected_before.project_id);
+        assert_eq!(restored.task_id, selected_before.task_id);
+        assert_eq!(restored.user_confirmed, selected_before.user_confirmed);
+        assert_eq!(restored.source, selected_before.source);
+        assert!(db.active_context().expect("load restored pin").is_none());
+        let rule_count_after: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM attribution_rules WHERE created_from_correction=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restored rules");
+        assert_eq!(rule_count_after, rule_count_before);
+        assert!(!db.undo_status().available);
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, WorkSession } from './types';
+import type { AnalysisJob, AppSettings, AttributionRule, CategoryOption, ContextPin, DashboardData, GithubSyncConfig, GithubSyncResult, GithubSyncStatus, Project, SessionPatch, Task, UndoStatus, WorkSession } from './types';
 import { fallbackDashboard } from './mock';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -48,6 +48,21 @@ export const api = {
   stopCollector: () => call<void>('stop_collector'),
   updateSession: (id: string, patch: SessionPatch) => call<WorkSession>('update_session', { id, patch }),
   updateSessions: (ids: string[], patch: SessionPatch) => call<WorkSession[]>('update_sessions', { ids, patch }, []),
+  applySessionCorrection: (
+    ids: string[],
+    patch: SessionPatch,
+    remember = false,
+    keyword?: string,
+    pinMinutes?: number,
+  ) => call<WorkSession[]>('apply_session_correction', {
+    ids,
+    patch,
+    remember,
+    keyword: keyword || null,
+    pinMinutes: pinMinutes || null,
+  }, []),
+  undoStatus: () => call<UndoStatus>('get_undo_status', undefined, { available: false }),
+  undoLastSessionCorrection: () => call<string>('undo_last_session_correction'),
   createProject: (name: string, category: string) =>
     call<Project>('create_project', { name, category }, {
       id: `preview-${Date.now()}`,

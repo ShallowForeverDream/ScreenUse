@@ -50,6 +50,7 @@ import {
   Tags,
   TimerReset,
   Trash2,
+  Undo2,
   WandSparkles,
   X,
   ZoomIn,
@@ -68,6 +69,7 @@ import type {
   SessionPatch,
   Task,
   ThemeMode,
+  UndoStatus,
   WorkSession,
 } from './types';
 
@@ -521,7 +523,9 @@ export default function App() {
   const [toast, setToast] = useState('');
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [selectionResetKey, setSelectionResetKey] = useState(0);
   const [editing, setEditing] = useState<WorkSession[]>([]);
+  const [undoStatus, setUndoStatus] = useState<UndoStatus>({ available: false });
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [projectFocusId, setProjectFocusId] = useState('');
@@ -531,9 +535,13 @@ export default function App() {
   const load = useCallback(async () => {
     const sequence = ++loadSequenceRef.current;
     try {
-      const dashboard = await api.dashboard();
+      const [dashboard, nextUndoStatus] = await Promise.all([
+        api.dashboard(),
+        api.undoStatus().catch(() => ({ available: false } as UndoStatus)),
+      ]);
       if (sequence !== loadSequenceRef.current) return;
       setData(dashboard);
+      setUndoStatus(nextUndoStatus);
       setLoadError('');
     } catch (error) {
       if (sequence !== loadSequenceRef.current) return;
@@ -788,6 +796,25 @@ export default function App() {
               />
             )}
             <div className="top-actions">
+              <button
+                disabled={!undoStatus.available}
+                onClick={() => {
+                  void runAction(
+                    api.undoLastSessionCorrection,
+                    '已撤销上一次修正',
+                  ).then(() => {
+                    setEditing([]);
+                    setSelected(new Set());
+                    setSelectionResetKey((value) => value + 1);
+                  }).catch(() => undefined);
+                }}
+                title={undoStatus.available
+                  ? `撤销：${undoStatus.label || '上一次修正'}`
+                  : '暂无可撤销的修正'}
+                type="button"
+              >
+                <Undo2 size={16} />撤销
+              </button>
               {data.settings.aiMode !== 'off' && (
                 <button
                   onClick={() =>
@@ -858,6 +885,7 @@ export default function App() {
             stats={stats}
             selectedDate={selectedDate}
             idleCategory={data.settings.idleCategory}
+            selectionResetKey={selectionResetKey}
             onEdit={setEditing}
             onOpenTimeline={() => setActiveTab('timeline')}
             planItems={data.planItems}
@@ -883,6 +911,7 @@ export default function App() {
             runAction={runAction}
             categoryOptions={data.categoryOptions}
             focusProjectId={projectFocusId}
+            selectionResetKey={selectionResetKey}
             onEdit={setEditing}
           />
         )}
@@ -903,15 +932,13 @@ export default function App() {
           onClose={() => setEditing([])}
           onSave={async (sessions, patch, options) => {
             await runAction(async () => {
-              await api.updateSessions(sessions.map((session) => session.id), patch);
-              if (options.remember) {
-                for (const session of sessions) {
-                  await api.learnRuleFromSession(session.id, options.keyword);
-                }
-              }
-              if (options.pin && patch.projectId) {
-                await api.pinContext(patch.projectId, patch.taskId, 30);
-              }
+              await api.applySessionCorrection(
+                sessions.map((session) => session.id),
+                patch,
+                options.remember,
+                options.keyword,
+                options.pin ? 30 : undefined,
+              );
             }, sessions.length > 1
               ? `已统一修正 ${sessions.length} 条会话`
               : options.pin
@@ -920,7 +947,8 @@ export default function App() {
                   ? '已修正并记住规则'
                   : '会话已修正');
             setEditing([]);
-            if (sessions.length > 1) setSelected(new Set());
+            setSelected(new Set());
+            setSelectionResetKey((value) => value + 1);
           }}
           runAction={runAction}
         />
@@ -1504,6 +1532,7 @@ function TodayView({
   stats,
   selectedDate,
   idleCategory,
+  selectionResetKey,
   onEdit,
   onOpenTimeline,
   planItems,
@@ -1514,6 +1543,7 @@ function TodayView({
   stats: DayStats;
   selectedDate: string;
   idleCategory: string;
+  selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
   onOpenTimeline: () => void;
   planItems: DashboardData['planItems'];
@@ -1652,7 +1682,7 @@ function TodayView({
               );
             })
           ) : (
-            <EmptyState title="暂无项目时间" detail="修正一条会话后，相似活动会自动归入项目。" />
+            <EmptyState title="暂无项目时间" detail="为时间段选择项目后会在这里显示。" />
           )}
         </div>
       </section>
@@ -1700,6 +1730,7 @@ function TodayView({
           selectedDate={selectedDate}
           zoom={timelineZoom}
           onZoomChange={setTimelineZoom}
+          selectionResetKey={selectionResetKey}
           onEdit={onEdit}
         />
       </section>
@@ -1756,6 +1787,7 @@ function TodayView({
           category={selectedCategory}
           sessions={sessions.filter((session) => session.category === selectedCategory)}
           selectedDate={selectedDate}
+          selectionResetKey={selectionResetKey}
           onClose={() => setSelectedCategory(null)}
           onEdit={onEdit}
         />
@@ -1766,6 +1798,7 @@ function TodayView({
           sessions={sessions.filter((session) => session.projectId === selectedProject.id)}
           tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
           selectedDate={selectedDate}
+          selectionResetKey={selectionResetKey}
           onClose={() => setSelectedProjectId(null)}
           onEdit={onEdit}
         />
@@ -1780,6 +1813,7 @@ function DayActivityTimeline({
   selectedDate,
   zoom,
   onZoomChange,
+  selectionResetKey,
   onEdit,
 }: {
   detailed: boolean;
@@ -1787,6 +1821,7 @@ function DayActivityTimeline({
   selectedDate: string;
   zoom: number;
   onZoomChange: (zoom: number) => void;
+  selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2122,6 +2157,7 @@ function DayActivityTimeline({
           selectedDate={selectedDate}
           title={expandedSessions[0].taskTitle || expandedSessions[0].projectName || '合并时间段'}
           contextLabel={`${formatTimelineClock(expandedGroup.startedAt, true)}–${formatTimelineClock(expandedGroup.endedAt, true)}`}
+          selectionResetKey={selectionResetKey}
           onClose={() => setExpandedGroup(null)}
           onEdit={onEdit}
         />
@@ -2135,6 +2171,7 @@ function ProjectTodayDetailModal({
   sessions,
   tasks,
   selectedDate,
+  selectionResetKey,
   onClose,
   onEdit,
 }: {
@@ -2142,6 +2179,7 @@ function ProjectTodayDetailModal({
   sessions: WorkSession[];
   tasks: Task[];
   selectedDate: string;
+  selectionResetKey: number;
   onClose: () => void;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
@@ -2191,6 +2229,7 @@ function ProjectTodayDetailModal({
       selectAllRef.current.indeterminate = selectedSessions.length > 0 && !allSelected;
     }
   }, [allSelected, selectedSessions.length]);
+  useEffect(() => setSelected(new Set()), [selectionResetKey]);
 
   const chooseTask = (key: string) => {
     setSelectedTaskKey(key);
@@ -2324,6 +2363,7 @@ function CategoryDetailModal({
   contextLabel,
   durationForSession,
   showDate = false,
+  selectionResetKey,
   onClose,
   onEdit,
 }: {
@@ -2334,6 +2374,7 @@ function CategoryDetailModal({
   contextLabel?: string;
   durationForSession?: (session: WorkSession) => number;
   showDate?: boolean;
+  selectionResetKey: number;
   onClose: () => void;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
@@ -2355,6 +2396,7 @@ function CategoryDetailModal({
       selectAllRef.current.indeterminate = selected.size > 0 && !allSelected;
     }
   }, [allSelected, selected.size]);
+  useEffect(() => setSelected(new Set()), [selectionResetKey]);
   const editSession = (session: WorkSession) => {
     const belongsToSelection = selected.has(session.id);
     onEdit(belongsToSelection && selectedSessions.length > 1 ? selectedSessions : [session]);
@@ -2880,6 +2922,7 @@ function ProjectsView({
   runAction,
   categoryOptions,
   focusProjectId,
+  selectionResetKey,
   onEdit,
 }: {
   projects: Project[];
@@ -2889,6 +2932,7 @@ function ProjectsView({
   runAction: ActionRunner;
   categoryOptions: CategoryOption[];
   focusProjectId: string;
+  selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
 }) {
   const [creating, setCreating] = useState(false);
@@ -3386,6 +3430,7 @@ function ProjectsView({
           contextLabel={rangeLabel}
           durationForSession={(session) => sessionMinutesInRange(session, rangeBounds)}
           showDate={projectRange !== 'today'}
+          selectionResetKey={selectionResetKey}
           onClose={() => setSessionDetail(null)}
           onEdit={onEdit}
         />
@@ -4331,7 +4376,7 @@ function EditSessionModal({
   const [projectBusy, setProjectBusy] = useState(false);
   const [taskBusy, setTaskBusy] = useState(false);
   const [categoryBusy, setCategoryBusy] = useState(false);
-  const [remember, setRemember] = useState(true);
+  const [remember, setRemember] = useState(false);
   const [keyword, setKeyword] = useState('');
   const [pin, setPin] = useState(false);
   const [renamingCategory, setRenamingCategory] = useState<CategoryOption | null>(null);
@@ -4775,7 +4820,7 @@ function EditSessionModal({
         <div className="correction-options">
           <label>
             <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
-            <span><strong>自动学习</strong><small>默认记住本次修正，之后不必重复修改</small></span>
+            <span><strong>记住识别规则</strong><small>仅影响之后的新时间段，不会修改其他已有记录</small></span>
           </label>
           <label className={!projectId ? 'disabled' : ''}>
             <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />

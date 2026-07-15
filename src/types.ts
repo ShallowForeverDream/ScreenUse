@@ -244,3 +244,9 @@ export interface SessionPatch {
   confidence?: number;
   userConfirmed?: boolean;
 }
+
+export interface UndoStatus {
+  available: boolean;
+  label?: string | null;
+  createdAt?: string | null;
+}

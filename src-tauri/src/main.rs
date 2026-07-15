@@ -97,15 +97,38 @@ fn update_sessions(
     ids: Vec<String>,
     patch: SessionPatch,
 ) -> Result<Vec<models::WorkSession>, String> {
-    let follow_context = patch.user_confirmed == Some(true);
-    let updated = state.db.update_sessions(&ids, patch).map_err(map_err)?;
-    if follow_context {
-        state
-            .db
-            .propagate_context_from_sessions(&ids)
-            .map_err(map_err)?;
-    }
-    Ok(updated)
+    state.db.update_sessions(&ids, patch).map_err(map_err)
+}
+
+#[tauri::command]
+fn apply_session_correction(
+    state: State<AppState>,
+    ids: Vec<String>,
+    patch: SessionPatch,
+    remember: bool,
+    keyword: Option<String>,
+    pin_minutes: Option<u32>,
+) -> Result<Vec<models::WorkSession>, String> {
+    state
+        .db
+        .apply_session_correction(
+            &ids,
+            patch,
+            remember,
+            keyword.as_deref(),
+            pin_minutes,
+        )
+        .map_err(map_err)
+}
+
+#[tauri::command]
+fn get_undo_status(state: State<AppState>) -> models::UndoStatus {
+    state.db.undo_status()
+}
+
+#[tauri::command]
+fn undo_last_session_correction(state: State<AppState>) -> Result<String, String> {
+    state.db.undo_last_session_correction().map_err(map_err)
 }
 
 #[tauri::command]
@@ -515,6 +538,9 @@ fn main() {
             collector_health,
             update_session,
             update_sessions,
+            apply_session_correction,
+            get_undo_status,
+            undo_last_session_correction,
             create_project,
             update_project,
             delete_project,

@@ -121,6 +121,14 @@ pub struct ContextPin {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UndoStatus {
+    pub available: bool,
+    pub label: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceItem {
     pub kind: String,
     pub label: String,
