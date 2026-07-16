@@ -2159,7 +2159,7 @@ impl AppDb {
     pub fn apply_ai_review(
         &self,
         id: &str,
-        patch: SessionPatch,
+        mut patch: SessionPatch,
         evidence: Vec<EvidenceItem>,
     ) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
@@ -2167,7 +2167,41 @@ impl AppDb {
         if is_idle_session(&current, &settings) {
             return Ok(current);
         }
+
+        let task_id = patch
+            .task_id
+            .as_deref()
+            .filter(|_| !patch.clear_project.unwrap_or(false))
+            .filter(|_| !patch.clear_task.unwrap_or(false))
+            .context("AI 复核必须选择一个已有的具体任务")?
+            .to_string();
+        let (task_title, task_status) = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT t.title,t.status
+                 FROM tasks t
+                 JOIN projects p ON p.id=t.project_id
+                 WHERE t.id=?1",
+                params![task_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .context("AI 复核选择的任务不存在或所属项目已经删除")?
+        };
+        if task_status != "active" || crate::ai::is_placeholder_task_title(&task_title) {
+            bail!("AI 复核不能选择停用、未归类或兜底任务：{task_title}");
+        }
+
+        // The task is the canonical AI output. update_session derives its project
+        // and category from that task, so stale model-supplied hierarchy fields
+        // cannot create an internally inconsistent attribution.
+        patch.clear_project = Some(false);
+        patch.clear_task = Some(false);
+        patch.user_confirmed = Some(false);
         let updated = self.update_session(id, patch)?;
+        if updated.task_id.as_deref() != Some(task_id.as_str()) {
+            bail!("AI 复核未能写入所选的具体任务");
+        }
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE work_sessions
@@ -5856,7 +5890,7 @@ mod tests {
             classification::ingest_event(&db, &chat_event("legacy-ai-placeholder", "待确认聊天"))
                 .expect("ingest target")
                 .expect("target session");
-        db.apply_ai_review(
+        db.update_session(
             &session.id,
             SessionPatch {
                 summary: Some("未明确归属的事务".into()),
@@ -5868,9 +5902,15 @@ mod tests {
                 confidence: Some(0.96),
                 user_confirmed: Some(false),
             },
-            Vec::new(),
         )
-        .expect("apply legacy AI review");
+        .expect("create legacy placeholder assignment");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions SET source='ai-review',user_confirmed=0 WHERE id=?1",
+                params![session.id],
+            )
+            .expect("mark legacy placeholder as AI review");
         db.conn
             .lock()
             .execute(
@@ -5908,6 +5948,74 @@ mod tests {
     }
 
     #[test]
+    fn ai_review_write_path_requires_an_active_concrete_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-ai-concrete-task-write-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("AI 精确归类").expect("create category");
+        let project = db
+            .create_project("精确项目", &category.name)
+            .expect("create project");
+        let placeholder = db
+            .create_task(&project.id, "未归类任务")
+            .expect("create placeholder task");
+        let target = classification::ingest_event(
+            &db,
+            &chat_event("ai-concrete-write-target", "需要精确归类的页面"),
+        )
+        .expect("ingest target")
+        .expect("target session");
+
+        let project_only = db
+            .apply_ai_review(
+                &target.id,
+                SessionPatch {
+                    summary: Some("只归到项目".into()),
+                    project_id: Some(project.id.clone()),
+                    task_id: None,
+                    clear_project: Some(false),
+                    clear_task: Some(true),
+                    category: Some(category.name.clone()),
+                    confidence: Some(0.95),
+                    user_confirmed: Some(false),
+                },
+                Vec::new(),
+            )
+            .expect_err("project-only AI result must fail");
+        assert!(project_only.to_string().contains("具体任务"));
+
+        let placeholder_result = db
+            .apply_ai_review(
+                &target.id,
+                SessionPatch {
+                    summary: Some("选择兜底任务".into()),
+                    project_id: Some(project.id),
+                    task_id: Some(placeholder.id),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some(category.name),
+                    confidence: Some(0.95),
+                    user_confirmed: Some(false),
+                },
+                Vec::new(),
+            )
+            .expect_err("placeholder AI task must fail");
+        assert!(placeholder_result.to_string().contains("兜底任务"));
+
+        let unchanged = db
+            .get_session(&target.id)
+            .expect("load target")
+            .expect("target still exists");
+        assert!(unchanged.task_id.is_none());
+        assert_ne!(unchanged.source, "ai-review");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn legacy_ai_project_only_result_returns_to_queue_but_idle_is_preserved() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-ai-concrete-hierarchy-migration-test-{}",
@@ -5924,7 +6032,7 @@ mod tests {
         )
         .expect("ingest project-only target")
         .expect("project-only session");
-        db.apply_ai_review(
+        db.update_session(
             &project_only.id,
             SessionPatch {
                 summary: Some("AI 只选择了项目".into()),
@@ -5936,9 +6044,15 @@ mod tests {
                 confidence: Some(0.95),
                 user_confirmed: Some(false),
             },
-            Vec::new(),
         )
-        .expect("apply incomplete AI result");
+        .expect("create incomplete legacy AI result");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions SET source='ai-review',user_confirmed=0 WHERE id=?1",
+                params![project_only.id],
+            )
+            .expect("mark project-only row as AI review");
 
         let settings = db.get_settings().expect("load settings").normalized();
         let idle_project_id = db
@@ -5948,7 +6062,7 @@ mod tests {
             classification::ingest_event(&db, &chat_event("legacy-ai-idle", "旧 AI 空闲判断"))
                 .expect("ingest idle target")
                 .expect("idle session");
-        db.apply_ai_review(
+        db.update_session(
             &idle.id,
             SessionPatch {
                 summary: Some("离开/空闲".into()),
@@ -5960,9 +6074,15 @@ mod tests {
                 confidence: Some(0.99),
                 user_confirmed: Some(false),
             },
-            Vec::new(),
         )
-        .expect("apply idle AI result");
+        .expect("create legacy idle AI result");
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE work_sessions SET source='ai-review',user_confirmed=0 WHERE id=?1",
+                params![idle.id],
+            )
+            .expect("mark idle row as AI review");
         db.conn
             .lock()
             .execute(
