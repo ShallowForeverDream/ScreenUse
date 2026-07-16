@@ -58,6 +58,7 @@ pub struct MemoryRecord {
     pub task_title: String,
     pub confirmed_at: String,
     pub user_confirmed: bool,
+    pub source_confidence: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +142,20 @@ pub fn features_from_session(
         .map(|(_, event)| *event)
     {
         return features_from_event(event);
+    }
+    if !events.is_empty() && !primary_app.is_empty() {
+        // Compaction or an old boundary repair can leave only a neighboring
+        // application's raw event inside the range. In that case the session's
+        // page/workspace evidence may also belong to that neighbor; retain only
+        // the anchored app/window instead of learning a cross-application pair.
+        return build_features(
+            evidence_app.unwrap_or_default(),
+            "",
+            first_evidence_value(&session.evidence, "window").unwrap_or_default(),
+            "",
+            "",
+            "",
+        );
     }
     build_features(
         evidence_app.unwrap_or_default(),
@@ -229,7 +244,9 @@ pub fn is_discriminative(features: &ContextFeatures) -> bool {
         || !features.domain.is_empty()
         || !features.workspace.is_empty()
         || !features.file.is_empty()
-        || (!features.window.is_empty() && !is_generic(&features.window))
+        || (!features.window.is_empty()
+            && features.window != features.app
+            && !is_generic(&features.window))
 }
 
 pub fn relates_to_assignment(
@@ -255,6 +272,17 @@ pub fn relates_to_assignment(
 }
 
 pub fn choose_assignment(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    if !is_discriminative(query) {
+        return None;
+    }
+    choose_similarity_assignment(query, records)
+        .or_else(|| choose_manual_keyword_signature(query, records))
+}
+
+fn choose_similarity_assignment(
     query: &ContextFeatures,
     records: &[MemoryRecord],
 ) -> Option<MemoryDecision> {
@@ -343,6 +371,38 @@ pub fn choose_assignment(
                 });
             }
         }
+    }
+
+    // A single exceptionally high-confidence AI result may teach only an exact,
+    // highly specific repeat. Broader or lower-confidence AI observations still
+    // require the existing three-sample consensus below.
+    let exact_ai = candidates
+        .iter()
+        .filter(|(record, similarity)| {
+            !record.user_confirmed
+                && record.source_confidence >= 0.96
+                && stable_for_single_ai_memory(query)
+                && similarity.strong
+                && similarity.score >= 0.90
+        })
+        .collect::<Vec<_>>();
+    let exact_ai_assignments = exact_ai
+        .iter()
+        .map(|(record, _)| assignment_key(record))
+        .collect::<HashSet<_>>();
+    if exact_ai_assignments.len() == 1 {
+        let (record, _) = exact_ai
+            .iter()
+            .max_by(|left, right| left.0.confirmed_at.cmp(&right.0.confirmed_at))?;
+        return Some(MemoryDecision {
+            category: record.category.clone(),
+            project_id: record.project_id.clone(),
+            task_id: record.task_id.clone(),
+            confidence: 0.90,
+            matched_label: strongest_label(query, &record.features),
+            support: exact_ai.len(),
+            memory_session_id: record.session_id.clone(),
+        });
     }
 
     // A manual correction is authoritative for the same strong context. AI
@@ -449,6 +509,145 @@ pub fn choose_assignment(
         confidence,
         matched_label: strongest_label(query, &record.features),
         support: winner.support,
+        memory_session_id: record.session_id.clone(),
+    })
+}
+
+fn stable_for_single_ai_memory(features: &ContextFeatures) -> bool {
+    if matches!(
+        features.app.as_str(),
+        "wemeetapp" | "zoom" | "teams" | "msteams" | "dingtalk" | "feishu"
+    ) {
+        return false;
+    }
+    let label = format!("{} {}", features.page, features.window);
+    !["会议室", "会议纪要", "元宝纪要", "meeting room"]
+        .iter()
+        .any(|marker| label.contains(marker))
+}
+
+fn choose_manual_keyword_signature(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    const MIN_TOKEN_SUPPORT: usize = 2;
+    const MIN_MATCHED_TOKENS: usize = 4;
+
+    if query.tokens.len() < MIN_MATCHED_TOKENS {
+        return None;
+    }
+    let query_tokens = query
+        .tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    #[derive(Default)]
+    struct TokenAssignment<'a> {
+        count: usize,
+        latest: Option<&'a MemoryRecord>,
+    }
+
+    let mut token_assignments = HashMap::<String, HashMap<String, TokenAssignment<'_>>>::new();
+    for record in records.iter().filter(|record| record.user_confirmed) {
+        let assignment = assignment_key(record);
+        for token in record
+            .features
+            .tokens
+            .iter()
+            .filter(|token| query_tokens.contains(token.as_str()))
+        {
+            let stats = token_assignments
+                .entry(token.clone())
+                .or_default()
+                .entry(assignment.clone())
+                .or_default();
+            stats.count += 1;
+            if stats
+                .latest
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                stats.latest = Some(record);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SignatureVote<'a> {
+        tokens: Vec<String>,
+        record: Option<&'a MemoryRecord>,
+    }
+
+    let mut votes = HashMap::<String, SignatureVote<'_>>::new();
+    for (token, assignments) in token_assignments {
+        if assignments.len() != 1 {
+            continue;
+        }
+        let (assignment, stats) = assignments.into_iter().next()?;
+        if stats.count < MIN_TOKEN_SUPPORT {
+            continue;
+        }
+        let vote = votes.entry(assignment).or_default();
+        vote.tokens.push(token);
+        if let Some(record) = stats.latest {
+            if vote
+                .record
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                vote.record = Some(record);
+            }
+        }
+    }
+
+    // Conflicting task signatures abstain even when one side has more matching
+    // words. This fallback exists to reduce AI calls, never to guess through a
+    // genuine personal-history conflict.
+    if votes.len() != 1 {
+        return None;
+    }
+    let (_, mut vote) = votes.into_iter().next()?;
+    if vote.tokens.len() < MIN_MATCHED_TOKENS {
+        return None;
+    }
+    let record = vote.record?;
+    let winner = assignment_key(record);
+    let supporting_memories = records
+        .iter()
+        .filter(|candidate| candidate.user_confirmed && assignment_key(candidate) == winner)
+        .filter(|candidate| {
+            candidate
+                .features
+                .tokens
+                .iter()
+                .any(|token| vote.tokens.contains(token))
+        })
+        .count();
+    if supporting_memories < MIN_TOKEN_SUPPORT {
+        return None;
+    }
+
+    vote.tokens.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    let matched = vote.tokens.iter().take(3).cloned().collect::<Vec<_>>();
+    let confidence = if vote.tokens.len() >= 8 && supporting_memories >= 3 {
+        0.95
+    } else if vote.tokens.len() >= 6 {
+        0.93
+    } else {
+        0.90
+    };
+    Some(MemoryDecision {
+        category: record.category.clone(),
+        project_id: record.project_id.clone(),
+        task_id: record.task_id.clone(),
+        confidence,
+        matched_label: format!("个人关键词：{}", matched.join("、")),
+        support: supporting_memories,
         memory_session_id: record.session_id.clone(),
     })
 }
@@ -793,6 +992,7 @@ mod tests {
             task_title: task.into(),
             confirmed_at: "2026-07-15T10:00:00Z".into(),
             user_confirmed: true,
+            source_confidence: 1.0,
         }
     }
 
@@ -839,6 +1039,33 @@ mod tests {
         assert_eq!(features.app, "screenuse");
         assert_ne!(features.page, "iot week1");
         assert!(features.workspace.is_empty());
+    }
+
+    #[test]
+    fn stale_neighbor_event_cannot_supply_the_session_page() {
+        let mut session = observed_session("WeMeetApp.exe", "h1ck0r的个人会议室");
+        session.evidence.insert(
+            0,
+            EvidenceItem {
+                kind: "page".into(),
+                label: "当前页面".into(),
+                value: "分析数据结构平均复杂度".into(),
+                weight: 0.82,
+            },
+        );
+        session.evidence.push(EvidenceItem {
+            kind: "window".into(),
+            label: "窗口".into(),
+            value: "h1ck0r的个人会议室".into(),
+            weight: 0.7,
+        });
+        let chatgpt = event("ChatGPT.exe", "分析数据结构平均复杂度");
+
+        let features = features_from_session(&session, &[chatgpt]);
+
+        assert_eq!(features.app, "wemeetapp");
+        assert_eq!(features.window, "h1ck0r的个人会议室");
+        assert!(features.page.is_empty());
     }
 
     #[test]
@@ -903,6 +1130,67 @@ mod tests {
     }
 
     #[test]
+    fn repeated_unique_manual_keywords_generalize_to_a_new_page() {
+        let records = vec![
+            record(
+                "one",
+                "wps.exe",
+                "湖北大学 推免 成果填报 证明材料 第一版",
+                "成果填报",
+            ),
+            record(
+                "two",
+                "chrome.exe",
+                "湖北大学 推免 成果填报 证明材料 第二版",
+                "成果填报",
+            ),
+        ];
+        let query = features_from_event(&event("QQ.exe", "湖北大学 推免 成果填报 证明材料 沟通群"));
+
+        let decision = choose_manual_keyword_signature(&query, &records)
+            .expect("consistent repeated keywords should resolve the task");
+        assert_eq!(decision.task_id, "成果填报");
+        assert!(decision.confidence >= 0.90);
+        assert!(decision.matched_label.starts_with("个人关键词："));
+    }
+
+    #[test]
+    fn conflicting_manual_keyword_signatures_abstain() {
+        let records = vec![
+            record(
+                "form-one",
+                "wps.exe",
+                "湖北大学 推免 成果填报 证明材料 第一版",
+                "成果填报",
+            ),
+            record(
+                "form-two",
+                "chrome.exe",
+                "湖北大学 推免 成果填报 证明材料 第二版",
+                "成果填报",
+            ),
+            record(
+                "iot-one",
+                "wps.exe",
+                "IOT 漏洞复现 测试报告 第一版",
+                "漏洞复现",
+            ),
+            record(
+                "iot-two",
+                "chrome.exe",
+                "IOT 漏洞复现 测试报告 第二版",
+                "漏洞复现",
+            ),
+        ];
+        let query = features_from_event(&event(
+            "ChatGPT.exe",
+            "湖北大学推免成果填报证明材料与IOT漏洞复现测试报告",
+        ));
+
+        assert!(choose_manual_keyword_signature(&query, &records).is_none());
+    }
+
+    #[test]
     fn exact_manual_context_beats_many_merely_similar_memories() {
         let query = features_from_event(&event("ChatGPT.exe", "IOT week1"));
         let mut records = vec![record("exact", "QQ.exe", "IOT week1", "IOT")];
@@ -928,6 +1216,15 @@ mod tests {
             &[record("one", "ChatGPT.exe", "ChatGPT", "ScreenUse")]
         )
         .is_none());
+    }
+
+    #[test]
+    fn an_unknown_application_self_title_is_not_discriminative() {
+        let mut self_titled = event("AutoProxyWeb.exe", "AutoProxyWeb");
+        self_titled.metadata = json!({});
+        let query = features_from_event(&self_titled);
+        assert_eq!(query.app, query.window);
+        assert!(!is_discriminative(&query));
     }
 
     #[test]
@@ -1007,8 +1304,47 @@ mod tests {
     fn one_ai_result_is_prompt_context_not_a_permanent_local_rule() {
         let mut ai = record("ai", "QQ.exe", "在线状态 小组群", "浪费");
         ai.user_confirmed = false;
+        ai.source_confidence = 0.93;
         assert!(choose_assignment(
             &features_from_event(&event("QQ.exe", "在线状态 小组群")),
+            &[ai]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn one_high_confidence_ai_result_teaches_only_an_exact_repeat() {
+        let mut ai = record("ai", "ChatGPT.exe", "week1", "漏洞复现");
+        ai.user_confirmed = false;
+        ai.source_confidence = 0.98;
+
+        let exact = choose_assignment(
+            &features_from_event(&event("ChatGPT.exe", "week1")),
+            &[ai.clone()],
+        )
+        .expect("exact high-confidence AI repeat");
+        assert_eq!(exact.task_id, "漏洞复现");
+        assert_eq!(exact.confidence, 0.90);
+        assert!(choose_assignment(
+            &features_from_event(&event("ChatGPT.exe", "week1 周报")),
+            &[ai]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn one_ai_meeting_room_result_does_not_become_a_permanent_topic() {
+        let mut ai = record(
+            "ai-meeting",
+            "WeMeetApp.exe",
+            "h1ck0r的个人会议室",
+            "数据结构讨论",
+        );
+        ai.user_confirmed = false;
+        ai.source_confidence = 0.98;
+
+        assert!(choose_assignment(
+            &features_from_event(&event("WeMeetApp.exe", "h1ck0r的个人会议室")),
             &[ai]
         )
         .is_none());
@@ -1021,6 +1357,7 @@ mod tests {
             .map(|index| {
                 let mut ai = record(&format!("ai-{index}"), "QQ.exe", "成果填报群", "成果填报");
                 ai.user_confirmed = false;
+                ai.source_confidence = 0.93;
                 ai
             })
             .collect::<Vec<_>>();

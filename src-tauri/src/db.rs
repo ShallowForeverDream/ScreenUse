@@ -20,6 +20,8 @@ const PERSONAL_MEMORY_BATCH_MIGRATION_KEY: &str = "migration_personal_memory_bat
 const PERSONAL_MEMORY_COHERENCE_MIGRATION_KEY: &str = "migration_personal_memory_quality_v5";
 const PERSONAL_MEMORY_AI_CONSENSUS_MIGRATION_KEY: &str =
     "migration_personal_memory_ai_consensus_v6";
+const PERSONAL_MEMORY_TASK_SIGNATURE_MIGRATION_KEY: &str =
+    "migration_personal_memory_task_signatures_v9";
 const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repair_v1";
@@ -187,6 +189,7 @@ impl AppDb {
         db.migrate_personal_memory_batches()?;
         db.migrate_personal_memory_coherence()?;
         db.migrate_personal_memory_ai_consensus()?;
+        db.migrate_personal_memory_task_signatures()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
@@ -3982,13 +3985,36 @@ impl AppDb {
         }
 
         // Start from the clean, user-confirmed memory set. AI results produced
-        // after this cutoff may be retained as low-trust observations, but only
-        // three agreeing observations can affect a future local decision.
+        // after this cutoff may be retained as low-trust observations. Ordinary
+        // AI memories need three agreeing samples; only an exceptionally
+        // confident, highly specific exact repeat can be reused after one.
         self.rebuild_personal_memory_from_confirmed()?;
         let cutoff = now();
         self.conn.lock().execute(
             "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?2)",
             params![PERSONAL_MEMORY_AI_CONSENSUS_MIGRATION_KEY, cutoff],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_personal_memory_task_signatures(&self) -> Result<()> {
+        let already_migrated = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PERSONAL_MEMORY_TASK_SIGNATURE_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        self.rebuild_personal_memory_from_confirmed()?;
+        self.conn.lock().execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PERSONAL_MEMORY_TASK_SIGNATURE_MIGRATION_KEY, now()],
         )?;
         Ok(())
     }
@@ -4361,7 +4387,7 @@ impl AppDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT m.session_id,m.features_json,m.category,m.project_id,p.name,
-                    m.task_id,t.title,m.confirmed_at,ws.user_confirmed
+                    m.task_id,t.title,m.confirmed_at,ws.user_confirmed,ws.confidence
              FROM attribution_memories m
              JOIN projects p ON p.id=m.project_id
              JOIN tasks t ON t.id=m.task_id AND t.project_id=m.project_id
@@ -4380,6 +4406,7 @@ impl AppDb {
                 task_title: row.get(6)?,
                 confirmed_at: row.get(7)?,
                 user_confirmed: row.get::<_, i64>(8)? != 0,
+                source_confidence: row.get(9)?,
             })
         })?;
         collect_rows(rows)
@@ -4439,7 +4466,7 @@ impl AppDb {
         let second_count = rows.get(1).map(|(_, count)| *count).unwrap_or_default();
         if *winner_count < 3
             || total == 0
-            || f64::from(*winner_count) / f64::from(total) < 0.90
+            || f64::from(*winner_count) / f64::from(total) < 0.80
             || *winner_count < second_count.saturating_add(3)
         {
             return Ok(None);
@@ -6023,6 +6050,92 @@ mod tests {
     }
 
     #[test]
+    fn task_signature_migration_rebuilds_stale_cross_app_memories() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-task-signature-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("会议学习").expect("create category");
+        let project = db
+            .create_project("数据结构", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "课程讨论")
+            .expect("create task");
+        let session = classification::ingest_event(
+            &db,
+            &context_event(
+                "signature-migration-meeting",
+                "WeMeetApp.exe",
+                "h1ck0r的个人会议室",
+                Utc::now() + Duration::hours(4),
+            ),
+        )
+        .expect("ingest meeting")
+        .expect("meeting session");
+        db.apply_session_correction(
+            std::slice::from_ref(&session.id),
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id),
+                task_id: Some(task.id),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("confirm meeting");
+        let polluted = crate::memory::ContextFeatures {
+            app: "wemeetapp".into(),
+            page: "分析数据结构平均复杂度".into(),
+            window: "h1ck0r的个人会议室".into(),
+            tokens: vec!["数据结构".into(), "平均复杂度".into()],
+            ..Default::default()
+        };
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE attribution_memories SET features_json=?1 WHERE session_id=?2",
+                params![
+                    serde_json::to_string(&polluted).expect("serialize"),
+                    session.id
+                ],
+            )
+            .expect("pollute old memory");
+            conn.execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![PERSONAL_MEMORY_TASK_SIGNATURE_MIGRATION_KEY],
+            )
+            .expect("reset signature migration");
+        }
+
+        db.migrate_personal_memory_task_signatures()
+            .expect("rebuild signatures");
+        let rebuilt: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT features_json FROM attribution_memories WHERE session_id=?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .expect("load rebuilt memory");
+        let rebuilt: crate::memory::ContextFeatures =
+            serde_json::from_str(&rebuilt).expect("parse rebuilt memory");
+        assert!(rebuilt.page.is_empty());
+        assert_eq!(rebuilt.window, "h1ck0r的个人会议室");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn dominant_confirmed_project_task_fills_the_required_task_level() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-dominant-project-task-test-{}",
@@ -6271,6 +6384,60 @@ mod tests {
                 .expect("count consensus memories"),
             3
         );
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn one_high_confidence_ai_review_resolves_an_exact_future_context() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-ai-exact-memory-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("科研复核").expect("create category");
+        let project = db
+            .create_project("IOT", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "漏洞复现")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(3);
+        let mut source_event = context_event("ai-exact-source", "ChatGPT.exe", "week1", base);
+        source_event.metadata["activePageTitle"] = serde_json::Value::String("week1".into());
+        let source = classification::ingest_event(&db, &source_event)
+            .expect("ingest AI source")
+            .expect("AI source session");
+        db.apply_ai_review(
+            &source.id,
+            SessionPatch {
+                summary: Some("复现 IOT 漏洞".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(false),
+            },
+            Vec::new(),
+        )
+        .expect("apply high-confidence AI review");
+
+        let mut repeat_event = context_event(
+            "ai-exact-repeat",
+            "ChatGPT.exe",
+            "week1",
+            base + Duration::seconds(10),
+        );
+        repeat_event.metadata["activePageTitle"] = serde_json::Value::String("week1".into());
+        let repeated = classification::ingest_event(&db, &repeat_event)
+            .expect("ingest exact repeat")
+            .expect("repeated session");
+        assert_eq!(repeated.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(repeated.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(repeated.category, category.name);
+        assert!(repeated.confidence >= 0.90);
+        assert_eq!(repeated.source, "context-complete");
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
@@ -9137,6 +9304,62 @@ mod tests {
                 eprintln!("  abstain: {abstention}");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires SCREENUSE_REPLAY_DATA_DIR pointing to a copied real ledger"]
+    fn replay_high_confidence_ai_fallback_learns_exact_repeats() {
+        let data_dir = std::env::var("SCREENUSE_REPLAY_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("set SCREENUSE_REPLAY_DATA_DIR to a copied ledger directory");
+        let db = AppDb::open_in(data_dir).expect("open replay database");
+        db.rebuild_personal_memory_from_confirmed()
+            .expect("rebuild coherent memories");
+        let mut targets = db
+            .load_personal_memories()
+            .expect("load confirmed examples")
+            .into_iter()
+            .filter(|record| record.user_confirmed)
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.confirmed_at.cmp(&right.confirmed_at));
+
+        let mut learned = Vec::new();
+        let mut local_hits = 0_usize;
+        let mut correct = 0_usize;
+        let mut ai_calls = 0_usize;
+        for target in &targets {
+            if let Some(decision) = crate::memory::choose_assignment(&target.features, &learned) {
+                local_hits += 1;
+                correct += usize::from(
+                    decision.category == target.category
+                        && decision.project_id == target.project_id
+                        && decision.task_id == target.task_id,
+                );
+            } else {
+                ai_calls += 1;
+                let mut ai_memory = target.clone();
+                ai_memory.user_confirmed = false;
+                ai_memory.source_confidence = 0.98;
+                learned.push(ai_memory);
+            }
+        }
+        let precision = if local_hits == 0 {
+            0.0
+        } else {
+            correct as f64 / local_hits as f64
+        };
+        let reduction = if targets.is_empty() {
+            0.0
+        } else {
+            local_hits as f64 / targets.len() as f64
+        };
+        eprintln!(
+            "AI exact-repeat learning: targets={} local_hits={local_hits} correct={correct} ai_calls={ai_calls} ai_reduction={:.2}% precision={:.2}%",
+            targets.len(),
+            reduction * 100.0,
+            precision * 100.0
+        );
+        assert!(precision >= 0.99, "AI-seeded local reuse lost precision");
     }
 
     #[test]
