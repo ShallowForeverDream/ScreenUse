@@ -183,12 +183,8 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         task_view_started_at = None;
                         if let Some(current) = active.as_mut() {
                             current.last_observed_at = Instant::now();
-                            let mut inherited_event = event;
-                            mark_metadata(
-                                &mut inherited_event,
-                                "inheritedTaskOverlay",
-                                serde_json::Value::Bool(true),
-                            );
+                            let inherited_event =
+                                inherit_active_context_event(&current.event, event);
                             let heartbeat_due = current.last_emitted_at.elapsed()
                                 >= Duration::from_secs(settings.heartbeat_seconds as u64);
                             if heartbeat_due {
@@ -443,6 +439,16 @@ fn idle_boundary_at(event: &RawActivityEvent, active_started_at: &str) -> String
 fn is_windows_task_view(event: &RawActivityEvent) -> bool {
     let app = event.app.as_deref().unwrap_or_default().trim().to_lowercase();
     let title = event.window_title.as_deref().unwrap_or_default().trim().to_lowercase();
+    if matches!(app.as_str(), "searchhost.exe" | "searchapp.exe")
+        && matches!(title.as_str(), "" | "search" | "搜索")
+    {
+        return true;
+    }
+    if app == "startmenuexperiencehost.exe"
+        && matches!(title.as_str(), "" | "start" | "开始")
+    {
+        return true;
+    }
     let shell_app = [
         "explorer.exe",
         "shellexperiencehost.exe",
@@ -463,7 +469,26 @@ fn should_inherit_active_context(
     !active_signature.is_empty()
         && active_signature != "idle"
         && observed_signature != "idle"
-        && is_task_overlay_app(event)
+        && (is_task_overlay_app(event)
+            || is_chat_auxiliary_overlay(active_signature, event))
+}
+
+fn inherit_active_context_event(
+    current: &RawActivityEvent,
+    observed: RawActivityEvent,
+) -> RawActivityEvent {
+    let mut inherited = current.clone();
+    inherited.timestamp = observed.timestamp;
+    inherited.input_stats = observed.input_stats;
+    mark_metadata(
+        &mut inherited,
+        "transientOverlay",
+        json!({
+            "app": observed.app,
+            "title": observed.window_title,
+        }),
+    );
+    inherited
 }
 
 fn is_task_overlay_app(event: &RawActivityEvent) -> bool {
@@ -472,10 +497,10 @@ fn is_task_overlay_app(event: &RawActivityEvent) -> bool {
         .as_deref()
         .unwrap_or_default()
         .trim()
-        .trim_end_matches(".exe")
         .to_lowercase();
+    let app = app.trim_end_matches(".exe");
     if matches!(
-        app.as_str(),
+        app,
         "snipaste"
             | "snippingtool"
             | "screenclippinghost"
@@ -547,52 +572,21 @@ fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
         return Some("browser-video-playing");
     }
 
-    if [
-        "vlc",
-        "mpv",
-        "potplayer",
-        "wmplayer",
-        "media player",
-        "mpc-hc",
-        "mpc-be",
-        "smplayer",
-    ]
-    .iter()
-    .any(|needle| app.contains(needle))
-    {
+    let local_media_playing = event
+        .metadata
+        .get("mediaPlaying")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if local_media_playing {
         return Some("media-player-foreground");
     }
 
-    let meeting_only_app = [
-        "wemeetapp",
-        "voovmeeting",
-        "tencentmeeting",
-    ]
-    .iter()
-    .any(|needle| app.contains(needle));
-    if meeting_only_app {
-        return Some("meeting-app-foreground");
-    }
-
-    let dedicated_meeting_app = [
-        "zoom.exe",
-        "ciscocollabhost",
-        "webexhost",
-        "webexmta",
-    ]
-    .iter()
-    .any(|needle| app.contains(needle));
-    let generic_home_title = [
-        "腾讯会议",
-        "voov meeting",
-        "zoom",
-        "zoom workplace",
-        "webex",
-        "cisco webex",
-    ]
-    .iter()
-    .any(|candidate| title == *candidate);
-    if dedicated_meeting_app && !title.is_empty() && !generic_home_title {
+    let meeting_controls_active = event
+        .metadata
+        .get("meetingActive")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if meeting_controls_active {
         return Some("meeting-app-foreground");
     }
 
@@ -608,6 +602,21 @@ fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
     ]
     .iter()
     .any(|needle| title.contains(needle));
+    let dedicated_meeting_app = [
+        "wemeetapp",
+        "voovmeeting",
+        "tencentmeeting",
+        "zoom.exe",
+        "ciscocollabhost",
+        "webexhost",
+        "webexmta",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    if dedicated_meeting_app && meeting_marker {
+        return Some("meeting-app-foreground");
+    }
+
     let collaboration_app = [
         "teams",
         "ms-teams",
@@ -617,6 +626,11 @@ fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
         "wecom",
         "wxwork",
         "skype",
+        "qq",
+        "weixin",
+        "wechat",
+        "slack",
+        "discord",
     ]
     .iter()
     .any(|needle| app.contains(needle));
@@ -689,6 +703,72 @@ unsafe fn process_image_path(pid: u32) -> Result<String> {
 }
 
 #[cfg(windows)]
+fn hosted_window_process(
+    window: windows::Win32::Foundation::HWND,
+    host_pid: u32,
+) -> Option<(u32, String)> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, GetWindowThreadProcessId,
+    };
+
+    struct SearchState {
+        host_pid: u32,
+        result: Option<(u32, String)>,
+    }
+
+    unsafe extern "system" fn visit(child: HWND, parameter: LPARAM) -> BOOL {
+        let state = &mut *(parameter.0 as *mut SearchState);
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(child, Some(&mut pid));
+        if pid == 0 || pid == state.host_pid {
+            return BOOL(1);
+        }
+        let Ok(path) = process_image_path(pid) else {
+            return BOOL(1);
+        };
+        if !is_hosted_app_candidate(&path) {
+            return BOOL(1);
+        }
+        state.result = Some((pid, path));
+        BOOL(0)
+    }
+
+    let mut state = SearchState {
+        host_pid,
+        result: None,
+    };
+    unsafe {
+        let _ = EnumChildWindows(
+            window,
+            Some(visit),
+            LPARAM((&mut state as *mut SearchState) as isize),
+        );
+    }
+    state.result
+}
+
+#[cfg(windows)]
+fn is_hosted_app_candidate(path: &str) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path)
+        .to_lowercase();
+    ![
+        "applicationframehost.exe",
+        "shellexperiencehost.exe",
+        "startmenuexperiencehost.exe",
+        "searchhost.exe",
+        "textinputhost.exe",
+        "runtimebroker.exe",
+        "dwm.exe",
+        "ctfmon.exe",
+    ]
+    .contains(&name.as_str())
+}
+
+#[cfg(windows)]
 fn capture_foreground_event() -> Result<RawActivityEvent> {
     use std::path::PathBuf;
     use windows::Win32::System::SystemInformation::GetTickCount;
@@ -714,10 +794,19 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
         let mut pid = 0u32;
         let _ = GetWindowThreadProcessId(window, Some(&mut pid));
         let executable = process_image_path(pid).ok();
-        let app = executable
+        let mut app = executable
             .as_ref()
             .and_then(|path| PathBuf::from(path).file_name().map(|name| name.to_string_lossy().to_string()))
             .unwrap_or_else(|| format!("pid:{pid}"));
+        if app.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+            if let Some((hosted_pid, hosted_path)) = hosted_window_process(window, pid) {
+                pid = hosted_pid;
+                app = PathBuf::from(&hosted_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("pid:{hosted_pid}"));
+            }
+        }
         let page_context = active_page_context(window, &app, &native_title);
         let title = page_context
             .as_ref()
@@ -735,25 +824,42 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
         };
 
         let mut metadata = json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" });
-        let workspace = page_context.as_ref().and_then(|context| context.project.clone());
+        if is_media_app(&app)
+            || (is_chat_client_app(&app) && looks_like_media_window(&native_title))
+        {
+            if let Some(playing) = foreground_media_playing(window).ok().flatten() {
+                metadata["mediaPlaying"] = serde_json::Value::Bool(playing);
+            }
+        }
+        if (is_meeting_app(&app) || is_chat_client_app(&app))
+            && foreground_meeting_active(window).unwrap_or(false)
+        {
+            metadata["meetingActive"] = serde_json::Value::Bool(true);
+        }
+        let workspace = page_context
+            .as_ref()
+            .and_then(|context| context.workspace.clone());
         if let Some(context) = page_context {
             metadata["nativeWindowTitle"] = serde_json::Value::String(native_title);
             metadata["activePageTitle"] = serde_json::Value::String(context.title.clone());
             metadata["activePageSource"] = serde_json::Value::String(context.source.into());
-            if context.source == "chatgpt-conversation" {
+            metadata["activeContextType"] = serde_json::Value::String(context.kind.into());
+            if context.kind == "conversation" {
                 metadata["conversationTitle"] =
                     serde_json::Value::String(context.title.clone());
+            }
+            if context.source == "chatgpt-conversation" {
                 metadata["chatgptConversationTitle"] =
                     serde_json::Value::String(context.title.clone());
             }
             if context.source == "qq-conversation-header" {
-                metadata["conversationTitle"] =
-                    serde_json::Value::String(context.title.clone());
                 metadata["qqConversationTitle"] =
                     serde_json::Value::String(context.title.clone());
             }
-            if let Some(project) = context.project {
-                metadata["chatgptProject"] = serde_json::Value::String(project);
+            if context.source == "chatgpt-conversation" {
+                if let Some(project) = context.workspace {
+                    metadata["chatgptProject"] = serde_json::Value::String(project);
+                }
             }
         }
 
@@ -764,7 +870,9 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             app: Some(app),
             window_title: Some(title),
             url: None,
-            file_path: executable,
+            // The process executable identifies the app, not the document being
+            // worked on. Real files are supplied by editor/document integrations.
+            file_path: None,
             workspace,
             input_stats: InputStats {
                 idle_seconds,
@@ -779,8 +887,132 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
 #[derive(Debug, Clone)]
 struct ActivePageContext {
     title: String,
-    project: Option<String>,
+    workspace: Option<String>,
     source: &'static str,
+    kind: &'static str,
+}
+
+#[cfg(windows)]
+fn foreground_media_playing(
+    window: windows::Win32::Foundation::HWND,
+) -> Result<Option<bool>> {
+    foreground_accessible_state(
+        window,
+        &[
+            "暂停",
+            "暂停播放",
+            "Pause",
+            "Pause playback",
+            "Pause video",
+        ],
+        &[
+            "播放",
+            "继续播放",
+            "Play",
+            "Play video",
+            "Resume playback",
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn foreground_meeting_active(window: windows::Win32::Foundation::HWND) -> Result<bool> {
+    Ok(foreground_accessible_state(
+        window,
+        &[
+            "离开会议",
+            "结束会议",
+            "结束通话",
+            "挂断",
+            "Leave meeting",
+            "End meeting",
+            "End call",
+            "Hang up",
+        ],
+        &[],
+    )?
+    .unwrap_or(false))
+}
+
+#[cfg(windows)]
+fn foreground_accessible_state(
+    window: windows::Win32::Foundation::HWND,
+    positive_names: &[&str],
+    negative_names: &[&str],
+) -> Result<Option<bool>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_ButtonControlTypeId,
+        UIA_ControlTypePropertyId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<bool>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ButtonControlTypeId.0),
+            )?;
+            let buttons = root.FindAll(TreeScope_Descendants, &condition)?;
+            for index in 0..buttons.Length()? {
+                let name = buttons
+                    .GetElement(index)?
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                for (names, state) in [(positive_names, true), (negative_names, false)] {
+                    if names.iter().any(|candidate| name.eq_ignore_ascii_case(candidate)) {
+                        return Ok(Some(state));
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+fn is_chat_auxiliary_overlay(active_signature: &str, event: &RawActivityEvent) -> bool {
+    let active_app = active_signature
+        .split('|')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let active_app = active_app.trim_end_matches(".exe");
+    let app = event
+        .app
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let app = app.trim_end_matches(".exe");
+    let title = event
+        .window_title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    (active_app == "qq"
+        && app == "qq"
+        && matches!(title.as_str(), "图片查看器" | "视频播放器"))
+        || ((active_app == "weixin" || active_app == "wechat")
+            && matches!(app, "wechatappex" | "wechatocr" | "wechatbrowser"))
+        || ((active_app == "weixin" || active_app == "wechat")
+            && (app == "weixin" || app == "wechat")
+            && matches!(
+                title.as_str(),
+                "图片查看" | "图片查看器" | "视频播放器" | "文件预览"
+            ))
 }
 
 #[cfg(windows)]
@@ -799,8 +1031,36 @@ fn active_page_context(
             return Some(context);
         }
     }
+    if is_browser_app_name(app) && looks_like_chatgpt_browser_window(native_title) {
+        if let Some(context) = chatgpt_selected_context(window).ok().flatten() {
+            return Some(context);
+        }
+    }
+    if is_chat_client_app(app) {
+        if let Some(context) = selected_page_context(window, app).ok().flatten() {
+            return Some(context);
+        }
+    }
+    if is_file_manager_app(app) {
+        if let Some(context) = explorer_active_context(window, app, native_title).ok().flatten() {
+            return Some(context);
+        }
+    }
     if is_document_app(app) {
         let native_document = clean_document_title(native_title, app);
+        if let Some(document) = native_document.as_deref() {
+            let (title, workspace) = document_title_and_workspace(document, app);
+            return Some(ActivePageContext {
+                title,
+                workspace,
+                source: "document-window-title",
+                kind: if is_mail_app(app) {
+                    "conversation"
+                } else {
+                    "document"
+                },
+            });
+        }
         let selected_tab = if native_document.is_none() {
             selected_document_tab(window).ok().flatten()
         } else {
@@ -814,27 +1074,337 @@ fn active_page_context(
         } else {
             None
         };
-        if let Some((title, source)) = native_document
-            .map(|title| (title, "document-window-title"))
-            .or_else(|| selected_tab.map(|title| (title, "selected-document-tab")))
+        if let Some((title, source)) = selected_tab
+            .map(|title| (title, "selected-document-tab"))
             .or_else(|| visible_wps_title.map(|title| (title, "wps-visible-window")))
         {
-            return Some(ActivePageContext { title, project: None, source });
+            return Some(ActivePageContext {
+                title,
+                workspace: None,
+                source,
+                kind: if is_mail_app(app) {
+                    "conversation"
+                } else {
+                    "document"
+                },
+            });
         }
     }
     if let Some(title) = clean_native_page_title(native_title, app) {
+        let (title, workspace) = editor_title_and_workspace(&title, app);
         return Some(ActivePageContext {
             title,
-            project: None,
+            workspace,
             source: "window-page-title",
+            kind: native_context_kind_for_window(app, native_title),
         });
     }
-    selected_page_context(window, app).ok().flatten()
+    supports_selected_page_fallback(app)
+        .then(|| selected_page_context(window, app).ok().flatten())
+        .flatten()
+}
+
+#[cfg(windows)]
+fn supports_selected_page_fallback(app: &str) -> bool {
+    is_browser_app_name(app) || is_editor_app_name(app) || is_terminal_app(app)
 }
 
 #[cfg(windows)]
 fn is_qq_app(app: &str) -> bool {
     app.eq_ignore_ascii_case("qq.exe") || app.eq_ignore_ascii_case("qq")
+}
+
+#[cfg(windows)]
+fn normalized_app_name(app: &str) -> String {
+    let name = std::path::Path::new(app.trim())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(app)
+        .trim()
+        .to_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+}
+
+#[cfg(windows)]
+fn is_chat_client_app(app: &str) -> bool {
+    matches!(
+        normalized_app_name(app).as_str(),
+        "qq"
+            | "weixin"
+            | "wechat"
+            | "wechatappex"
+            | "dingtalk"
+            | "dingtalklauncher"
+            | "feishu"
+            | "lark"
+            | "wxwork"
+            | "wecom"
+            | "teams"
+            | "ms-teams"
+            | "slack"
+            | "discord"
+            | "telegram"
+            | "telegramdesktop"
+            | "signal"
+            | "whatsapp"
+            | "line"
+            | "skype"
+            | "tim"
+            | "messenger"
+    )
+}
+
+#[cfg(windows)]
+fn is_mail_app(app: &str) -> bool {
+    matches!(
+        normalized_app_name(app).as_str(),
+        "outlook" | "olk" | "hxoutlook" | "thunderbird" | "foxmail"
+    )
+}
+
+#[cfg(windows)]
+fn is_browser_app_name(app: &str) -> bool {
+    matches!(
+        normalized_app_name(app).as_str(),
+        "chrome"
+            | "msedge"
+            | "firefox"
+            | "brave"
+            | "vivaldi"
+            | "opera"
+            | "opera_gx"
+            | "chromium"
+            | "arc"
+            | "tabbit browser"
+            | "thorium"
+            | "floorp"
+            | "waterfox"
+            | "librewolf"
+            | "duckduckgo"
+    )
+}
+
+#[cfg(windows)]
+fn looks_like_chatgpt_browser_window(title: &str) -> bool {
+    let title = title.to_lowercase();
+    title.contains("chatgpt") || title.contains("chat.openai.com")
+}
+
+#[cfg(windows)]
+fn is_file_manager_app(app: &str) -> bool {
+    matches!(
+        normalized_app_name(app).as_str(),
+        "explorer"
+            | "totalcmd64"
+            | "totalcmd"
+            | "files"
+            | "directory opus"
+            | "dopus"
+            | "freecommander"
+            | "doublecmd"
+            | "everything"
+    )
+}
+
+#[cfg(windows)]
+fn is_editor_app_name(app: &str) -> bool {
+    let app = normalized_app_name(app);
+    matches!(
+        app.as_str(),
+        "code"
+            | "code - insiders"
+            | "code-insiders"
+            | "cursor"
+            | "windsurf"
+            | "codium"
+            | "devenv"
+            | "idea64"
+            | "idea"
+            | "pycharm64"
+            | "pycharm"
+            | "webstorm64"
+            | "webstorm"
+            | "rustrover64"
+            | "rustrover"
+            | "clion64"
+            | "clion"
+            | "studio64"
+            | "ida64"
+            | "ida"
+            | "ghidra"
+            | "sublime_text"
+            | "zed"
+            | "rstudio"
+            | "matlab"
+            | "unity"
+            | "unityhub"
+            | "unrealeditor"
+            | "godot"
+            | "photoshop"
+            | "illustrator"
+            | "figma"
+            | "blender"
+            | "premiere pro"
+            | "afterfx"
+            | "acad"
+            | "rider64"
+            | "rider"
+            | "eclipse"
+            | "netbeans64"
+            | "netbeans"
+            | "qtcreator"
+            | "codeblocks"
+            | "devcpp"
+            | "arduino ide"
+            | "arduino"
+            | "dbeaver"
+            | "datagrip64"
+            | "datagrip"
+            | "navicat"
+            | "postman"
+            | "insomnia"
+            | "fiddler"
+            | "wireshark"
+            | "burpsuite"
+            | "docker desktop"
+            | "githubdesktop"
+            | "gitkraken"
+            | "krita"
+            | "inkscape"
+            | "resolve"
+            | "affinity photo 2"
+            | "affinity designer 2"
+            | "sketchup"
+    )
+}
+
+#[cfg(windows)]
+fn is_terminal_app(app: &str) -> bool {
+    matches!(
+        normalized_app_name(app).as_str(),
+        "windowsterminal"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "wezterm-gui"
+            | "alacritty"
+            | "kitty"
+            | "mintty"
+            | "conemu64"
+            | "conemu"
+            | "mobaxterm"
+            | "xshell"
+            | "putty"
+            | "securecrt"
+            | "git-bash"
+            | "bash"
+            | "wsl"
+    )
+}
+
+#[cfg(windows)]
+fn is_meeting_app(app: &str) -> bool {
+    let app = normalized_app_name(app);
+    [
+        "wemeetapp",
+        "voovmeeting",
+        "tencentmeeting",
+        "zoom",
+        "ciscocollabhost",
+        "webexhost",
+        "webexmta",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle))
+}
+
+#[cfg(windows)]
+fn is_media_app(app: &str) -> bool {
+    let app = normalized_app_name(app);
+    [
+        "vlc",
+        "mpv",
+        "potplayer",
+        "wmplayer",
+        "microsoft.media.player",
+        "mpc-hc",
+        "mpc-be",
+        "smplayer",
+        "bilibili",
+        "哔哩哔哩",
+        "iqiyi",
+        "爱奇艺",
+        "youku",
+        "优酷",
+        "qqmusic",
+        "cloudmusic",
+        "spotify",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle))
+}
+
+#[cfg(windows)]
+fn looks_like_media_window(title: &str) -> bool {
+    let title = title.to_lowercase();
+    [
+        "视频播放器",
+        "视频播放",
+        "video player",
+        "playing video",
+        "媒体播放",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle))
+}
+
+#[cfg(windows)]
+fn native_context_kind(app: &str) -> &'static str {
+    if is_browser_app_name(app) {
+        "browser-page"
+    } else if is_chat_client_app(app) || is_mail_app(app) {
+        "conversation"
+    } else if is_document_app(app) {
+        "document"
+    } else if is_editor_app_name(app) {
+        "editor"
+    } else if is_file_manager_app(app) {
+        "folder"
+    } else if is_terminal_app(app) {
+        "terminal"
+    } else if is_meeting_app(app) {
+        "meeting"
+    } else if is_media_app(app) {
+        "media"
+    } else {
+        "page"
+    }
+}
+
+#[cfg(windows)]
+fn native_context_kind_for_window(app: &str, title: &str) -> &'static str {
+    if is_browser_app_name(app) {
+        "browser-page"
+    } else if is_editor_product_title(title) {
+        "editor"
+    } else {
+        native_context_kind(app)
+    }
+}
+
+#[cfg(windows)]
+fn is_editor_product_title(title: &str) -> bool {
+    let title = title.to_lowercase();
+    [
+        "ghidra",
+        "eclipse ide",
+        "apache netbeans",
+        "burp suite",
+        "android studio",
+        "intellij idea",
+    ]
+    .iter()
+    .any(|product| title == *product || title.contains(&format!(" - {product}")))
 }
 
 #[cfg(windows)]
@@ -896,8 +1466,9 @@ fn qq_active_conversation_context(
                 if let Some(title) = clean_qq_conversation_title(&name) {
                     return Ok(Some(ActivePageContext {
                         title,
-                        project: None,
+                        workspace: None,
                         source: "qq-conversation-header",
+                        kind: "conversation",
                     }));
                 }
             }
@@ -929,8 +1500,9 @@ fn qq_active_conversation_context(
                 if let Some(title) = clean_qq_conversation_title(&name) {
                     return Ok(Some(ActivePageContext {
                         title,
-                        project: None,
+                        workspace: None,
                         source: "qq-conversation-header",
+                        kind: "conversation",
                     }));
                 }
             }
@@ -968,6 +1540,180 @@ fn clean_qq_conversation_title(value: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn explorer_active_context(
+    window: windows::Win32::Foundation::HWND,
+    app: &str,
+    native_title: &str,
+) -> Result<Option<ActivePageContext>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern,
+        IUIAutomationValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+        UIA_ControlTypePropertyId, UIA_SelectionItemPatternId, UIA_TabItemControlTypeId,
+        UIA_ValuePatternId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+
+            let address_condition = automation.CreatePropertyCondition(
+                UIA_AutomationIdPropertyId,
+                &VARIANT::from("TextBox"),
+            )?;
+            let address_boxes = root.FindAll(TreeScope_Descendants, &address_condition)?;
+            for index in 0..address_boxes.Length()? {
+                let element = address_boxes.GetElement(index)?;
+                if element.CurrentIsOffscreen()?.as_bool() {
+                    continue;
+                }
+                let name = element
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                if !matches!(name.as_str(), "地址栏" | "Address bar") {
+                    continue;
+                }
+                let value_pattern: IUIAutomationValuePattern = match element
+                    .GetCurrentPatternAs(UIA_ValuePatternId)
+                {
+                    Ok(pattern) => pattern,
+                    Err(_) => continue,
+                };
+                let value = value_pattern.CurrentValue()?.to_string();
+                if let Some((title, workspace)) = clean_explorer_location(&value) {
+                    return Ok(Some(ActivePageContext {
+                        title,
+                        workspace: Some(workspace),
+                        source: "explorer-address-bar",
+                        kind: "folder",
+                    }));
+                }
+            }
+
+            let tab_condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_TabItemControlTypeId.0),
+            )?;
+            let tabs = root.FindAll(TreeScope_Descendants, &tab_condition)?;
+            for index in 0..tabs.Length()? {
+                let element = tabs.GetElement(index)?;
+                let selected: IUIAutomationSelectionItemPattern = match element
+                    .GetCurrentPatternAs(UIA_SelectionItemPatternId)
+                {
+                    Ok(pattern) => pattern,
+                    Err(_) => continue,
+                };
+                if selected.CurrentIsSelected()?.as_bool() {
+                    let name = element.CurrentName()?.to_string();
+                    if let Some(title) = clean_explorer_folder_name(&name) {
+                        return Ok(Some(ActivePageContext {
+                            title,
+                            workspace: None,
+                            source: "explorer-selected-tab",
+                            kind: "folder",
+                        }));
+                    }
+                }
+            }
+
+            Ok(clean_file_manager_window_title(native_title, app).map(|title| ActivePageContext {
+                title,
+                workspace: None,
+                source: "explorer-window-title",
+                kind: "folder",
+            }))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn clean_explorer_location(value: &str) -> Option<(String, String)> {
+    let workspace = value
+        .trim()
+        .strip_prefix("地址: ")
+        .or_else(|| value.trim().strip_prefix("Address: "))
+        .unwrap_or(value.trim())
+        .trim();
+    if workspace.is_empty() || matches!(workspace, "地址栏" | "Address bar") {
+        return None;
+    }
+    let title = workspace
+        .rsplit(['\\', '/', '>'])
+        .map(str::trim)
+        .find(|part| !part.is_empty())?;
+    clean_explorer_folder_name(title).map(|title| (title, workspace.to_string()))
+}
+
+#[cfg(windows)]
+fn clean_explorer_window_title(value: &str) -> Option<String> {
+    let mut title = value.replace(['\r', '\n', '\t'], " ").trim().to_string();
+    for suffix in [" - 文件资源管理器", " - File Explorer", " - Windows Explorer"] {
+        if let Some(stripped) = title.strip_suffix(suffix) {
+            title = stripped.trim().to_string();
+            break;
+        }
+    }
+    if let Some((first, rest)) = title.split_once(" 和 ") {
+        if rest.contains("个其他选项卡") {
+            title = first.trim().to_string();
+        }
+    }
+    if let Some((first, rest)) = title.split_once(" and ") {
+        if rest.contains("more tab") {
+            title = first.trim().to_string();
+        }
+    }
+    clean_explorer_folder_name(&title)
+}
+
+#[cfg(windows)]
+fn clean_file_manager_window_title(value: &str, app: &str) -> Option<String> {
+    if normalized_app_name(app) == "explorer" {
+        return clean_explorer_window_title(value);
+    }
+    let title = strip_product_suffix(
+        value,
+        &[
+            " - Total Commander",
+            " - Files",
+            " - Directory Opus",
+            " - FreeCommander",
+            " - Double Commander",
+            " - Everything",
+        ],
+    );
+    clean_explorer_folder_name(&title)
+}
+
+#[cfg(windows)]
+fn clean_explorer_folder_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 180
+        || matches!(
+            value.to_lowercase().as_str(),
+            "文件资源管理器" | "file explorer" | "windows explorer" | "此电脑" | "this pc"
+        )
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(windows)]
 fn is_wps_app(app: &str) -> bool {
     ["wps.exe", "et.exe", "wpp.exe", "wpspdf.exe"]
         .iter()
@@ -989,6 +1735,22 @@ fn is_document_app(app: &str) -> bool {
             "obsidian.exe",
             "notepad.exe",
             "notepad++.exe",
+            "sumatrapdf.exe",
+            "foxitpdfreader.exe",
+            "foxitphantompdf.exe",
+            "soffice.bin",
+            "swriter.exe",
+            "scalc.exe",
+            "simpress.exe",
+            "notion.exe",
+            "logseq.exe",
+            "joplin.exe",
+            "zettlr.exe",
+            "calibre.exe",
+            "ebook-viewer.exe",
+            "xournalpp.exe",
+            "drawboardpdf.exe",
+            "mupdf.exe",
         ]
         .iter()
         .any(|name| app.eq_ignore_ascii_case(name))
@@ -1071,8 +1833,17 @@ fn selected_page_context(
             }
             Ok(best.map(|(_, title)| ActivePageContext {
                 title,
-                project: None,
-                source: "selected-page-item",
+                workspace: None,
+                source: if is_chat_client_app(app) {
+                    "chat-conversation-selection"
+                } else {
+                    "selected-page-item"
+                },
+                kind: if is_chat_client_app(app) {
+                    "conversation"
+                } else {
+                    native_context_kind(app)
+                },
             }))
         })();
         if initialized {
@@ -1098,7 +1869,163 @@ fn selected_item_page_title(name: &str, automation_id: &str, app: &str) -> Optio
 
 #[cfg(windows)]
 fn clean_native_page_title(value: &str, app: &str) -> Option<String> {
-    clean_page_label(value, app)
+    let cleaned = if is_file_manager_app(app) {
+        clean_file_manager_window_title(value, app)?
+    } else {
+        let markers: &[&str] = if is_browser_app_name(app) {
+            &[
+                " - Google Chrome",
+                " — Google Chrome",
+                " - Microsoft Edge",
+                " — Microsoft Edge",
+                " — Mozilla Firefox",
+                " - Mozilla Firefox",
+                " - Brave",
+                " - Vivaldi",
+                " - Opera",
+                " - Chromium",
+                " - Tabbit",
+                " - Thorium",
+                " - Floorp",
+                " - Waterfox",
+                " - LibreWolf",
+                " - DuckDuckGo",
+            ]
+        } else if is_editor_app_name(app) || is_editor_product_title(value) {
+            &[
+                " - Visual Studio Code",
+                " - Cursor",
+                " - Windsurf",
+                " - VSCodium",
+                " - Microsoft Visual Studio",
+                " - IntelliJ IDEA",
+                " - PyCharm",
+                " - WebStorm",
+                " - RustRover",
+                " - CLion",
+                " - Android Studio",
+                " - IDA Pro",
+                " - IDA",
+                " - Ghidra",
+                " - Sublime Text",
+                " - Zed",
+                " - RStudio",
+                " - MATLAB",
+                " - Unity",
+                " - Unreal Editor",
+                " - Godot Engine",
+                " - Adobe Photoshop",
+                " - Adobe Illustrator",
+                " - Figma",
+                " - Blender",
+                " - Adobe Premiere Pro",
+                " - Adobe After Effects",
+                " - AutoCAD",
+                " - Rider",
+                " - Eclipse IDE",
+                " - Apache NetBeans IDE",
+                " - Qt Creator",
+                " - Code::Blocks",
+                " - Arduino IDE",
+                " - DBeaver",
+                " - DataGrip",
+                " - Navicat Premium",
+                " - Postman",
+                " - Insomnia",
+                " - Fiddler",
+                " - Wireshark",
+                " - Burp Suite Professional",
+                " - Burp Suite Community Edition",
+                " - Docker Desktop",
+                " - GitHub Desktop",
+                " - GitKraken",
+                " - Krita",
+                " - Inkscape",
+                " - DaVinci Resolve",
+                " - Affinity Photo 2",
+                " - Affinity Designer 2",
+                " - SketchUp",
+            ]
+        } else if is_meeting_app(app) {
+            &[
+                " - Zoom Workplace",
+                " - Zoom",
+                " - Cisco Webex",
+                " - Webex",
+                " - 腾讯会议",
+                " - VooV Meeting",
+            ]
+        } else if is_terminal_app(app) {
+            &[
+                " - Windows Terminal",
+                " - PowerShell",
+                " - Command Prompt",
+                " - WezTerm",
+                " - Alacritty",
+            ]
+        } else if is_media_app(app) {
+            &[
+                " - VLC media player",
+                " - PotPlayer",
+                " - Windows Media Player",
+                " - Media Player",
+                " - Spotify",
+                " - 网易云音乐",
+                " - QQ音乐",
+            ]
+        } else if is_chat_client_app(app) {
+            &[
+                " - 微信",
+                " - WeChat",
+                " - 钉钉",
+                " - DingTalk",
+                " - 飞书",
+                " - Feishu",
+                " - Lark",
+                " - 企业微信",
+                " - WeCom",
+                " - Microsoft Teams",
+                " - Slack",
+                " - Discord",
+                " - Telegram",
+                " - WhatsApp",
+                " - Signal",
+            ]
+        } else if is_mail_app(app) {
+            &[
+                " - Outlook",
+                " - Microsoft Outlook",
+                " - Mozilla Thunderbird",
+                " - Thunderbird",
+                " - Foxmail",
+            ]
+        } else {
+            &[]
+        };
+        strip_product_suffix(value, markers)
+    };
+    clean_page_label(&cleaned, app)
+}
+
+#[cfg(windows)]
+fn strip_product_suffix(value: &str, markers: &[&str]) -> String {
+    let normalized = value.replace(['\r', '\n', '\t'], " ");
+    let lower = normalized.to_lowercase();
+    for marker in markers {
+        let marker = marker.to_lowercase();
+        if let Some(index) = lower.rfind(&marker) {
+            let tail = lower[index + marker.len()..].trim();
+            if tail.is_empty()
+                || tail
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+            {
+                return normalized[..index].trim().to_string();
+            }
+        }
+    }
+    normalized.trim().to_string()
 }
 
 #[cfg(windows)]
@@ -1128,6 +2055,19 @@ fn is_generic_page_label(value: &str, app: &str) -> bool {
     if value == app_name {
         return true;
     }
+    if value.strip_prefix(&app_name).is_some_and(|tail| {
+        let tail = tail.trim();
+        !tail.is_empty()
+            && tail
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+            && tail
+                .chars()
+                .all(|character| character.is_ascii_digit() || ".- _()".contains(character))
+    }) {
+        return true;
+    }
     [
         "qq", "腾讯qq", "微信", "wechat", "weixin", "钉钉", "dingtalk", "企业微信",
         "wecom", "飞书", "feishu", "lark", "chatgpt", "codex", "screenuse", "wps",
@@ -1138,7 +2078,15 @@ fn is_generic_page_label(value: &str, app: &str) -> bool {
         "tabbit browser", "windows explorer", "file explorer", "文件资源管理器",
         "消息", "聊天", "会话", "通讯录", "联系人", "工作台", "文档", "会议", "邮箱",
         "日历", "首页", "好友", "群聊", "搜索", "设置", "home", "messages", "contacts",
-        "workbench", "calendar", "settings", "main window", "mainwindow",
+        "workbench", "calendar", "settings", "main window", "mainwindow", "此电脑", "this pc",
+        "腾讯会议", "voov meeting", "zoom", "zoom workplace", "webex", "cisco webex",
+        "visual studio code", "cursor", "windsurf", "vscodium", "intellij idea", "pycharm",
+        "webstorm", "rustrover", "clion", "android studio", "windows terminal", "powershell",
+        "windows powershell", "command prompt", "命令提示符", "vlc media player", "potplayer",
+        "media player", "spotify", "网易云音乐", "qq音乐", "图片查看器", "视频播放器",
+        "photos", "microsoft photos", "照片", "calculator", "计算器", "paint",
+        "microsoft paint", "画图", "camera", "相机", "clock", "时钟",
+        "语音通话", "视频通话", "屏幕共享", "邀请加群", "群应用", "发送", "send",
     ]
     .contains(&value.as_str())
         || looks_like_clock(&value)
@@ -1235,8 +2183,9 @@ fn chatgpt_selected_context(
             }
             Ok(title.map(|title| ActivePageContext {
                 title,
-                project,
+                workspace: project,
                 source: "chatgpt-conversation",
+                kind: "conversation",
             }))
         })();
         if initialized {
@@ -1307,7 +2256,6 @@ fn selected_document_tab(
 
 #[cfg(windows)]
 fn clean_document_title(native_title: &str, app: &str) -> Option<String> {
-    let mut title = native_title.replace(['\r', '\n', '\t'], " ").trim().to_string();
     let suffixes: &[&str] = if is_wps_app(app) {
         &[" - WPS Office", " – WPS Office", " — WPS Office", " - WPS"]
     } else {
@@ -1328,15 +2276,71 @@ fn clean_document_title(native_title: &str, app: &str) -> Option<String> {
             " - Obsidian",
             " - Notepad++",
             " - Notepad",
+            " - SumatraPDF",
+            " - Foxit PDF Reader",
+            " - Foxit PDF Editor",
+            " - LibreOffice Writer",
+            " - LibreOffice Calc",
+            " - LibreOffice Impress",
+            " - LibreOffice",
+            " - Notion",
+            " | Notion",
+            " — Notion",
+            " - Logseq",
+            " - Joplin",
+            " - Zettlr",
+            " - calibre",
+            " - E-book viewer",
+            " - Xournal++",
+            " - Drawboard PDF",
+            " - MuPDF",
         ]
     };
-    for suffix in suffixes {
-        if let Some(stripped) = title.strip_suffix(suffix) {
-            title = stripped.trim().to_string();
-            break;
+    let title = strip_product_suffix(native_title, suffixes);
+    valid_document_title(&title)
+}
+
+#[cfg(windows)]
+fn document_title_and_workspace(title: &str, app: &str) -> (String, Option<String>) {
+    let app = normalized_app_name(app);
+    if matches!(app.as_str(), "obsidian" | "logseq") {
+        if let Some((document, workspace)) = title.rsplit_once(" - ") {
+            let document = document.trim();
+            let workspace = workspace.trim();
+            if !document.is_empty() && !workspace.is_empty() {
+                return (document.to_string(), Some(workspace.to_string()));
+            }
         }
     }
-    valid_document_title(&title)
+    (title.to_string(), None)
+}
+
+#[cfg(windows)]
+fn editor_title_and_workspace(title: &str, app: &str) -> (String, Option<String>) {
+    if matches!(
+        normalized_app_name(app).as_str(),
+        "code" | "code - insiders" | "code-insiders" | "cursor" | "windsurf" | "codium"
+    ) {
+        if let Some((document, workspace)) = title.rsplit_once(" - ") {
+            let document = document.trim();
+            let workspace = workspace.trim();
+            if !document.is_empty()
+                && !workspace.is_empty()
+                && !matches!(
+                    workspace.to_lowercase().as_str(),
+                    "code"
+                        | "visual studio code"
+                        | "visual studio code - insiders"
+                        | "cursor"
+                        | "windsurf"
+                        | "vscodium"
+                )
+            {
+                return (document.to_string(), Some(workspace.to_string()));
+            }
+        }
+    }
+    (title.to_string(), None)
 }
 
 #[cfg(windows)]
@@ -1349,7 +2353,10 @@ fn valid_document_title(value: &str) -> Option<String> {
             "wps" | "wps office" | "word" | "microsoft word" | "excel" | "microsoft excel"
                 | "powerpoint" | "microsoft powerpoint" | "onenote" | "microsoft onenote"
                 | "outlook" | "adobe acrobat" | "acrobat reader" | "typora" | "obsidian"
-                | "notepad" | "notepad++"
+                | "notepad" | "notepad++" | "sumatrapdf" | "foxit pdf reader"
+                | "foxit pdf editor" | "libreoffice" | "notion" | "logseq" | "joplin"
+                | "zettlr"
+                | "calibre" | "e-book viewer" | "xournal++" | "drawboard pdf" | "mupdf"
         )
     {
         None
@@ -1364,7 +2371,7 @@ fn valid_selected_document_title(value: &str) -> Option<String> {
     let normalized = title.to_ascii_lowercase();
     [
         ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".txt", ".md",
-        ".csv", ".rtf",
+        ".csv", ".rtf", ".odt", ".ods", ".odp", ".tex", ".epub",
     ]
     .iter()
     .any(|extension| normalized.contains(extension))
@@ -1514,6 +2521,39 @@ mod tests {
         normal.window_title = Some("ScreenUse - Visual Studio Code".into());
         let observed = context_signature(&normal, 180);
         assert!(!should_inherit_active_context("chatgpt|ScreenUse||||", &observed, &normal));
+
+        let active = RawActivityEvent {
+            app: Some("QQ.exe".into()),
+            window_title: Some("科研讨论群".into()),
+            timestamp: "2026-07-14T00:59:55Z".into(),
+            metadata: json!({"activePageTitle": "科研讨论群"}),
+            ..normal.clone()
+        };
+        let viewer = RawActivityEvent {
+            app: Some("QQ.exe".into()),
+            window_title: Some("图片查看器".into()),
+            timestamp: "2026-07-14T01:00:05Z".into(),
+            ..normal
+        };
+        let viewer_signature = context_signature(&viewer, 180);
+        assert!(should_inherit_active_context(
+            &context_signature(&active, 180),
+            &viewer_signature,
+            &viewer,
+        ));
+        assert!(!should_inherit_active_context(
+            "chrome.exe|论文检索||||",
+            &viewer_signature,
+            &viewer,
+        ));
+        let inherited = inherit_active_context_event(&active, viewer);
+        assert_eq!(inherited.app.as_deref(), Some("QQ.exe"));
+        assert_eq!(inherited.window_title.as_deref(), Some("科研讨论群"));
+        assert_eq!(inherited.timestamp, "2026-07-14T01:00:05Z");
+        assert_eq!(
+            inherited.metadata["transientOverlay"]["title"].as_str(),
+            Some("图片查看器")
+        );
     }
 
     #[test]
@@ -1619,9 +2659,15 @@ mod tests {
         assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("Zoom.exe".into()),
             window_title: Some("Weekly sync".into()),
-            metadata: json!({}),
+            metadata: json!({"meetingActive": true}),
             ..event.clone()
         }), Some("meeting-app-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("Zoom.exe".into()),
+            window_title: Some("Zoom Workplace".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), None);
         assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("ms-teams.exe".into()),
             window_title: Some("产品周会 - Microsoft Teams meeting".into()),
@@ -1649,9 +2695,15 @@ mod tests {
         assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("vlc.exe".into()),
             window_title: Some("recording.mp4".into()),
-            metadata: json!({}),
+            metadata: json!({"mediaPlaying": true}),
             ..event.clone()
         }), Some("media-player-foreground"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("vlc.exe".into()),
+            window_title: Some("recording.mp4".into()),
+            metadata: json!({"mediaPlaying": false}),
+            ..event.clone()
+        }), None);
         assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("notepad.exe".into()),
             window_title: Some("notes.txt".into()),
@@ -1693,6 +2745,11 @@ mod tests {
             metadata: json!({}),
         };
         assert!(is_windows_task_view(&event));
+        assert!(is_windows_task_view(&RawActivityEvent {
+            app: Some("SearchHost.exe".into()),
+            window_title: Some("搜索".into()),
+            ..event.clone()
+        }));
         assert!(!is_windows_task_view(&RawActivityEvent {
             app: Some("chrome.exe".into()),
             ..event
@@ -1731,9 +2788,180 @@ mod tests {
     fn supported_page_apps_cover_chat_and_office_tools() {
         assert!(is_chat_workspace_app("ChatGPT.exe"));
         assert!(is_chat_workspace_app("codex.exe"));
+        assert!(is_chat_client_app("Weixin.exe"));
+        assert!(is_chat_client_app("DingTalk.exe"));
+        assert!(is_chat_client_app("Feishu.exe"));
+        assert!(is_chat_client_app("ms-teams.exe"));
+        assert!(is_chat_client_app("Slack.exe"));
         assert!(is_document_app("wps.exe"));
         assert!(is_document_app("EXCEL.EXE"));
+        assert!(is_editor_app_name("Code.exe"));
+        assert!(is_editor_app_name("pycharm64.exe"));
+        assert!(is_terminal_app("WindowsTerminal.exe"));
+        assert!(is_file_manager_app("explorer.exe"));
         assert!(!is_document_app("steam.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn documented_common_app_families_have_a_precision_profile() {
+        for app in [
+            "QQ.exe",
+            "Weixin.exe",
+            "DingTalk.exe",
+            "Feishu.exe",
+            "wxwork.exe",
+            "ms-teams.exe",
+            "Slack.exe",
+            "Discord.exe",
+            "Telegram.exe",
+            "Signal.exe",
+            "WhatsApp.exe",
+            "LINE.exe",
+            "TIM.exe",
+        ] {
+            assert!(is_chat_client_app(app), "missing chat profile for {app}");
+        }
+        for app in [
+            "chrome.exe",
+            "msedge.exe",
+            "firefox.exe",
+            "brave.exe",
+            "vivaldi.exe",
+            "opera.exe",
+            "arc.exe",
+            "Tabbit Browser.exe",
+        ] {
+            assert!(is_browser_app_name(app), "missing browser profile for {app}");
+        }
+        for app in [
+            "wps.exe",
+            "WINWORD.EXE",
+            "EXCEL.EXE",
+            "POWERPNT.EXE",
+            "Obsidian.exe",
+            "Typora.exe",
+            "AcroRd32.exe",
+            "soffice.bin",
+            "Notion.exe",
+            "calibre.exe",
+        ] {
+            assert!(is_document_app(app), "missing document profile for {app}");
+        }
+        for app in [
+            "Code.exe",
+            "Cursor.exe",
+            "pycharm64.exe",
+            "rider64.exe",
+            "ida64.exe",
+            "ghidra.exe",
+            "DBeaver.exe",
+            "Postman.exe",
+            "Wireshark.exe",
+            "Unity.exe",
+            "Blender.exe",
+        ] {
+            assert!(is_editor_app_name(app), "missing work profile for {app}");
+        }
+        for app in [
+            "WindowsTerminal.exe",
+            "pwsh.exe",
+            "cmd.exe",
+            "MobaXterm.exe",
+            "Xshell.exe",
+            "putty.exe",
+            "wsl.exe",
+        ] {
+            assert!(is_terminal_app(app), "missing terminal profile for {app}");
+        }
+        for app in ["explorer.exe", "TOTALCMD64.EXE", "Files.exe", "dopus.exe"] {
+            assert!(is_file_manager_app(app), "missing file manager profile for {app}");
+        }
+        for app in ["OUTLOOK.EXE", "olk.exe", "thunderbird.exe", "Foxmail.exe"] {
+            assert!(is_mail_app(app), "missing mail profile for {app}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_titles_are_cleaned_for_common_app_families() {
+        assert_eq!(
+            clean_native_page_title("icpc-trainer - Google Chrome", "chrome.exe"),
+            Some("icpc-trainer".into())
+        );
+        assert_eq!(
+            clean_document_title(
+                "CVE-2026-44277 - WorkSpace - Obsidian 1.12.7",
+                "Obsidian.exe",
+            ),
+            Some("CVE-2026-44277 - WorkSpace".into())
+        );
+        assert_eq!(
+            document_title_and_workspace("CVE-2026-44277 - WorkSpace", "Obsidian.exe"),
+            ("CVE-2026-44277".into(), Some("WorkSpace".into()))
+        );
+        assert_eq!(
+            editor_title_and_workspace("main.rs - ScreenUse", "Code.exe"),
+            ("main.rs".into(), Some("ScreenUse".into()))
+        );
+        assert_eq!(
+            clean_native_page_title("main.rs - ScreenUse - Visual Studio Code", "Code.exe"),
+            Some("main.rs - ScreenUse".into())
+        );
+        assert_eq!(
+            clean_native_page_title("科研周会 - Zoom Workplace", "Zoom.exe"),
+            Some("科研周会".into())
+        );
+        assert_eq!(
+            clean_native_page_title("lecture.mp4 - VLC media player", "vlc.exe"),
+            Some("lecture.mp4".into())
+        );
+        assert_eq!(
+            clean_explorer_window_title("release 和 3 个其他选项卡 - 文件资源管理器"),
+            Some("release".into())
+        );
+        assert_eq!(
+            clean_explorer_location(r"C:\College\ICPC\icpc-trainer"),
+            Some(("icpc-trainer".into(), r"C:\College\ICPC\icpc-trainer".into()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_context_types_cover_each_precision_signal() {
+        assert_eq!(native_context_kind("chrome.exe"), "browser-page");
+        assert_eq!(native_context_kind("Weixin.exe"), "conversation");
+        assert_eq!(native_context_kind("OUTLOOK.EXE"), "conversation");
+        assert_eq!(native_context_kind("wps.exe"), "document");
+        assert_eq!(native_context_kind("Code.exe"), "editor");
+        assert_eq!(native_context_kind("explorer.exe"), "folder");
+        assert_eq!(native_context_kind("WindowsTerminal.exe"), "terminal");
+        assert_eq!(native_context_kind("WeMeetApp.exe"), "meeting");
+        assert_eq!(native_context_kind("vlc.exe"), "media");
+        assert!(looks_like_media_window("QQ · 视频播放器"));
+        assert!(!looks_like_media_window("QQ · 图片查看器"));
+        assert_eq!(
+            native_context_kind_for_window("javaw.exe", "firmware.bin - Ghidra"),
+            "editor"
+        );
+        assert_eq!(
+            native_context_kind_for_window("chrome.exe", "Ghidra - Google Chrome"),
+            "browser-page"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hosted_uwp_resolution_rejects_windows_shell_helpers() {
+        assert!(is_hosted_app_candidate(
+            r"C:\Program Files\WindowsApps\Microsoft.Windows.Photos\Microsoft.Photos.exe"
+        ));
+        assert!(!is_hosted_app_candidate(
+            r"C:\Windows\System32\ApplicationFrameHost.exe"
+        ));
+        assert!(!is_hosted_app_candidate(
+            r"C:\Windows\SystemApps\TextInputHost.exe"
+        ));
     }
 
     #[cfg(windows)]
@@ -1789,5 +3017,8 @@ mod tests {
             clean_native_page_title("ICPC 训练群", "DingTalk.exe"),
             Some("ICPC 训练群".into())
         );
+        assert!(!supports_selected_page_fallback("screenuse.exe"));
+        assert!(supports_selected_page_fallback("WindowsTerminal.exe"));
     }
+
 }

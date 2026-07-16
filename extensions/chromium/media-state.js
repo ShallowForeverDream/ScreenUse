@@ -40,7 +40,7 @@ function scheduleContextCheck() {
   setTimeout(publishContextIfChanged, 600);
 }
 
-if (['chatgpt.com', 'www.chatgpt.com', 'chat.openai.com'].includes(location.hostname)) {
+if (globalThis.ScreenUsePageContext?.isSupportedConversationHost?.(location.hostname)) {
   const observer = new MutationObserver(scheduleContextCheck);
   const roots = [document.querySelector('nav'), document.querySelector('aside'), document.querySelector('title')]
     .filter((root, index, items) => root && items.indexOf(root) === index);

@@ -361,6 +361,37 @@ pub fn canonical_context(value: &str) -> String {
     }
 }
 
+pub fn clear_legacy_process_file(features: &mut ContextFeatures) -> bool {
+    let file_name = features
+        .file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    let Some(stem) = file_name
+        .to_lowercase()
+        .strip_suffix(".exe")
+        .map(ToOwned::to_owned)
+    else {
+        return false;
+    };
+    if normalize(&stem) != normalize(&features.app) {
+        return false;
+    }
+    features.file.clear();
+    features.tokens.clear();
+    for value in [
+        &features.page,
+        &features.window,
+        &features.domain,
+        &features.workspace,
+    ] {
+        features.tokens.extend(text_tokens(value));
+    }
+    features.tokens.sort();
+    features.tokens.dedup();
+    true
+}
+
 fn build_features(
     app: &str,
     page: &str,
@@ -649,5 +680,27 @@ mod tests {
             "保研"
         );
         assert!(canonical_context("ChatGPT - Google Chrome").is_empty());
+    }
+
+    #[test]
+    fn clears_only_a_process_executable_masquerading_as_the_active_file() {
+        let mut polluted = ContextFeatures {
+            app: "screenuse".into(),
+            page: "时间轴".into(),
+            file: "users/me/screenuse.exe".into(),
+            tokens: vec!["screenuse".into(), "时间".into()],
+            ..Default::default()
+        };
+        assert!(clear_legacy_process_file(&mut polluted));
+        assert!(polluted.file.is_empty());
+        assert!(!polluted.tokens.iter().any(|token| token == "screenuse"));
+
+        let mut binary = ContextFeatures {
+            app: "ida".into(),
+            file: "ctf/challenge.exe".into(),
+            ..Default::default()
+        };
+        assert!(!clear_legacy_process_file(&mut binary));
+        assert_eq!(binary.file, "ctf/challenge.exe");
     }
 }

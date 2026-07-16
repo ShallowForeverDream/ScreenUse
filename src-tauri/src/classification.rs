@@ -352,6 +352,33 @@ fn should_create_workspace_project(event: &RawActivityEvent, workspace: Option<&
             "webstorm",
             "rustrover",
             "clion",
+            "ida",
+            "ghidra",
+            "sublime_text",
+            "zed",
+            "rstudio",
+            "matlab",
+            "unity",
+            "unrealeditor",
+            "godot",
+            "rider",
+            "eclipse",
+            "netbeans",
+            "qtcreator",
+            "codeblocks",
+            "devcpp",
+            "arduino",
+            "dbeaver",
+            "datagrip",
+            "navicat",
+            "postman",
+            "insomnia",
+            "fiddler",
+            "wireshark",
+            "burpsuite",
+            "docker desktop",
+            "githubdesktop",
+            "gitkraken",
         ]
         .iter()
         .any(|needle| app.contains(needle))
@@ -380,6 +407,8 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
 
     if [
         "code.exe",
+        "code - insiders",
+        "code-insiders",
         "cursor",
         "windsurf",
         "codium",
@@ -389,6 +418,33 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
         "webstorm",
         "rustrover",
         "clion",
+        "ida",
+        "ghidra",
+        "sublime_text",
+        "zed",
+        "rstudio",
+        "matlab",
+        "unity",
+        "unrealeditor",
+        "godot",
+        "rider",
+        "eclipse",
+        "netbeans",
+        "qtcreator",
+        "codeblocks",
+        "devcpp",
+        "arduino",
+        "dbeaver",
+        "datagrip",
+        "navicat",
+        "postman",
+        "insomnia",
+        "fiddler",
+        "wireshark",
+        "burpsuite",
+        "docker desktop",
+        "githubdesktop",
+        "gitkraken",
     ]
     .iter()
     .any(|needle| app.contains(needle))
@@ -397,22 +453,32 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
     }
     if [
         "wechat", "weixin", "qq.exe", "teams", "slack", "discord", "telegram", "feishu", "lark",
-        "zoom",
+        "zoom", "dingtalk", "wecom", "wxwork", "wemeet", "voovmeeting", "webex",
+        "outlook", "olk.exe", "thunderbird", "foxmail", "tim.exe", "messenger",
     ]
     .iter()
     .any(|needle| app.contains(needle))
     {
         return ("沟通", 0.88);
     }
-    if ["winword", "wps", "obsidian", "typora", "notion", "powerpnt"]
+    if [
+        "winword", "wps", "et.exe", "wpp", "excel", "obsidian", "typora", "notion",
+        "powerpnt", "onenote", "logseq", "joplin", "zettlr", "soffice", "swriter",
+        "scalc", "simpress",
+    ]
         .iter()
         .any(|needle| app.contains(needle))
     {
         return ("写作", 0.84);
     }
-    if ["steam", "epicgames", "battle.net", "spotify", "music"]
+    if [
+        "steam", "epicgames", "battle.net", "spotify", "music", "bilibili", "iqiyi",
+        "youku", "vlc", "potplayer", "mpv",
+    ]
         .iter()
         .any(|needle| app.contains(needle))
+        || app.contains("-win64-shipping")
+        || app == "game.exe"
     {
         return ("娱乐", 0.90);
     }
@@ -430,6 +496,16 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
             "devtools",
             "npmjs",
             "crates.io",
+            "ghidra",
+            "intellij idea",
+            "android studio",
+            "eclipse ide",
+            "apache netbeans",
+            "burp suite",
+            "dbeaver",
+            "datagrip",
+            "postman",
+            "wireshark",
         ],
     ) {
         return ("开发", 0.80);
@@ -505,6 +581,26 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
             96,
         );
     }
+    if let Some(kind) = active_context_type(&event.metadata) {
+        if matches!(kind, "document" | "meeting" | "terminal" | "media") {
+            if let Some(title) = event_current_page_title(event)
+                .map(clean_title)
+                .filter(|title| !title.is_empty())
+            {
+                let workspace = event
+                    .workspace
+                    .as_deref()
+                    .and_then(path_label)
+                    .filter(|workspace| !normalize(&title).contains(&normalize(workspace)));
+                return cap(
+                    &workspace
+                        .map(|workspace| format!("{title} · {workspace}"))
+                        .unwrap_or(title),
+                    96,
+                );
+            }
+        }
+    }
     let workspace = event.workspace.as_deref().and_then(path_label);
     let file = event.file_path.as_deref().and_then(path_label);
     if let Some(workspace) = workspace {
@@ -549,13 +645,17 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
 }
 
 fn event_hay(event: &RawActivityEvent) -> String {
+    let active_page = event_current_page_title(event).unwrap_or_default();
+    let conversation = chat_conversation_title(event).unwrap_or_default();
     normalize(&format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         event.app.as_deref().unwrap_or_default(),
         event.window_title.as_deref().unwrap_or_default(),
         event.url.as_deref().unwrap_or_default(),
         event.file_path.as_deref().unwrap_or_default(),
         event.workspace.as_deref().unwrap_or_default(),
+        active_page,
+        conversation,
     ))
 }
 
@@ -574,6 +674,45 @@ fn event_current_page_title(event: &RawActivityEvent) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn active_context_type(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("activeContextType")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            match metadata
+                .get("activePageSource")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(
+                    "chatgpt-conversation"
+                    | "qq-conversation-header"
+                    | "chat-conversation-selection",
+                ) => Some("conversation"),
+                Some("document-window-title" | "selected-document-tab" | "wps-visible-window") => {
+                    Some("document")
+                }
+                Some("explorer-address-bar" | "explorer-selected-tab" | "explorer-window-title") => {
+                    Some("folder")
+                }
+                Some("vscode-extension") => Some("editor"),
+                _ => None,
+            }
+        })
+}
+
+pub(crate) fn context_evidence_label(metadata: &serde_json::Value) -> &'static str {
+    match active_context_type(metadata) {
+        Some("conversation") => "当前会话",
+        Some("document") => "当前文档",
+        Some("editor") => "当前编辑",
+        Some("folder") => "当前目录",
+        Some("meeting") => "当前会议",
+        Some("terminal") => "当前终端",
+        Some("media") => "当前媒体",
+        _ => "当前页面",
+    }
+}
+
 fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
     event
         .metadata
@@ -590,13 +729,7 @@ fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
                 .filter(|value| !value.is_empty())
         })
         .or_else(|| {
-            (matches!(
-                event
-                    .metadata
-                    .get("activePageSource")
-                    .and_then(serde_json::Value::as_str),
-                Some("chatgpt-conversation" | "qq-conversation-header")
-            ))
+            (active_context_type(&event.metadata) == Some("conversation"))
             .then(|| event_current_page_title(event))
             .flatten()
         })
@@ -729,6 +862,14 @@ mod tests {
     }
 
     #[test]
+    fn classifies_packaged_unreal_games_as_entertainment() {
+        assert_eq!(
+            classify_category(&event("Atlas-Win64-Shipping.exe", "ATLAS"), 180).0,
+            "娱乐"
+        );
+    }
+
+    #[test]
     fn extracts_windows_workspace_name() {
         assert_eq!(
             path_label(r"C:\\Code\\ScreenUse").as_deref(),
@@ -778,6 +919,49 @@ mod tests {
         });
 
         assert_eq!(summary_for_event(&event, "学习"), "科研讨论群");
+    }
+
+    #[test]
+    fn semantic_context_types_use_specific_evidence_labels() {
+        for (kind, label) in [
+            ("conversation", "当前会话"),
+            ("document", "当前文档"),
+            ("editor", "当前编辑"),
+            ("folder", "当前目录"),
+            ("meeting", "当前会议"),
+            ("terminal", "当前终端"),
+            ("media", "当前媒体"),
+            ("browser-page", "当前页面"),
+        ] {
+            assert_eq!(
+                context_evidence_label(&json!({"activeContextType": kind})),
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn local_classification_uses_the_semantic_page_not_only_the_app_title() {
+        let mut event = event("chrome.exe", "ChatGPT - Google Chrome");
+        event.metadata = json!({
+            "activePageTitle": "Rust crates.io API 开发",
+            "activeContextType": "conversation"
+        });
+        assert_eq!(classify_category(&event, 180).0, "开发");
+    }
+
+    #[test]
+    fn document_summary_keeps_the_note_before_its_workspace() {
+        let mut event = event("Obsidian.exe", "CVE-2026-44277");
+        event.workspace = Some("WorkSpace".into());
+        event.metadata = json!({
+            "activePageTitle": "CVE-2026-44277",
+            "activeContextType": "document"
+        });
+        assert_eq!(
+            summary_for_event(&event, "写作"),
+            "CVE-2026-44277 · WorkSpace"
+        );
     }
 
     #[test]

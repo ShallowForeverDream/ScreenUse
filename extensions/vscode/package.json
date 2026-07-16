@@ -2,7 +2,7 @@
   "name": "screenuse-vscode-collector",
   "displayName": "ScreenUse Editor Context",
   "description": "Silently sends the active workspace, file, language and Git branch metadata to the local ScreenUse app. It never reads file contents.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "screenuse",
   "engines": {
     "vscode": "^1.92.0"

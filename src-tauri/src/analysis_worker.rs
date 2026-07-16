@@ -2,6 +2,7 @@ use crate::ai::{
     parse_and_validate, request_with_codex_account, review_instructions, review_prompt,
     AiAttributionBatch, AiResponse, AiReviewInput, OpenAiCompatibleClient,
 };
+use crate::classification;
 use crate::db::{now, AppDb};
 use crate::models::{
     AiUsage, AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession,
@@ -420,27 +421,17 @@ fn events_for_session<'a>(
 
 fn metadata_evidence(events: Vec<&RawActivityEvent>) -> Vec<EvidenceItem> {
     let mut evidence = Vec::new();
-    if let Some((page_title, page_source)) = events.iter().rev().find_map(|event| {
+    if let Some((event, page_title)) = events.iter().rev().find_map(|event| {
         let title = event
             .metadata
             .get("activePageTitle")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())?;
-        let source = event
-            .metadata
-            .get("activePageSource")
-            .and_then(serde_json::Value::as_str);
-        Some((title, source))
+        Some((*event, title))
     }) {
-        let page_is_conversation =
-            matches!(page_source, Some("chatgpt-conversation" | "qq-conversation-header"));
         evidence.push(EvidenceItem {
             kind: "page".into(),
-            label: if page_is_conversation {
-                "当前会话".into()
-            } else {
-                "当前页面".into()
-            },
+            label: classification::context_evidence_label(&event.metadata).into(),
             value: page_title.to_string(),
             weight: 0.82,
         });

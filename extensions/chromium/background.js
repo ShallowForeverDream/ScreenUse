@@ -11,7 +11,11 @@ function browserName() {
   if (userAgent.includes('Edg/')) return 'Microsoft Edge';
   if (userAgent.includes('OPR/')) return 'Opera';
   if (userAgent.includes('Vivaldi/')) return 'Vivaldi';
-  if (userAgent.includes('Brave')) return 'Brave';
+  if (userAgent.includes('Tabbit')) return 'Tabbit Browser';
+  if (userAgent.includes('Arc/')) return 'Arc';
+  if (userAgent.includes('Brave') || navigator.brave) return 'Brave';
+  if (userAgent.includes('Firefox/')) return 'Mozilla Firefox';
+  if (userAgent.includes('Chrome/')) return 'Google Chrome';
   return 'Chromium';
 }
 

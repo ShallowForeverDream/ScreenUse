@@ -17,6 +17,8 @@ use uuid::Uuid;
 const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 const PERSONAL_MEMORY_MIGRATION_KEY: &str = "migration_personal_memory_v1";
+const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
+const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
@@ -171,7 +173,9 @@ impl AppDb {
         db.migrate()?;
         db.clear_obsolete_project_descriptions()?;
         db.seed_if_empty()?;
+        db.migrate_process_file_paths()?;
         db.migrate_personal_memory()?;
+        db.migrate_process_file_memories()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
@@ -188,6 +192,86 @@ impl AppDb {
             params!["在修正归类时手动创建"],
         )?;
         Ok(())
+    }
+
+    fn migrate_process_file_paths(&self) -> Result<u32> {
+        let changed = {
+            let mut conn = self.conn.lock();
+            let already_migrated = conn
+                .query_row(
+                    "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                    params![PROCESS_FILE_PATH_MIGRATION_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if already_migrated {
+                return Ok(0);
+            }
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                r#"UPDATE raw_events
+                   SET file_path=NULL
+                   WHERE file_path IS NOT NULL AND app IS NOT NULL
+                     AND lower(replace(file_path,'/','\')) LIKE '%\' || lower(app)"#,
+                [],
+            )? as u32;
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+                params![PROCESS_FILE_PATH_MIGRATION_KEY, now()],
+            )?;
+            tx.commit()?;
+            changed
+        };
+        if changed > 0 {
+            self.rebuild_personal_memory_from_confirmed()?;
+        }
+        Ok(changed)
+    }
+
+    fn migrate_process_file_memories(&self) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        let already_migrated = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PROCESS_FILE_MEMORY_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(0);
+        }
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id,features_json FROM attribution_memories",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+        let tx = conn.transaction()?;
+        let mut changed = 0_u32;
+        for (session_id, raw) in rows {
+            let Ok(mut features) = serde_json::from_str::<crate::memory::ContextFeatures>(&raw)
+            else {
+                continue;
+            };
+            if crate::memory::clear_legacy_process_file(&mut features) {
+                tx.execute(
+                    "UPDATE attribution_memories SET features_json=?1 WHERE session_id=?2",
+                    params![serde_json::to_string(&features)?, session_id],
+                )?;
+                changed += 1;
+            }
+        }
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PROCESS_FILE_MEMORY_MIGRATION_KEY, now()],
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -2417,13 +2501,6 @@ impl AppDb {
             .get("activePageTitle")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty());
-        let page_is_conversation = matches!(
-            event
-                .metadata
-                .get("activePageSource")
-                .and_then(serde_json::Value::as_str),
-            Some("chatgpt-conversation" | "qq-conversation-header")
-        );
         let mut evidence = vec![
             EvidenceItem {
                 kind: if page_title.is_some() {
@@ -2432,11 +2509,7 @@ impl AppDb {
                     "window".into()
                 },
                 label: if page_title.is_some() {
-                    if page_is_conversation {
-                        "当前会话".into()
-                    } else {
-                        "当前页面".into()
-                    }
+                    classification::context_evidence_label(&event.metadata).into()
                 } else {
                     "窗口".into()
                 },
@@ -4733,7 +4806,7 @@ mod tests {
         .expect("ingest document event");
         let session = db.list_sessions(1).expect("list sessions")[0].clone();
         assert_eq!(session.evidence[0].kind, "page");
-        assert_eq!(session.evidence[0].label, "当前页面");
+        assert_eq!(session.evidence[0].label, "当前文档");
         assert_eq!(session.evidence[0].value, "ICPC 训练计划.docx");
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -4861,6 +4934,58 @@ mod tests {
         assert_eq!(preserved.poll_interval_seconds, 7);
         assert_eq!(preserved.heartbeat_seconds, 7);
 
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn legacy_process_paths_are_removed_without_deleting_real_binary_files() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-process-path-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![PROCESS_FILE_PATH_MIGRATION_KEY],
+            )
+            .expect("reset process path migration");
+            for (id, app, file_path) in [
+                ("legacy-process", "QQ.exe", r"C:\Program Files\Tencent\QQ.exe"),
+                ("real-binary", "ida.exe", r"D:\CTF\challenge.exe"),
+            ] {
+                conn.execute(
+                    "INSERT INTO raw_events(
+                        id,source,timestamp,app,window_title,url,file_path,workspace,
+                        input_stats_json,metadata_json
+                     ) VALUES(?1,'test',?2,?3,?3,NULL,?4,NULL,'{}','{}')",
+                    params![id, now(), app, file_path],
+                )
+                .expect("insert legacy event");
+            }
+        }
+
+        assert_eq!(db.migrate_process_file_paths().expect("migrate paths"), 1);
+        let conn = db.conn.lock();
+        let process_path: Option<String> = conn
+            .query_row(
+                "SELECT file_path FROM raw_events WHERE id='legacy-process'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read process event");
+        let real_file: Option<String> = conn
+            .query_row(
+                "SELECT file_path FROM raw_events WHERE id='real-binary'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read real binary event");
+        assert!(process_path.is_none());
+        assert_eq!(real_file.as_deref(), Some(r"D:\CTF\challenge.exe"));
+        drop(conn);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

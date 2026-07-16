@@ -126,6 +126,10 @@ fn browser_context(value: &Value) -> BrowserContext {
         event_id: cap(&event_id, 200),
         browser: cap(&browser, 80),
         title: title.map(|value| cap(&value, 320)),
+        tab_title: value
+            .get("tabTitle")
+            .and_then(Value::as_str)
+            .map(|value| cap(value, 320)),
         context_title: context_title.map(|value| cap(&value, 320)),
         context_type: context_type.map(|value| cap(&value, 80)),
         url: url.map(|value| cap(&value, 1200)),
@@ -157,6 +161,10 @@ fn editor_context(value: &Value) -> EditorContext {
 
     EditorContext {
         event_id: cap(&event_id, 200),
+        app_name: value
+            .get("appName")
+            .and_then(Value::as_str)
+            .map(|value| cap(value, 120)),
         workspace,
         active_file,
         language_id: value.get("languageId").and_then(Value::as_str).map(|value| cap(value, 80)),
@@ -164,6 +172,10 @@ fn editor_context(value: &Value) -> EditorContext {
         event_kind: value.get("eventKind").and_then(Value::as_str).map(|value| cap(value, 80)),
         terminal_count: value.get("terminalCount").and_then(Value::as_u64).unwrap_or_default().min(u32::MAX as u64) as u32,
         debug_active: value.get("debugActive").and_then(Value::as_str).map(|value| cap(value, 160)),
+        active_terminal: value
+            .get("activeTerminal")
+            .and_then(Value::as_str)
+            .map(|value| cap(value, 160)),
         ..Default::default()
     }
 }
@@ -218,7 +230,21 @@ mod tests {
             "windowId": 1
         }));
         assert_eq!(context.title.as_deref(), Some("ICPC刷题网站功能需求"));
+        assert_eq!(context.tab_title.as_deref(), Some("ChatGPT"));
         assert_eq!(context.context_title.as_deref(), Some("ICPC刷题网站功能需求"));
         assert_eq!(context.context_type.as_deref(), Some("chatgpt-conversation"));
+    }
+
+    #[test]
+    fn keeps_editor_identity_and_active_terminal_metadata() {
+        let context = editor_context(&json!({
+            "appName": "Visual Studio Code",
+            "workspace": [{"name": "ScreenUse", "path": "D:\\MY_PROJECT\\ScreenUse"}],
+            "activeFile": "D:\\MY_PROJECT\\ScreenUse\\src\\App.tsx",
+            "activeTerminal": "PowerShell"
+        }));
+        assert_eq!(context.app_name.as_deref(), Some("Visual Studio Code"));
+        assert_eq!(context.active_terminal.as_deref(), Some("PowerShell"));
+        assert_eq!(context.active_file.as_deref(), Some("D:\\MY_PROJECT\\ScreenUse\\src\\App.tsx"));
     }
 }

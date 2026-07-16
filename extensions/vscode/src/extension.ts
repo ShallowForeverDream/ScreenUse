@@ -28,6 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidSaveTextDocument(() => schedule('save')),
     vscode.window.onDidOpenTerminal(() => schedule('terminal-open')),
     vscode.window.onDidCloseTerminal(() => schedule('terminal-close')),
+    vscode.window.onDidChangeActiveTerminal(() => schedule('active-terminal', true)),
     vscode.debug.onDidStartDebugSession(() => schedule('debug-start', true)),
     vscode.debug.onDidTerminateDebugSession(() => schedule('debug-stop', true)),
   );
@@ -68,6 +69,7 @@ async function sendActivity(eventKind = pendingKind, force = false) {
 
   const payload = {
     source: 'vscode-extension',
+    appName: vscode.env.appName,
     capturedAt: new Date().toISOString(),
     eventId: signature || 'vscode:no-editor',
     eventKind,
@@ -77,6 +79,7 @@ async function sendActivity(eventKind = pendingKind, force = false) {
     isDirty: Boolean(editor?.document.isDirty),
     gitBranch,
     terminalCount: vscode.window.terminals.length,
+    activeTerminal: vscode.window.activeTerminal?.name || null,
     debugActive,
   };
 
