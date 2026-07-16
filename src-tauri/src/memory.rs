@@ -327,7 +327,9 @@ pub fn choose_assignment(
     choose_similarity_assignment(query, records)
         .or_else(|| choose_manual_keyword_signature(query, records))
         .or_else(|| choose_manual_token_pair_signature(query, records))
+        .or_else(|| choose_trusted_ai_token_pair_signature(query, records))
         .or_else(|| choose_stable_app_assignment(query, records))
+        .or_else(|| choose_trusted_ai_stable_app_assignment(query, records))
 }
 
 fn choose_stable_app_assignment(
@@ -362,6 +364,49 @@ fn choose_stable_app_assignment(
         confidence: if matching.len() >= 4 { 0.94 } else { 0.90 },
         matched_label: format!("专用应用：{}", query.app),
         support: matching.len(),
+        memory_session_id: record.session_id.clone(),
+    })
+}
+
+fn choose_trusted_ai_stable_app_assignment(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    if query.app.is_empty() || is_contextual_application(&query.app) {
+        return None;
+    }
+    let matching = records
+        .iter()
+        .filter(|record| record.features.app == query.app)
+        .collect::<Vec<_>>();
+    if matching.iter().any(|record| record.user_confirmed) {
+        return None;
+    }
+    let trusted = matching
+        .into_iter()
+        .filter(|record| record.source_confidence >= 0.96)
+        .collect::<Vec<_>>();
+    if trusted.len() < 3 {
+        return None;
+    }
+    let assignments = trusted
+        .iter()
+        .map(|record| assignment_key(record))
+        .collect::<HashSet<_>>();
+    if assignments.len() != 1 {
+        return None;
+    }
+    let record = trusted
+        .iter()
+        .copied()
+        .max_by(|left, right| left.confirmed_at.cmp(&right.confirmed_at))?;
+    Some(MemoryDecision {
+        category: record.category.clone(),
+        project_id: record.project_id.clone(),
+        task_id: record.task_id.clone(),
+        confidence: if trusted.len() >= 5 { 0.90 } else { 0.88 },
+        matched_label: format!("AI 稳定专用应用：{}", query.app),
+        support: trusted.len(),
         memory_session_id: record.session_id.clone(),
     })
 }
@@ -989,6 +1034,138 @@ fn choose_manual_token_pair_signature(
         task_id: record.task_id.clone(),
         confidence: if vote.max_support >= 4 { 0.93 } else { 0.90 },
         matched_label: format!("个人组合词：{matched}"),
+        support: vote.max_support,
+        memory_session_id: record.session_id.clone(),
+    })
+}
+
+fn choose_trusted_ai_token_pair_signature(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    #[derive(Default)]
+    struct PairAssignment<'a> {
+        count: usize,
+        latest: Option<&'a MemoryRecord>,
+    }
+
+    #[derive(Default)]
+    struct PairVote<'a> {
+        pairs: Vec<(String, String)>,
+        max_support: usize,
+        record: Option<&'a MemoryRecord>,
+    }
+
+    let query_tokens = signature_tokens(query);
+    if query_tokens.len() < 2 {
+        return None;
+    }
+    let query_pairs = token_pairs(&query_tokens)
+        .into_iter()
+        .filter(is_specific_token_pair)
+        .collect::<HashSet<_>>();
+    if query_pairs.is_empty() {
+        return None;
+    }
+
+    let matching_pairs = |record: &MemoryRecord| {
+        let matching_tokens = signature_tokens(&record.features)
+            .into_iter()
+            .filter(|token| query_tokens.binary_search(token).is_ok())
+            .collect::<Vec<_>>();
+        token_pairs(&matching_tokens)
+            .into_iter()
+            .filter(|pair| query_pairs.contains(pair))
+            .collect::<Vec<_>>()
+    };
+
+    let mut ai_assignments =
+        HashMap::<(String, String), HashMap<String, PairAssignment<'_>>>::new();
+    let mut manual_assignments = HashMap::<(String, String), HashSet<String>>::new();
+    for record in records {
+        let pairs = matching_pairs(record);
+        if pairs.is_empty() {
+            continue;
+        }
+        let assignment = assignment_key(record);
+        if record.user_confirmed {
+            for pair in pairs {
+                manual_assignments
+                    .entry(pair)
+                    .or_default()
+                    .insert(assignment.clone());
+            }
+            continue;
+        }
+        if record.source_confidence < 0.96 || !stable_for_single_ai_memory(&record.features) {
+            continue;
+        }
+        for pair in pairs {
+            let stats = ai_assignments
+                .entry(pair)
+                .or_default()
+                .entry(assignment.clone())
+                .or_default();
+            stats.count += 1;
+            if stats
+                .latest
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                stats.latest = Some(record);
+            }
+        }
+    }
+
+    let mut votes = HashMap::<String, PairVote<'_>>::new();
+    for (pair, pair_assignments) in ai_assignments {
+        if pair_assignments.len() != 1 {
+            continue;
+        }
+        let (assignment, stats) = pair_assignments.into_iter().next()?;
+        if stats.count < 3 {
+            continue;
+        }
+        if let Some(manual) = manual_assignments.get(&pair) {
+            if manual.len() != 1 || !manual.contains(&assignment) {
+                return None;
+            }
+        }
+        let vote = votes.entry(assignment).or_default();
+        vote.pairs.push(pair);
+        vote.max_support = vote.max_support.max(stats.count);
+        if let Some(record) = stats.latest {
+            if vote
+                .record
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                vote.record = Some(record);
+            }
+        }
+    }
+
+    if votes.len() != 1 {
+        return None;
+    }
+    let (_, mut vote) = votes.into_iter().next()?;
+    if vote.max_support < 4 && vote.pairs.len() < 2 {
+        return None;
+    }
+    let record = vote.record?;
+    vote.pairs.sort_by(|left, right| {
+        pair_specificity(right)
+            .cmp(&pair_specificity(left))
+            .then_with(|| left.cmp(right))
+    });
+    let matched = vote
+        .pairs
+        .first()
+        .map(|(left, right)| format!("{left} + {right}"))?;
+    Some(MemoryDecision {
+        category: record.category.clone(),
+        project_id: record.project_id.clone(),
+        task_id: record.task_id.clone(),
+        confidence: if vote.max_support >= 6 { 0.90 } else { 0.88 },
+        matched_label: format!("AI 稳定组合词：{matched}"),
         support: vote.max_support,
         memory_session_id: record.session_id.clone(),
     })
@@ -1740,6 +1917,73 @@ mod tests {
     }
 
     #[test]
+    fn repeated_high_confidence_ai_pairs_generalize_only_after_stable_support() {
+        let observations = (1..=4)
+            .map(|index| {
+                let mut ai = record(
+                    &format!("ai-aliyun-{index}"),
+                    "Chrome.exe",
+                    &format!("root@server-{index} - Aliyun Workbench"),
+                    "云端开发",
+                );
+                ai.user_confirmed = false;
+                ai.source_confidence = 0.98;
+                ai
+            })
+            .collect::<Vec<_>>();
+        let query = features_from_event(&event(
+            "Chrome.exe",
+            "root@new-server - Aliyun Workbench",
+        ));
+
+        assert!(choose_trusted_ai_token_pair_signature(&query, &observations[..2]).is_none());
+        let decision = choose_trusted_ai_token_pair_signature(&query, &observations)
+            .expect("four consistent AI observations should form a stable task pair");
+        assert_eq!(decision.task_id, "云端开发");
+        assert_eq!(decision.support, 4);
+        assert!(decision.confidence <= 0.90);
+        assert!(decision.matched_label.starts_with("AI 稳定组合词："));
+    }
+
+    #[test]
+    fn trusted_ai_pairs_abstain_on_ai_or_manual_conflicts() {
+        let mut observations = (1..=4)
+            .map(|index| {
+                let mut ai = record(
+                    &format!("ai-aliyun-{index}"),
+                    "Chrome.exe",
+                    &format!("Aliyun Workbench server {index}"),
+                    "云端开发",
+                );
+                ai.user_confirmed = false;
+                ai.source_confidence = 0.98;
+                ai
+            })
+            .collect::<Vec<_>>();
+        let query = features_from_event(&event("Chrome.exe", "Aliyun Workbench new server"));
+
+        let mut conflicting_ai = record(
+            "ai-aliyun-conflict",
+            "Chrome.exe",
+            "Aliyun Workbench billing server",
+            "账单核对",
+        );
+        conflicting_ai.user_confirmed = false;
+        conflicting_ai.source_confidence = 0.98;
+        observations.push(conflicting_ai);
+        assert!(choose_trusted_ai_token_pair_signature(&query, &observations).is_none());
+
+        observations.pop();
+        observations.push(record(
+            "manual-aliyun-conflict",
+            "Chrome.exe",
+            "Aliyun Workbench billing server",
+            "账单核对",
+        ));
+        assert!(choose_trusted_ai_token_pair_signature(&query, &observations).is_none());
+    }
+
+    #[test]
     fn a_dedicated_application_learns_only_after_consistent_manual_use() {
         let records = vec![
             record("one", "Atlas-Win64-Shipping.exe", "关卡一", "小小梦魇"),
@@ -1751,6 +1995,78 @@ mod tests {
             .expect("a dedicated executable should learn its stable task");
         assert_eq!(decision.task_id, "小小梦魇");
         assert_eq!(decision.support, 2);
+    }
+
+    #[test]
+    fn a_dedicated_application_can_learn_from_three_consistent_ai_reviews() {
+        let observations = (1..=3)
+            .map(|index| {
+                let mut ai = record(
+                    &format!("ai-game-{index}"),
+                    "Atlas-Win64-Shipping.exe",
+                    &format!("Little Nightmares chapter {index}"),
+                    "小小梦魇",
+                );
+                ai.user_confirmed = false;
+                ai.source_confidence = 0.98;
+                ai
+            })
+            .collect::<Vec<_>>();
+        let query = features_from_event(&event(
+            "Atlas-Win64-Shipping.exe",
+            "Little Nightmares Enhanced Edition",
+        ));
+
+        assert!(choose_trusted_ai_stable_app_assignment(&query, &observations[..2]).is_none());
+        let decision = choose_trusted_ai_stable_app_assignment(&query, &observations)
+            .expect("three consistent AI reviews should teach a dedicated executable");
+        assert_eq!(decision.task_id, "小小梦魇");
+        assert_eq!(decision.support, 3);
+        assert!(decision.confidence <= 0.90);
+    }
+
+    #[test]
+    fn ai_application_learning_never_overrides_manual_or_contextual_history() {
+        let mut observations = (1..=3)
+            .map(|index| {
+                let mut ai = record(
+                    &format!("ai-game-{index}"),
+                    "Atlas-Win64-Shipping.exe",
+                    &format!("Little Nightmares chapter {index}"),
+                    "小小梦魇",
+                );
+                ai.user_confirmed = false;
+                ai.source_confidence = 0.98;
+                ai
+            })
+            .collect::<Vec<_>>();
+        let game_query = features_from_event(&event(
+            "Atlas-Win64-Shipping.exe",
+            "Little Nightmares Enhanced Edition",
+        ));
+        observations.push(record(
+            "manual-game-conflict",
+            "Atlas-Win64-Shipping.exe",
+            "Little Nightmares settings",
+            "性能测试",
+        ));
+        assert!(choose_trusted_ai_stable_app_assignment(&game_query, &observations).is_none());
+
+        let chat_observations = (1..=4)
+            .map(|index| {
+                let mut ai = record(
+                    &format!("ai-chat-{index}"),
+                    "ChatGPT.exe",
+                    &format!("ScreenUse issue {index}"),
+                    "ScreenUse开发",
+                );
+                ai.user_confirmed = false;
+                ai.source_confidence = 0.98;
+                ai
+            })
+            .collect::<Vec<_>>();
+        let chat_query = features_from_event(&event("ChatGPT.exe", "unrelated conversation"));
+        assert!(choose_trusted_ai_stable_app_assignment(&chat_query, &chat_observations).is_none());
     }
 
     #[test]
