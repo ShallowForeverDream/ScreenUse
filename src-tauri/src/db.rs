@@ -128,11 +128,12 @@ struct ConfirmedContextVote {
 pub(crate) struct RecentTaskContext {
     pub project_id: Option<String>,
     pub task_id: Option<String>,
+    pub task_title: String,
     pub category: String,
     pub confidence: f32,
     pub user_confirmed: bool,
     pub source: String,
-    pub ended_at: String,
+    pub boundary_at: String,
 }
 
 #[cfg(test)]
@@ -2387,21 +2388,25 @@ impl AppDb {
     ) -> Result<Option<RecentTaskContext>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT project_id,task_id,category,confidence,user_confirmed,source,ended_at
-             FROM work_sessions
-             WHERE id<>?1 AND started_at<=?2 AND ended_at<=?2
-             ORDER BY ended_at DESC,updated_at DESC
+            "SELECT ws.project_id,ws.task_id,t.title,ws.category,ws.confidence,
+                    ws.user_confirmed,ws.source,ws.ended_at
+             FROM work_sessions ws
+             JOIN tasks t ON t.id=ws.task_id AND t.project_id=ws.project_id
+             WHERE ws.id<>?1 AND ws.started_at<=?2 AND ws.ended_at<=?2
+                   AND t.status='active'
+             ORDER BY ws.ended_at DESC,ws.updated_at DESC
              LIMIT 1",
             params![current_session_id, started_at],
             |row| {
                 Ok(RecentTaskContext {
                     project_id: row.get(0)?,
                     task_id: row.get(1)?,
-                    category: row.get(2)?,
-                    confidence: row.get(3)?,
-                    user_confirmed: row.get::<_, i64>(4)? != 0,
-                    source: row.get(5)?,
-                    ended_at: row.get(6)?,
+                    task_title: row.get(2)?,
+                    category: row.get(3)?,
+                    confidence: row.get(4)?,
+                    user_confirmed: row.get::<_, i64>(5)? != 0,
+                    source: row.get(6)?,
+                    boundary_at: row.get(7)?,
                 })
             },
         )
@@ -3019,9 +3024,10 @@ impl AppDb {
             event.file_path.clone().unwrap_or_default()
         )
         .to_lowercase();
+        let event_features = crate::memory::features_from_event(event);
         let conn = self.conn.lock();
         let rules = {
-            let mut stmt = conn.prepare("SELECT matcher_json,project_id,task_id,category,name,priority,updated_at FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC,updated_at DESC")?;
+            let mut stmt = conn.prepare("SELECT matcher_json,project_id,task_id,category,name,priority,updated_at,created_from_correction FROM attribution_rules WHERE enabled=1 ORDER BY priority DESC,updated_at DESC")?;
             let mapped = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -3031,14 +3037,79 @@ impl AppDb {
                     r.get::<_, String>(4)?,
                     r.get::<_, i32>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)? != 0,
                 ))
             })?;
             collect_rows(mapped)?
         };
+        let mut correction_matcher_assignments = HashMap::<String, HashSet<String>>::new();
+        for (
+            matcher_json,
+            project_id,
+            task_id,
+            category,
+            _,
+            _,
+            _,
+            created_from_correction,
+        ) in &rules
+        {
+            if !created_from_correction {
+                continue;
+            }
+            let matcher: serde_json::Value =
+                serde_json::from_str(matcher_json).unwrap_or_default();
+            if matcher
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default()
+                < 3
+            {
+                continue;
+            }
+            correction_matcher_assignments
+                .entry(matcher_json.clone())
+                .or_default()
+                .insert(format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    category,
+                    project_id.as_deref().unwrap_or_default(),
+                    task_id.as_deref().unwrap_or_default()
+                ));
+        }
         let mut best_match = None;
-        for (matcher_json, project_id, task_id, category, _name, priority, updated_at) in rules {
+        for (
+            matcher_json,
+            project_id,
+            task_id,
+            category,
+            _name,
+            priority,
+            updated_at,
+            created_from_correction,
+        ) in rules
+        {
             let matcher: serde_json::Value =
                 serde_json::from_str(&matcher_json).unwrap_or_default();
+            let generation = matcher
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            // Older automatically merged rules used a large OR-list of every
+            // page ever seen for one task.  One generic word could therefore
+            // relabel unrelated sessions.  Personal memory supersedes those
+            // rules; only exact-context generation 3 correction rules remain
+            // eligible.
+            if created_from_correction && generation < 3 {
+                continue;
+            }
+            if created_from_correction
+                && correction_matcher_assignments
+                    .get(&matcher_json)
+                    .is_some_and(|assignments| assignments.len() > 1)
+            {
+                continue;
+            }
             let mut keywords = matcher
                 .get("keywords")
                 .and_then(|value| value.as_array())
@@ -3053,6 +3124,15 @@ impl AppDb {
                     keywords.push(keyword.to_lowercase());
                 }
             }
+            let exact_context = matcher
+                .get("exactContext")
+                .and_then(serde_json::Value::as_str)
+                .map(crate::memory::canonical_context)
+                .unwrap_or_default();
+            let match_all_keywords = matcher
+                .get("matchMode")
+                .and_then(serde_json::Value::as_str)
+                == Some("all");
             let app = matcher
                 .get("app")
                 .and_then(|v| v.as_str())
@@ -3068,25 +3148,45 @@ impl AppDb {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let has_constraint = !keywords.is_empty()
+            let has_constraint = !exact_context.is_empty()
+                || !keywords.is_empty()
                 || !app.is_empty()
                 || !domain.is_empty()
                 || !workspace.is_empty();
-            let matched_keyword_length = keywords
+            let keyword_hits = keywords
                 .iter()
                 .filter(|keyword| hay.contains(keyword.as_str()))
+                .collect::<Vec<_>>();
+            let matched_keyword_length = keyword_hits
+                .iter()
                 .map(|keyword| keyword.chars().count())
                 .max()
                 .unwrap_or(0);
-            let hit = has_constraint
-                && (keywords.is_empty() || matched_keyword_length > 0)
-                && (app.is_empty()
-                    || event
+            let exact_context_hit = exact_context.is_empty()
+                || event_features.page == exact_context
+                || event_features.window == exact_context;
+            let keyword_hit = keywords.is_empty()
+                || if match_all_keywords {
+                    keyword_hits.len() == keywords.len()
+                } else {
+                    !keyword_hits.is_empty()
+                };
+            let normalized_app = app.trim_end_matches(".exe");
+            let app_hit = app.is_empty()
+                || if generation >= 3 {
+                    event_features.app == normalized_app
+                } else {
+                    event
                         .app
                         .as_deref()
                         .unwrap_or("")
                         .to_lowercase()
-                        .contains(&app))
+                        .contains(&app)
+                };
+            let hit = has_constraint
+                && exact_context_hit
+                && keyword_hit
+                && app_hit
                 && (domain.is_empty()
                     || event
                         .url
@@ -3104,10 +3204,11 @@ impl AppDb {
             if hit {
                 let constraint_count = usize::from(!app.is_empty())
                     + usize::from(!domain.is_empty())
-                    + usize::from(!workspace.is_empty());
+                    + usize::from(!workspace.is_empty())
+                    + usize::from(!exact_context.is_empty());
                 let rank = (
                     priority,
-                    matched_keyword_length,
+                    matched_keyword_length.max(exact_context.chars().count()),
                     constraint_count,
                     updated_at,
                 );
@@ -3217,7 +3318,17 @@ impl AppDb {
         }
 
         let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
-        let features = crate::memory::features_from_session(&session, &events);
+        let ambiguous_context = crate::memory::has_ambiguous_session_context(&session, &events);
+        let features = if ambiguous_context {
+            // Do not let the last transient page inside a compacted block
+            // silently relabel the whole block.  The first-class page evidence
+            // shown in the correction UI is the stable identity; an exact
+            // memory may still resolve it, otherwise AI/manual review handles
+            // the mixed block.
+            crate::memory::features_from_primary_session_evidence(&session)
+        } else {
+            crate::memory::features_from_session(&session, &events)
+        };
         if !crate::memory::is_discriminative(&features) {
             return Ok(None);
         }
@@ -3247,8 +3358,10 @@ impl AppDb {
             decision.category = category.into();
             decision.confidence = decision.confidence.max(category_confidence);
         }
-        if let Some(contextual) =
-            classification::resolve_project_task(self, &event, &decision.category)?
+        if let Some(contextual) = (!ambiguous_context)
+            .then(|| classification::resolve_project_task(self, &event, &decision.category))
+            .transpose()?
+            .flatten()
         {
             let current_is_complete = decision.project_id.is_some()
                 && decision.task_id.is_some()
@@ -3268,7 +3381,12 @@ impl AppDb {
                 decision = exact_ai;
             }
         }
-        if let Some(recent) = classification::recent_task_assignment(self, &session)? {
+        let continuity = if ambiguous_context {
+            None
+        } else {
+            classification::recent_task_assignment(self, &session)?
+        };
+        if let Some(recent) = continuity {
             let current_is_complete = decision.project_id.is_some()
                 && decision.task_id.is_some()
                 && decision.confidence >= 0.84;
@@ -3280,7 +3398,7 @@ impl AppDb {
                 decision.evidence = Some(EvidenceItem {
                     kind: "context-continuity".into(),
                     label: "连续事务".into(),
-                    value: "紧邻上一时间段".into(),
+                    value: "当前页面与上一具体任务一致".into(),
                     weight: decision.confidence,
                 });
             }
@@ -3366,6 +3484,7 @@ impl AppDb {
         for session in self.list_sessions(MAX_PERSONAL_MEMORIES)? {
             let observed = crate::memory::features_from_session_evidence(&session);
             if session.id == target.id
+                || session.ended_at > target.started_at
                 || session.summary == "离开/空闲"
                 || session.source == "collector-idle"
                 || crate::memory::exact_context_identity(&observed).as_deref()
@@ -3386,7 +3505,7 @@ impl AppDb {
             let assignment = format!("{}\u{1f}{project_id}\u{1f}{task_id}", session.category);
             if session.user_confirmed && is_reliable_memory_session(&session) {
                 manual_assignments.insert(assignment);
-            } else if session.source == "ai-review" && session.confidence + 0.0001 >= 0.84 {
+            } else if session.source == "ai-review" && session.confidence + 0.0001 >= 0.90 {
                 matching_ai.push((session, assignment));
             }
         }
@@ -3398,6 +3517,19 @@ impl AppDb {
             .map(|(_, assignment)| assignment.as_str())
             .collect::<HashSet<_>>();
         if ai_assignments.len() != 1 {
+            return Ok(None);
+        }
+        let has_direct_assignment_signal = matching_ai.iter().any(|(session, _)| {
+            let task_title = session.task_title.as_deref().unwrap_or_default();
+            session.confidence + 0.0001 >= 0.96
+                && crate::memory::is_specific_task_label(task_title)
+                && crate::memory::relates_to_assignment(
+                    features,
+                    "",
+                    task_title,
+                )
+        });
+        if !has_direct_assignment_signal {
             return Ok(None);
         }
         let assignment = matching_ai[0].1.as_str();
@@ -4384,10 +4516,15 @@ impl AppDb {
             let after_last_event = all_events
                 .partition_point(|event| event.timestamp.as_str() <= session.ended_at.as_str());
             let events = &all_events[first_event..after_last_event];
-            if crate::memory::has_ambiguous_session_context(session, events) {
-                continue;
-            }
-            let features = crate::memory::features_from_session(session, events);
+            // A manually corrected block is authoritative even when old raw
+            // samples inside it contain more than one transient window.  In
+            // that case learn the stable page/window evidence shown to the
+            // user instead of dropping the correction completely.
+            let features = if crate::memory::has_ambiguous_session_context(session, events) {
+                crate::memory::features_from_primary_session_evidence(session)
+            } else {
+                crate::memory::features_from_session(session, events)
+            };
             if !crate::memory::is_discriminative(&features) {
                 continue;
             }
@@ -4527,11 +4664,15 @@ impl AppDb {
             return Ok(false);
         }
         let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
-        if crate::memory::has_ambiguous_session_context(session, &events) {
-            self.delete_personal_memory(&session.id)?;
-            return Ok(false);
-        }
-        let features = crate::memory::features_from_session(session, &events);
+        let features = if crate::memory::has_ambiguous_session_context(session, &events) {
+            if !session.user_confirmed {
+                self.delete_personal_memory(&session.id)?;
+                return Ok(false);
+            }
+            crate::memory::features_from_primary_session_evidence(session)
+        } else {
+            crate::memory::features_from_session(session, &events)
+        };
         if !crate::memory::is_discriminative(&features) {
             self.delete_personal_memory(&session.id)?;
             return Ok(false);
@@ -4739,6 +4880,17 @@ impl AppDb {
         for (id, original_matcher, project_id, task_id, category) in rules {
             let mut matcher: serde_json::Value =
                 serde_json::from_str(&original_matcher).unwrap_or_else(|_| serde_json::json!({}));
+            let generation = matcher
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            if generation < 3 {
+                changed += conn.execute(
+                    "UPDATE attribution_rules SET enabled=0,updated_at=?1 WHERE id=?2",
+                    params![now(), id],
+                )? as u32;
+                continue;
+            }
             let mut keywords = matcher
                 .get("keywords")
                 .and_then(serde_json::Value::as_array)
@@ -4761,11 +4913,6 @@ impl AppDb {
                     keywords.push(keyword);
                 }
             }
-            if task_id.is_some() {
-                if let Some(object) = matcher.as_object_mut() {
-                    object.remove("app");
-                }
-            }
             let mut normalized = HashSet::new();
             keywords.retain(|keyword| normalized.insert(keyword.to_lowercase()));
             keywords.sort_by_key(|keyword| keyword.to_lowercase());
@@ -4773,6 +4920,16 @@ impl AppDb {
             if let Some(object) = matcher.as_object_mut() {
                 object.remove("keyword");
                 object.insert("keywords".into(), serde_json::json!(keywords));
+                if let Some(exact_context) = object
+                    .get("exactContext")
+                    .and_then(serde_json::Value::as_str)
+                    .map(crate::memory::canonical_context)
+                {
+                    object.insert(
+                        "exactContext".into(),
+                        serde_json::Value::String(exact_context),
+                    );
+                }
             }
             let matcher_json = matcher.to_string();
             let identity = serde_json::to_string(&(
@@ -4966,19 +5123,6 @@ impl AppDb {
                     .map(|value| value.chars().take(48).collect::<String>()),
             );
         }
-        for candidate in [
-            session.project_name.as_deref(),
-            session.task_title.as_deref(),
-        ] {
-            if let Some(candidate) = candidate.and_then(context_memory_keyword) {
-                keywords.push(candidate.chars().take(48).collect());
-            }
-        }
-        if let Some(window) = context_memory_keyword(&window).filter(|value| {
-            value.to_lowercase() != app && !is_generic_context_label(&value.to_lowercase())
-        }) {
-            keywords.push(window.chars().take(64).collect());
-        }
         keywords = keywords
             .into_iter()
             .map(|value| crate::memory::canonical_context(&value))
@@ -4986,11 +5130,32 @@ impl AppDb {
             .collect();
         keywords.sort();
         keywords.dedup();
-        if keywords.is_empty() {
+        let exact_context = context_memory_keyword(&window)
+            .filter(|value| {
+                value.to_lowercase() != app && !is_generic_context_label(&value.to_lowercase())
+            })
+            .map(|value| crate::memory::canonical_context(&value))
+            .filter(|value| !value.is_empty());
+        if keywords.is_empty() && exact_context.is_none() {
             bail!("当前窗口没有可区分线索，请填写识别词或固定当前事务");
         }
-        let mut matcher = serde_json::json!({ "generation": 2, "keywords": keywords });
-        if !app.is_empty() && session.task_id.is_none() {
+        let mut matcher = if keywords.is_empty() {
+            serde_json::json!({
+                "generation": 3,
+                "exactContext": exact_context,
+                "keywords": [],
+            })
+        } else {
+            serde_json::json!({
+                "generation": 3,
+                "keywords": keywords,
+                "matchMode": "any",
+            })
+        };
+        // Automatically remembered exact pages stay scoped to their app.
+        // Explicit user keywords are intentionally allowed across tools (for
+        // example the same “成果填报” work in Chrome and WPS).
+        if !app.is_empty() && keywords.is_empty() {
             matcher["app"] = serde_json::Value::String(app);
         }
         let mut rule = AttributionRule {
@@ -5008,64 +5173,6 @@ impl AppDb {
             enabled: true,
         };
         let conn = self.conn.lock();
-        if rule.task_id.is_some() {
-            let existing = {
-                let mut stmt = conn.prepare(
-                    "SELECT id,matcher_json FROM attribution_rules
-                     WHERE created_from_correction=1 AND enabled=1
-                       AND COALESCE(project_id,'')=COALESCE(?1,'')
-                       AND COALESCE(task_id,'')=COALESCE(?2,'') AND category=?3
-                     ORDER BY updated_at DESC",
-                )?;
-                let rows = stmt.query_map(
-                    params![rule.project_id, rule.task_id, rule.category],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )?;
-                collect_rows(rows)?
-            };
-            if let Some((keeper_id, _)) = existing.first() {
-                let mut merged = rule
-                    .matcher
-                    .get("keywords")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                for (_, matcher_json) in &existing {
-                    let matcher =
-                        serde_json::from_str::<serde_json::Value>(matcher_json).unwrap_or_default();
-                    merged.extend(
-                        matcher
-                            .get("keywords")
-                            .and_then(serde_json::Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToOwned::to_owned),
-                    );
-                }
-                let mut seen = HashSet::new();
-                merged.retain(|value| {
-                    !is_context_memory_noise(value) && seen.insert(value.trim().to_lowercase())
-                });
-                merged.truncate(48);
-                rule.matcher = serde_json::json!({ "generation": 2, "keywords": merged });
-                conn.execute(
-                    "UPDATE attribution_rules SET name=?1,priority=?2,matcher_json=?3,updated_at=?4 WHERE id=?5",
-                    params![rule.name, rule.priority, rule.matcher.to_string(), now(), keeper_id],
-                )?;
-                for (duplicate_id, _) in existing.iter().skip(1) {
-                    conn.execute(
-                        "DELETE FROM attribution_rules WHERE id=?1",
-                        params![duplicate_id],
-                    )?;
-                }
-                rule.id = keeper_id.clone();
-                return Ok(rule);
-            }
-        }
         let matcher_json = rule.matcher.to_string();
         if let Some(existing_id) = conn
             .query_row(
@@ -6284,7 +6391,7 @@ mod tests {
                     "INSERT INTO work_sessions(
                        id,started_at,ended_at,project_id,task_id,category,summary,confidence,
                        evidence_json,user_confirmed,source,updated_at
-                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,0.87,?8,?9,?10,?3)",
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,0.97,?8,?9,?10,?3)",
                     params![
                         id,
                         fmt(base + Duration::minutes(minute)),
@@ -6321,13 +6428,13 @@ mod tests {
 
         insert_assigned(
             "exact-ai",
-            "一等奖学金人数统计",
+            "成果 · 填报",
             0,
             &expected_task.id,
             "ai-review",
             false,
         );
-        insert_target("exact-target", "一等奖学金人数统计", 60);
+        insert_target("exact-target", "成果 · 填报", 60);
         let resolved = db
             .refresh_session_from_local_attribution("exact-target")
             .expect("reuse exact AI result")
@@ -7091,8 +7198,10 @@ mod tests {
             .create_task(&project.id, "漏洞复现")
             .expect("create task");
         let base = Utc::now() + Duration::hours(3);
-        let mut source_event = context_event("ai-exact-source", "ChatGPT.exe", "week1", base);
-        source_event.metadata["activePageTitle"] = serde_json::Value::String("week1".into());
+        let mut source_event =
+            context_event("ai-exact-source", "ChatGPT.exe", "IOT 漏洞复现 week1", base);
+        source_event.metadata["activePageTitle"] =
+            serde_json::Value::String("IOT 漏洞复现 week1".into());
         let source = classification::ingest_event(&db, &source_event)
             .expect("ingest AI source")
             .expect("AI source session");
@@ -7115,10 +7224,11 @@ mod tests {
         let mut repeat_event = context_event(
             "ai-exact-repeat",
             "ChatGPT.exe",
-            "week1",
+            "IOT 漏洞复现 week1",
             base + Duration::seconds(10),
         );
-        repeat_event.metadata["activePageTitle"] = serde_json::Value::String("week1".into());
+        repeat_event.metadata["activePageTitle"] =
+            serde_json::Value::String("IOT 漏洞复现 week1".into());
         let repeated = classification::ingest_event(&db, &repeat_event)
             .expect("ingest exact repeat")
             .expect("repeated session");
@@ -7126,7 +7236,7 @@ mod tests {
         assert_eq!(repeated.task_id.as_deref(), Some(task.id.as_str()));
         assert_eq!(repeated.category, category.name);
         assert!(repeated.confidence >= 0.90);
-        assert_eq!(repeated.source, "context-complete");
+        assert_ne!(repeated.source, "ai-review");
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -8066,12 +8176,12 @@ mod tests {
             conn.execute(
                 "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
                  VALUES ('generic-meeting','旧会议规则',90,?1,?2,?3,'学习',1,1,?4)",
-                params![serde_json::json!({"keywords": ["会议", "腾讯会议"]}).to_string(), internship.id, meeting.id, fmt(base - Duration::days(1))],
+                params![serde_json::json!({"generation": 2, "keywords": ["会议", "腾讯会议"]}).to_string(), internship.id, meeting.id, fmt(base - Duration::days(1))],
             ).expect("insert generic rule");
             conn.execute(
                 "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
                  VALUES ('specific-iot','IOT 会议规则',90,?1,?2,?3,'学习',1,1,?4)",
-                params![serde_json::json!({"keywords": ["申书豪预定的会议", "IOT"]}).to_string(), research.id, iot.id, fmt(base)],
+                params![serde_json::json!({"generation": 3, "app": "wemeetapp", "exactContext": "申书豪预定的会议", "keywords": []}).to_string(), research.id, iot.id, fmt(base)],
             ).expect("insert specific rule");
         }
         let session = classification::ingest_event(
@@ -8253,7 +8363,12 @@ mod tests {
 
         let qq = classification::ingest_event(
             &db,
-            &context_event("context-qq", "QQ.exe", "QQ", base + Duration::seconds(10)),
+            &context_event(
+                "context-qq",
+                "QQ.exe",
+                "推免成果填报群",
+                base + Duration::seconds(10),
+            ),
         )
         .expect("ingest qq")
         .expect("qq session");
@@ -8266,7 +8381,7 @@ mod tests {
             &context_event(
                 "context-wps",
                 "wps.exe",
-                "证明材料.pdf",
+                "成果填报证明材料.pdf",
                 base + Duration::seconds(20),
             ),
         )
@@ -8526,7 +8641,10 @@ mod tests {
             .matcher
             .get("keywords")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|keywords| keywords.iter().any(|value| value == "预推免成果填报")));
+            .is_some_and(|keywords| {
+                keywords.iter().any(|value| value == "成果填报")
+                    && keywords.iter().any(|value| value == "预推免")
+            }));
 
         let wps = classification::ingest_event(
             &db,
@@ -8556,7 +8674,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_rule_normalization_merges_app_duplicates_and_keeps_page_memory() {
+    fn explicit_cross_app_keywords_are_deduplicated_without_page_pollution() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-rule-normalization-test-{}",
             Uuid::new_v4()
@@ -8627,9 +8745,8 @@ mod tests {
             .get("keywords")
             .and_then(serde_json::Value::as_array)
             .expect("normalized keywords");
-        assert!(pages
-            .iter()
-            .all(|(_, _, page)| keywords.iter().any(|value| value == page)));
+        assert!(keywords.iter().any(|value| value == "成果填报"));
+        assert!(keywords.iter().any(|value| value == "预推免"));
         drop(conn);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -10245,6 +10362,169 @@ mod tests {
                 suffix_correct as f64 / suffix.len() as f64 * 100.0
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires SCREENUSE_REPLAY_DATA_DIR pointing to a copied real ledger"]
+    fn replay_production_preflight_without_future_corrections() {
+        let data_dir = std::env::var("SCREENUSE_REPLAY_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("set SCREENUSE_REPLAY_DATA_DIR to a copied ledger directory");
+        let db = AppDb::open_in(data_dir).expect("open replay database");
+        db.rebuild_personal_memory_from_confirmed()
+            .expect("rebuild coherent memories");
+        let mut targets = db
+            .load_personal_memories()
+            .expect("load confirmed examples")
+            .into_iter()
+            .filter(|record| record.user_confirmed)
+            .filter_map(|record| {
+                db.get_session(&record.session_id)
+                    .expect("load target session")
+                    .map(|session| (session.started_at, record))
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(
+            !targets.is_empty(),
+            "replay ledger has no manual corrections"
+        );
+
+        {
+            let mut conn = db.conn.lock();
+            let tx = conn.transaction().expect("begin replay reset");
+            tx.execute("DELETE FROM attribution_memories", [])
+                .expect("clear future memories");
+            tx.execute(
+                "DELETE FROM attribution_rules WHERE created_from_correction=1",
+                [],
+            )
+            .expect("clear future learned rules");
+            tx.execute("DELETE FROM context_pin", [])
+                .expect("clear pinned context");
+            for (_, target) in &targets {
+                tx.execute(
+                    "UPDATE work_sessions
+                     SET project_id=NULL,task_id=NULL,category='杂务',confidence=0.56,
+                         user_confirmed=0,source='context-complete'
+                     WHERE id=?1",
+                    params![target.session_id],
+                )
+                .expect("remove future correction");
+            }
+            tx.commit().expect("commit replay reset");
+        }
+
+        let mut automatic = 0_usize;
+        let mut correct = 0_usize;
+        let mut errors = Vec::new();
+        let mut fallbacks = Vec::new();
+        let mut outcomes = Vec::new();
+        for (_, target) in &targets {
+            let predicted = db
+                .refresh_session_from_local_attribution(&target.session_id)
+                .expect("run production local preflight");
+            let concrete = predicted.as_ref().is_some_and(|session| {
+                session.project_id.is_some()
+                    && session.task_id.is_some()
+                    && session.confidence >= 0.84
+            });
+            let is_correct = predicted.as_ref().is_some_and(|session| {
+                concrete
+                    && session.category == target.category
+                    && session.project_id.as_deref() == Some(target.project_id.as_str())
+                    && session.task_id.as_deref() == Some(target.task_id.as_str())
+            });
+            automatic += usize::from(concrete);
+            correct += usize::from(is_correct);
+            outcomes.push((concrete, is_correct));
+            if concrete && !is_correct && errors.len() < 30 {
+                let session = predicted.as_ref().expect("concrete prediction exists");
+                errors.push(format!(
+                    "{} | {:?} -> {}/{:?}/{:?} {:.2} source={} evidence={:?} (expected {}/{}/{})",
+                    target.session_id,
+                    target.features,
+                    session.category,
+                    session.project_id,
+                    session.task_id,
+                    session.confidence,
+                    session.source,
+                    session.evidence,
+                    target.category,
+                    target.project_id,
+                    target.task_id
+                ));
+            } else if !concrete && fallbacks.len() < 30 {
+                fallbacks.push(format!(
+                    "{} | {:?} (expected {}/{}/{})",
+                    target.session_id,
+                    target.features,
+                    target.category,
+                    target.project_id,
+                    target.task_id
+                ));
+            }
+
+            db.conn
+                .lock()
+                .execute(
+                    "UPDATE work_sessions
+                     SET project_id=?1,task_id=?2,category=?3,confidence=0.99,
+                         user_confirmed=1,source='manual-correction',updated_at=?4
+                     WHERE id=?5",
+                    params![
+                        target.project_id,
+                        target.task_id,
+                        target.category,
+                        target.confirmed_at,
+                        target.session_id,
+                    ],
+                )
+                .expect("restore correction after prediction");
+            let restored = db
+                .get_session(&target.session_id)
+                .expect("load restored session")
+                .expect("restored session exists");
+            db.record_personal_memory(&restored)
+                .expect("learn correction after prediction");
+            let _ = db.learn_rule_from_session(&target.session_id, None);
+        }
+
+        let coverage = automatic as f64 / targets.len() as f64;
+        let precision = if automatic == 0 {
+            0.0
+        } else {
+            correct as f64 / automatic as f64
+        };
+        eprintln!(
+            "production preflight chronological: targets={} automatic={automatic} correct={correct} coverage={:.2}% precision={:.2}% ai_fallbacks={}",
+            targets.len(),
+            coverage * 100.0,
+            precision * 100.0,
+            targets.len() - automatic
+        );
+        for error in errors {
+            eprintln!("  error: {error}");
+        }
+        for fallback in fallbacks {
+            eprintln!("  fallback: {fallback}");
+        }
+        for window in [50_usize, 100, 200] {
+            let suffix = &outcomes[outcomes.len().saturating_sub(window)..];
+            let suffix_automatic = suffix.iter().filter(|(auto, _)| *auto).count();
+            let suffix_correct = suffix.iter().filter(|(_, correct)| *correct).count();
+            eprintln!(
+                "  last {}: automatic={suffix_automatic} correct={suffix_correct} coverage={:.2}% precision={:.2}%",
+                suffix.len(),
+                suffix_automatic as f64 / suffix.len() as f64 * 100.0,
+                if suffix_automatic == 0 {
+                    0.0
+                } else {
+                    suffix_correct as f64 / suffix_automatic as f64 * 100.0
+                }
+            );
+        }
+        assert!(precision >= 0.99, "production preflight lost precision");
     }
 
     #[test]

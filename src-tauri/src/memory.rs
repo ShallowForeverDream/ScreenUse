@@ -244,6 +244,27 @@ pub fn features_from_session_evidence(session: &WorkSession) -> ContextFeatures 
     features_from_session(session, &[])
 }
 
+pub fn features_from_primary_session_evidence(session: &WorkSession) -> ContextFeatures {
+    let page = first_evidence_value(&session.evidence, "page").unwrap_or_default();
+    let window = if page.is_empty() {
+        first_evidence_value(&session.evidence, "window").unwrap_or_default()
+    } else {
+        ""
+    };
+    // Evidence is stored as a flat list, so workspace/file entries cannot be
+    // proven to belong to the first app once a compacted session contains
+    // several contexts.  Keep only the visible primary page identity instead
+    // of manufacturing combinations such as `ScreenUse + ICPC workspace`.
+    build_features(
+        first_evidence_value(&session.evidence, "app").unwrap_or_default(),
+        page,
+        window,
+        "",
+        "",
+        "",
+    )
+}
+
 pub fn is_discriminative(features: &ContextFeatures) -> bool {
     (!features.page.is_empty() && !is_generic(&features.page))
         || !features.domain.is_empty()
@@ -492,7 +513,11 @@ fn choose_similarity_assignment(
         .iter()
         .map(|(record, _)| assignment_key(record))
         .collect::<HashSet<_>>();
-    if exact_ai_assignments.len() == 1 {
+    let exact_ai_is_anchored = exact_ai.iter().any(|(record, _)| {
+        is_specific_task_label(&record.task_title)
+            && relates_to_assignment(query, "", &record.task_title)
+    });
+    if exact_ai_assignments.len() == 1 && (exact_ai.len() >= 3 || exact_ai_is_anchored) {
         let (record, _) = exact_ai
             .iter()
             .max_by(|left, right| left.0.confirmed_at.cmp(&right.0.confirmed_at))?;
@@ -626,6 +651,31 @@ pub(crate) fn stable_for_single_ai_memory(features: &ContextFeatures) -> bool {
     !["会议室", "会议纪要", "元宝纪要", "meeting room"]
         .iter()
         .any(|marker| label.contains(marker))
+}
+
+pub(crate) fn is_specific_task_label(value: &str) -> bool {
+    let normalized = normalize(value).replace([' ', '_', '-'], "");
+    !matches!(
+        normalized.as_str(),
+        ""
+            | "微信"
+            | "qq"
+            | "会议"
+            | "沟通"
+            | "聊天"
+            | "开发"
+            | "测试"
+            | "开发与测试"
+            | "开发与调试"
+            | "使用测试"
+            | "学习"
+            | "科研"
+            | "写作"
+            | "阅读"
+            | "资料阅读"
+            | "日常事务"
+            | "浪费"
+    ) && !crate::ai::is_placeholder_task_title(value)
 }
 
 fn choose_manual_keyword_signature(
@@ -1563,19 +1613,19 @@ mod tests {
 
     #[test]
     fn one_high_confidence_ai_result_teaches_only_an_exact_repeat() {
-        let mut ai = record("ai", "ChatGPT.exe", "week1", "漏洞复现");
+        let mut ai = record("ai", "ChatGPT.exe", "漏洞复现 week1", "漏洞复现");
         ai.user_confirmed = false;
         ai.source_confidence = 0.98;
 
         let exact = choose_assignment(
-            &features_from_event(&event("ChatGPT.exe", "week1")),
+            &features_from_event(&event("ChatGPT.exe", "漏洞复现 week1")),
             &[ai.clone()],
         )
         .expect("exact high-confidence AI repeat");
         assert_eq!(exact.task_id, "漏洞复现");
         assert_eq!(exact.confidence, 0.90);
         assert!(choose_assignment(
-            &features_from_event(&event("ChatGPT.exe", "week1 周报")),
+            &features_from_event(&event("ChatGPT.exe", "漏洞复现 week1 周报")),
             &[ai]
         )
         .is_none());

@@ -84,8 +84,18 @@ pub(crate) fn recent_task_assignment(
     {
         return Ok(None);
     }
+    let features = crate::memory::features_from_session_evidence(session);
+    let specific_task_match = !is_generic_task_title(&context.task_title)
+        && crate::memory::relates_to_assignment(&features, "", &context.task_title);
+    // A project can contain several unrelated tasks.  Matching only the project
+    // name (for example `IOT`) must never copy the previous task (`会议`) onto
+    // the new page (`CVE 复现`).  Continuity is allowed to fill a concrete task
+    // only when the current metadata also identifies that exact task.
+    if !specific_task_match {
+        return Ok(None);
+    }
     let started = chrono::DateTime::parse_from_rfc3339(&session.started_at)?;
-    let previous_end = chrono::DateTime::parse_from_rfc3339(&context.ended_at)?;
+    let previous_end = chrono::DateTime::parse_from_rfc3339(&context.boundary_at)?;
     let gap_seconds = (started - previous_end).num_seconds().max(0);
     if gap_seconds > 30 {
         return Ok(None);
