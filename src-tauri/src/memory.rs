@@ -84,6 +84,8 @@ pub struct RetrievedMemoryExample {
     pub task_title: String,
     pub similarity: f32,
     pub confirmed_at: String,
+    pub user_confirmed: bool,
+    pub source_confidence: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -688,6 +690,8 @@ pub fn retrieve_examples(
                 task_title: record.task_title.clone(),
                 similarity: (score * 1000.0).round() / 1000.0,
                 confirmed_at: record.confirmed_at.clone(),
+                user_confirmed: record.user_confirmed,
+                source_confidence: record.source_confidence,
             });
             if output
                 .iter()

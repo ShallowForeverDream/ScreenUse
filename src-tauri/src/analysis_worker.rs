@@ -199,7 +199,11 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
     let categories = db.list_categories()?;
     let projects = db.list_projects()?;
     let tasks = db.list_tasks()?;
-    let memories = db.relevant_personal_memories(&targets, 3)?;
+    // Keep several competing concrete tasks visible to the model.  Provenance
+    // is included in each example, so a manual correction remains stronger
+    // than a previous AI suggestion instead of becoming a self-reinforcing
+    // classification loop.
+    let memories = db.relevant_personal_memories(&targets, 5)?;
     let input = AiReviewInput {
         targets: &targets,
         context_sessions: &context_sessions,

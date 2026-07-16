@@ -392,10 +392,10 @@ fn hide_console(_command: &mut Command) {}
 pub(crate) fn review_instructions() -> &'static str {
     "你是单人电脑时间账本的层级归类器。不要调用工具、读取文件或联网，只分析输入 JSON。\
 按 reviewItems 原顺序，为每个 targetSession.sessionId 返回且只返回一个结果；sessionId 是不透明字符串，必须逐字复制。\
-当前 category/project/task/confidence 只是旧系统建议，不是事实。层级归类时只决定 taskId；每个结果都必须从 catalog.taskChoices 选择一个 status=active 的具体 taskId。后端会根据该任务唯一反推项目和分类，不要自行决定或输出 projectId/category。禁止只归到分类或项目，也禁止选择 others、nothing、未归类、未指定、其他等兜底任务。\
-决策优先级：① personalMemory 中与当前页面、对话标题、工作区、文件或域名高度相似且由用户确认的例子；② 当前页面/文档/工作区等直接线索；\
+当前 category/project/task/confidence 只是旧系统建议，不是事实。层级归类时只决定 taskId；每个结果都必须明确地从 catalog.taskChoices 选择一个 status=active 的具体 taskId。即使某个项目只有一个任务，也不能省略 taskId 或只归到分类/项目。后端只根据该任务唯一反推项目和分类，不要自行决定或输出 projectId/category。禁止选择 others、nothing、未归类、未指定、其他等兜底任务。\
+决策优先级：① personalMemory 中 userConfirmed=true、且当前页面、对话标题、工作区、文件或域名高度相似的人工确认例子；userConfirmed=false 只是历史 AI 建议，不能单独作为高置信度依据；② 当前页面/文档/工作区等直接线索；\
 ③ timelineContext 中紧邻且已确认的同一事务连续性；④ 应用名只作弱证据。Explorer、浏览器、QQ、微信、WPS、截图工具和终端可能只是同一任务的工具切换。\
-taskId 不得为 null，也禁止创造名称。先比较完整的“分类 / 项目 / 任务”路径，再提交最末级任务 ID。证据不足时仍选择最合理的已有具体任务，但 confidence 不得高于 0.65，并在 evidence 中说明不确定依据。冲突记忆不强行套用。\
+taskId 不得为 null，也禁止创造名称。先比较完整的“分类 / 项目 / 任务”路径，再提交最末级任务 ID；同名任务必须用分类和项目区分。证据不足时可给出最合理的具体任务建议，但 confidence 不得高于 0.65，并在 evidence 中明确说明不确定依据，使其继续等待人工确认。冲突记忆不强行套用。\
 confidence 校准：精确个人记忆且无冲突 0.92-0.98；两个独立强线索 0.86-0.93；主要靠连续上下文 0.72-0.85；猜测不高于 0.65。\
 summary 用不超过 30 个汉字描述实际事务；evidence 最多 3 项，只保留决定性证据。只输出符合 JSON Schema 的 JSON。"
 }
@@ -728,13 +728,10 @@ fn session_id_typo_distance(left: &str, right: &str) -> usize {
 }
 
 fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) -> Result<()> {
-    if result.task_id.is_none() {
-        result.task_id = compatible_missing_task(result, input).map(|task| task.id.clone());
-    }
     let task_id = result
         .task_id
         .as_deref()
-        .ok_or_else(|| anyhow!("AI review must select a concrete taskId"))?;
+        .ok_or_else(|| anyhow!("AI review must explicitly select a concrete taskId"))?;
     let task = input
         .tasks
         .iter()
@@ -816,51 +813,6 @@ pub(crate) fn is_placeholder_task_title(title: &str) -> bool {
             | "待归类"
             | "待复核"
     )
-}
-
-fn compatible_missing_task<'a>(
-    result: &AiAttributionResult,
-    input: &'a AiReviewInput<'_>,
-) -> Option<&'a Task> {
-    let target = input
-        .targets
-        .iter()
-        .find(|session| session.id == result.session_id)?;
-    let project_id = result.project_id.as_deref();
-
-    if let Some(task_id) = target.task_id.as_deref() {
-        if let Some(task) = input.tasks.iter().find(|task| {
-            task.id == task_id
-                && is_concrete_review_task(task)
-                && project_id.map_or(true, |project_id| task.project_id == project_id)
-        }) {
-            return Some(task);
-        }
-    }
-
-    let mut remembered = input.memories.iter().filter(|memory| {
-        memory.target_session_id == result.session_id
-            && project_id.map_or(true, |project_id| memory.project_id == project_id)
-    });
-    if let Some(memory) = remembered.next() {
-        if remembered.next().is_none() || memory.similarity >= 0.9 {
-            if let Some(task) = input.tasks.iter().find(|task| {
-                task.id == memory.task_id
-                    && is_concrete_review_task(task)
-                    && project_id.map_or(true, |project_id| task.project_id == project_id)
-            }) {
-                return Some(task);
-            }
-        }
-    }
-
-    let project_id = project_id?;
-    let mut tasks = input
-        .tasks
-        .iter()
-        .filter(|task| is_concrete_review_task(task) && task.project_id == project_id);
-    let only = tasks.next()?;
-    tasks.next().is_none().then_some(only)
 }
 
 fn strip_url_noise(value: &str) -> String {
@@ -1149,6 +1101,8 @@ mod tests {
             task_title: "成果填报".into(),
             similarity: 0.94,
             confirmed_at: "2026-07-13T10:00:00Z".into(),
+            user_confirmed: true,
+            source_confidence: 0.91,
         }];
         let input = AiReviewInput {
             targets: &targets,
@@ -1191,6 +1145,15 @@ mod tests {
         assert_eq!(payload["personalMemory"].as_array().unwrap().len(), 1);
         assert_eq!(payload["personalMemory"][0]["targetSessionId"], "target");
         assert_eq!(payload["personalMemory"][0]["taskId"], "task");
+        assert_eq!(payload["personalMemory"][0]["userConfirmed"], true);
+        assert!(
+            (payload["personalMemory"][0]["sourceConfidence"]
+                .as_f64()
+                .unwrap()
+                - 0.91)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
@@ -1245,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_missing_task_when_the_selected_project_has_one_active_task() {
+    fn rejects_project_only_result_even_when_the_project_has_one_active_task() {
         let target = WorkSession {
             id: "target".into(),
             started_at: "2026-07-14T10:00:00Z".into(),
@@ -1298,10 +1261,8 @@ mod tests {
             evidence: vec![],
         };
 
-        validate_result(&mut result, &input).expect("repair the only concrete task");
-        assert_eq!(result.task_id.as_deref(), Some("task"));
-        assert_eq!(result.project_id.as_deref(), Some("project"));
-        assert_eq!(result.category, "保研");
+        let error = validate_result(&mut result, &input).expect_err("task must be explicit");
+        assert!(error.to_string().contains("explicitly select"));
     }
 
     #[test]
