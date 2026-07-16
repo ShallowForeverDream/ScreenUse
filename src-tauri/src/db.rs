@@ -7,9 +7,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -17,11 +15,14 @@ use uuid::Uuid;
 const ONE_SECOND_SAMPLING_MIGRATION_KEY: &str = "migration_sampling_1s_v1";
 const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 const PERSONAL_MEMORY_MIGRATION_KEY: &str = "migration_personal_memory_v1";
+const PERSONAL_MEMORY_CONSENSUS_MIGRATION_KEY: &str = "migration_personal_memory_consensus_v2";
+const PERSONAL_MEMORY_BATCH_MIGRATION_KEY: &str = "migration_personal_memory_batch_v3";
 const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
+const AI_MEMORY_MIN_CONFIDENCE: f32 = 0.92;
 const LAST_CORRECTION_UNDO_FILE: &str = "last-correction-undo.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +177,8 @@ impl AppDb {
         db.migrate_process_file_paths()?;
         db.migrate_personal_memory()?;
         db.migrate_process_file_memories()?;
+        db.migrate_personal_memory_consensus()?;
+        db.migrate_personal_memory_batches()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
@@ -243,9 +246,8 @@ impl AppDb {
             return Ok(0);
         }
         let rows = {
-            let mut stmt = conn.prepare(
-                "SELECT session_id,features_json FROM attribution_memories",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT session_id,features_json FROM attribution_memories")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -1484,8 +1486,7 @@ impl AppDb {
             ],
         )?;
         drop(conn);
-        self.get_session(&id)?
-            .context("手动时间段创建后未找到")
+        self.get_session(&id)?.context("手动时间段创建后未找到")
     }
 
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
@@ -1650,12 +1651,7 @@ impl AppDb {
         let snapshot = self.capture_session_correction_undo(ids, label)?;
         let result = (|| {
             let updated = self.update_sessions(ids, patch)?;
-            // Every confirmed correction becomes one isolated personal example.
-            // It only influences future events through conservative retrieval and
-            // never rewrites existing sessions.
-            for session in &updated {
-                self.record_personal_memory(session)?;
-            }
+            self.record_correction_memories(&updated, true)?;
             if remember {
                 for session in &updated {
                     self.learn_rule_from_session(&session.id, keyword)?;
@@ -1968,8 +1964,11 @@ impl AppDb {
         )?;
         drop(conn);
         self.match_plan_items_for_session(&updated.id)?;
-        self.get_session(&updated.id)?
-            .context("AI-reviewed session disappeared")
+        let reviewed = self
+            .get_session(&updated.id)?
+            .context("AI-reviewed session disappeared")?;
+        self.record_personal_memory(&reviewed)?;
+        Ok(reviewed)
     }
 
     #[cfg(test)]
@@ -3558,39 +3557,198 @@ impl AppDb {
         Ok(())
     }
 
-    pub(crate) fn rebuild_personal_memory_from_confirmed(&self) -> Result<u32> {
+    fn migrate_personal_memory_consensus(&self) -> Result<()> {
+        let already_migrated = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PERSONAL_MEMORY_CONSENSUS_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        self.rebuild_personal_memory_from_confirmed()?;
         self.conn.lock().execute(
-            "DELETE FROM attribution_memories
-             WHERE NOT EXISTS (
-               SELECT 1 FROM work_sessions ws
-               WHERE ws.id=attribution_memories.session_id
-                 AND ws.user_confirmed=1 AND ws.project_id IS NOT NULL
-                 AND ws.task_id IS NOT NULL AND ws.summary<>'离开/空闲'
-             )",
-            [],
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PERSONAL_MEMORY_CONSENSUS_MIGRATION_KEY, now()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_personal_memory_batches(&self) -> Result<()> {
+        let already_migrated = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PERSONAL_MEMORY_BATCH_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        self.rebuild_personal_memory_from_confirmed()?;
+        self.conn.lock().execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PERSONAL_MEMORY_BATCH_MIGRATION_KEY, now()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_personal_memory_from_confirmed(&self) -> Result<u32> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM attribution_memories", [])?;
         let confirmed = self
             .list_sessions(MAX_PERSONAL_MEMORIES)?
             .into_iter()
-            .filter(|session| session.user_confirmed && session.task_id.is_some())
+            .filter(|session| is_reliable_memory_session(session) && session.task_id.is_some())
             .collect::<Vec<_>>();
+        self.record_correction_memories(&confirmed, false)
+    }
+
+    fn record_correction_memories(
+        &self,
+        sessions: &[WorkSession],
+        current_batch: bool,
+    ) -> Result<u32> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        struct Candidate<'a> {
+            session: &'a WorkSession,
+            features: crate::memory::ContextFeatures,
+            confirmed_at: String,
+            group_key: String,
+            feature_key: String,
+        }
+
+        let confirmed_at = {
+            let conn = self.conn.lock();
+            let mut values = HashMap::new();
+            for session in sessions {
+                if let Some(updated_at) = conn
+                    .query_row(
+                        "SELECT updated_at FROM work_sessions WHERE id=?1",
+                        params![session.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    values.insert(session.id.clone(), updated_at);
+                }
+            }
+            values
+        };
+
+        let mut candidates = Vec::new();
+        for session in sessions {
+            self.delete_personal_memory(&session.id)?;
+            if !is_reliable_memory_session(session)
+                || session.source == "collector-idle"
+                || session.summary == "离开/空闲"
+            {
+                continue;
+            }
+            let (Some(project_id), Some(task_id)) =
+                (session.project_id.as_deref(), session.task_id.as_deref())
+            else {
+                continue;
+            };
+            if session.project_name.is_none() || session.task_title.is_none() {
+                continue;
+            }
+            let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
+            let features = crate::memory::features_from_session(session, &events);
+            if !crate::memory::is_discriminative(&features) {
+                continue;
+            }
+            let timestamp = confirmed_at
+                .get(&session.id)
+                .cloned()
+                .unwrap_or_else(|| session.ended_at.clone());
+            let batch_label = if current_batch {
+                "current-correction"
+            } else {
+                timestamp.as_str()
+            };
+            let group_key = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                batch_label, session.category, project_id, task_id
+            );
+            let feature_key = serde_json::to_string(&features)?;
+            candidates.push(Candidate {
+                session,
+                features,
+                confirmed_at: timestamp,
+                group_key,
+                feature_key,
+            });
+        }
+
+        let mut group_counts = HashMap::<String, usize>::new();
+        let mut feature_counts = HashMap::<(String, String), usize>::new();
+        for candidate in &candidates {
+            if candidate.session.user_confirmed {
+                *group_counts.entry(candidate.group_key.clone()).or_default() += 1;
+                *feature_counts
+                    .entry((candidate.group_key.clone(), candidate.feature_key.clone()))
+                    .or_default() += 1;
+            }
+        }
+
         let mut stored = 0_u32;
-        for session in &confirmed {
-            stored += u32::from(self.record_personal_memory(session)?);
+        for candidate in candidates {
+            let manual_group_size = group_counts
+                .get(&candidate.group_key)
+                .copied()
+                .unwrap_or_default();
+            let repeated_context = feature_counts
+                .get(&(candidate.group_key.clone(), candidate.feature_key.clone()))
+                .copied()
+                .unwrap_or_default()
+                >= 2;
+            let assignment_anchored = crate::memory::relates_to_assignment(
+                &candidate.features,
+                candidate
+                    .session
+                    .project_name
+                    .as_deref()
+                    .unwrap_or_default(),
+                candidate.session.task_title.as_deref().unwrap_or_default(),
+            );
+            let keep = !candidate.session.user_confirmed
+                || manual_group_size <= 1
+                || repeated_context
+                || assignment_anchored;
+            if keep {
+                stored += u32::from(self.store_personal_memory(
+                    candidate.session,
+                    &candidate.features,
+                    &candidate.confirmed_at,
+                )?);
+            }
         }
         Ok(stored)
     }
 
     fn record_personal_memory(&self, session: &WorkSession) -> Result<bool> {
-        let Some(project_id) = session.project_id.as_deref() else {
+        if session.project_id.is_none() {
             self.delete_personal_memory(&session.id)?;
             return Ok(false);
-        };
-        let Some(task_id) = session.task_id.as_deref() else {
+        }
+        if session.task_id.is_none() {
             self.delete_personal_memory(&session.id)?;
             return Ok(false);
-        };
-        if !session.user_confirmed
+        }
+        if !is_reliable_memory_session(session)
             || session.source == "collector-idle"
             || session.summary == "离开/空闲"
         {
@@ -3603,7 +3761,49 @@ impl AppDb {
             self.delete_personal_memory(&session.id)?;
             return Ok(false);
         }
+        let confirmed_at = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT updated_at FROM work_sessions WHERE id=?1",
+                params![session.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("memory source session disappeared")?;
+        self.store_personal_memory(session, &features, &confirmed_at)
+    }
+
+    fn store_personal_memory(
+        &self,
+        session: &WorkSession,
+        features: &crate::memory::ContextFeatures,
+        confirmed_at: &str,
+    ) -> Result<bool> {
+        let Some(project_id) = session.project_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(task_id) = session.task_id.as_deref() else {
+            return Ok(false);
+        };
+        let settings = self.get_settings()?.normalized();
         let conn = self.conn.lock();
+        let project_name = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id=?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("memory project disappeared")?;
+        if session.category == settings.idle_category && project_name == settings.idle_project_name
+        {
+            conn.execute(
+                "DELETE FROM attribution_memories WHERE session_id=?1",
+                params![session.id],
+            )?;
+            return Ok(false);
+        }
         conn.execute(
             "INSERT INTO attribution_memories(
                 session_id,features_json,category,project_id,task_id,confirmed_at,last_used_at,use_count
@@ -3614,11 +3814,11 @@ impl AppDb {
                 confirmed_at=excluded.confirmed_at",
             params![
                 session.id,
-                serde_json::to_string(&features)?,
+                serde_json::to_string(features)?,
                 session.category,
                 project_id,
                 task_id,
-                now(),
+                confirmed_at,
             ],
         )?;
         conn.execute(
@@ -3644,10 +3844,11 @@ impl AppDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT m.session_id,m.features_json,m.category,m.project_id,p.name,
-                    m.task_id,t.title,m.confirmed_at
+                    m.task_id,t.title,m.confirmed_at,ws.user_confirmed
              FROM attribution_memories m
              JOIN projects p ON p.id=m.project_id
              JOIN tasks t ON t.id=m.task_id AND t.project_id=m.project_id
+             JOIN work_sessions ws ON ws.id=m.session_id
              ORDER BY m.confirmed_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![MAX_PERSONAL_MEMORIES], |row| {
@@ -3661,6 +3862,7 @@ impl AppDb {
                 task_id: row.get(5)?,
                 task_title: row.get(6)?,
                 confirmed_at: row.get(7)?,
+                user_confirmed: row.get::<_, i64>(8)? != 0,
             })
         })?;
         collect_rows(rows)
@@ -3685,16 +3887,11 @@ impl AppDb {
         let records = self.load_personal_memories()?;
         let decision = crate::memory::choose_assignment(&query, &records);
         if let Some(decision) = &decision {
-            let assignment = records.iter().find(|record| {
-                record.project_id == decision.project_id && record.task_id == decision.task_id
-            });
-            if let Some(record) = assignment {
-                self.conn.lock().execute(
-                    "UPDATE attribution_memories
-                     SET last_used_at=?1,use_count=use_count+1 WHERE session_id=?2",
-                    params![now(), record.session_id],
-                )?;
-            }
+            self.conn.lock().execute(
+                "UPDATE attribution_memories
+                 SET last_used_at=?1,use_count=use_count+1 WHERE session_id=?2",
+                params![now(), decision.memory_session_id],
+            )?;
         }
         Ok(decision)
     }
@@ -4592,6 +4789,11 @@ fn is_auto_session_source(source: &str) -> bool {
     )
 }
 
+fn is_reliable_memory_session(session: &WorkSession) -> bool {
+    session.user_confirmed
+        || (session.source == "ai-review" && session.confidence >= AI_MEMORY_MIN_CONFIDENCE)
+}
+
 fn is_task_overlay_session(session: &WorkSession) -> bool {
     primary_session_app(session)
         .as_deref()
@@ -5020,6 +5222,59 @@ mod tests {
             db.list_sessions(500).expect("sessions after").len(),
             count_before
         );
+        assert_eq!(
+            db.conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM attribution_memories WHERE session_id=?1",
+                    params![session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count AI memories"),
+            1
+        );
+        let mut follow_up = context_event(
+            "ai-memory-target",
+            "wps.exe",
+            "成果填报群",
+            Utc::now() + Duration::minutes(2),
+        );
+        follow_up.metadata["activePageTitle"] = serde_json::Value::String("成果填报群".into());
+        let first_repeat = classification::ingest_event(&db, &follow_up)
+            .expect("ingest first repeated context")
+            .expect("first repeated session");
+        assert!(first_repeat.task_id.is_none());
+        db.apply_ai_review(
+            &first_repeat.id,
+            SessionPatch {
+                summary: Some("沟通推免成果填报".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.93),
+                user_confirmed: Some(false),
+            },
+            Vec::new(),
+        )
+        .expect("apply corroborating AI review");
+        let mut second_repeat = context_event(
+            "ai-memory-corroborated-target",
+            "QQ.exe",
+            "成果填报群",
+            Utc::now() + Duration::minutes(4),
+        );
+        second_repeat.metadata["activePageTitle"] =
+            serde_json::Value::String("成果填报群".into());
+        let learned = classification::ingest_event(&db, &second_repeat)
+            .expect("ingest corroborated AI context")
+            .expect("corroborated AI session");
+        assert_eq!(learned.task_id.as_deref(), Some(task.id.as_str()));
+        assert!(learned
+            .evidence
+            .iter()
+            .any(|item| item.kind == "personal-memory"));
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
@@ -5071,10 +5326,8 @@ mod tests {
 
     #[test]
     fn legacy_process_paths_are_removed_without_deleting_real_binary_files() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "screenuse-process-path-test-{}",
-            Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-process-path-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
         {
             let conn = db.conn.lock();
@@ -5084,7 +5337,11 @@ mod tests {
             )
             .expect("reset process path migration");
             for (id, app, file_path) in [
-                ("legacy-process", "QQ.exe", r"C:\Program Files\Tencent\QQ.exe"),
+                (
+                    "legacy-process",
+                    "QQ.exe",
+                    r"C:\Program Files\Tencent\QQ.exe",
+                ),
                 ("real-binary", "ida.exe", r"D:\CTF\challenge.exe"),
             ] {
                 conn.execute(
@@ -6186,6 +6443,66 @@ mod tests {
     }
 
     #[test]
+    fn explicit_project_page_overrides_an_old_wrong_personal_memory() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-explicit-over-memory-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let old_project = db.create_project("IOT", "开发").expect("old project");
+        let old_task = db
+            .create_task(&old_project.id, "漏洞复现")
+            .expect("old task");
+        let exact_project = db
+            .create_project("ScreenUse 专项", "开发")
+            .expect("exact project");
+        let exact_task = db
+            .create_task(&exact_project.id, "开发与测试")
+            .expect("exact task");
+        let base = Utc::now() + Duration::minutes(20);
+        let source = classification::ingest_event(
+            &db,
+            &context_event("wrong-memory-source", "ChatGPT.exe", "ScreenUse 专项", base),
+        )
+        .expect("ingest memory source")
+        .expect("memory source");
+        db.apply_session_correction(
+            std::slice::from_ref(&source.id),
+            SessionPatch {
+                summary: None,
+                project_id: Some(old_project.id.clone()),
+                task_id: Some(old_task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some("开发".into()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("store old wrong memory");
+
+        let target = classification::ingest_event(
+            &db,
+            &context_event(
+                "explicit-project-target",
+                "wps.exe",
+                "ScreenUse 专项",
+                base + Duration::minutes(2),
+            ),
+        )
+        .expect("ingest explicit target")
+        .expect("explicit target");
+        assert_eq!(target.project_id.as_deref(), Some(exact_project.id.as_str()));
+        assert_eq!(target.task_id.as_deref(), Some(exact_task.id.as_str()));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn one_manual_correction_repairs_adjacent_weak_sessions_until_idle() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-context-propagation-test-{}",
@@ -6963,7 +7280,9 @@ mod tests {
         let project = db
             .create_project("手动补录项目", "开发")
             .expect("create project");
-        let task = db.create_task(&project.id, "补录任务").expect("create task");
+        let task = db
+            .create_task(&project.id, "补录任务")
+            .expect("create task");
         let base = Utc::now() + Duration::days(30);
         let patch = SessionPatch {
             summary: Some("补录空档".into()),
@@ -7427,6 +7746,83 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.kind == "personal-memory"));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn batch_correction_does_not_turn_incidental_apps_into_permanent_rules() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-batch-memory-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        db.create_category("科研").expect("create category");
+        let project = db.create_project("IOT", "科研").expect("create project");
+        let task = db.create_task(&project.id, "会议").expect("create task");
+        let base = Utc::now() + Duration::minutes(2);
+        let insert = |id: &str, start: DateTime<Utc>, page: &str, app: &str| {
+            let evidence = serde_json::to_string(&vec![
+                EvidenceItem {
+                    kind: "page".into(),
+                    label: "当前页面".into(),
+                    value: page.into(),
+                    weight: 0.95,
+                },
+                EvidenceItem {
+                    kind: "app".into(),
+                    label: "应用".into(),
+                    value: app.into(),
+                    weight: 0.8,
+                },
+            ])
+            .expect("serialize evidence");
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,NULL,NULL,'杂务',?4,0.55,?5,0,'context-complete',?6)",
+                    params![id, fmt(start), fmt(start + Duration::seconds(10)), page, evidence, now()],
+                )
+                .expect("insert session");
+        };
+        insert("batch-related", base, "IOT week1", "ChatGPT.exe");
+        insert(
+            "batch-incidental",
+            base + Duration::seconds(10),
+            "ScreenUse开发",
+            "ScreenUse.exe",
+        );
+
+        db.apply_session_correction(
+            &["batch-related".into(), "batch-incidental".into()],
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some("科研".into()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("batch correction");
+
+        let stored = db
+            .conn
+            .lock()
+            .prepare(
+                "SELECT session_id FROM attribution_memories
+                 WHERE session_id IN ('batch-related','batch-incidental') ORDER BY session_id",
+            )
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("load memories");
+        assert_eq!(stored, vec!["batch-related".to_string()]);
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

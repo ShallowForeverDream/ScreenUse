@@ -293,6 +293,7 @@ pub struct AppSettings {
     // sequentially so only one model request is active at a time.
     pub ai_mode: String,
     pub ai_provider: String,
+    pub ai_review_scope: String,
     pub min_ai_session_minutes: u32,
     pub codex_plan: String,
     pub ai_base_url: String,
@@ -328,6 +329,7 @@ impl Default for AppSettings {
             quick_pause_enabled: true,
             ai_mode: "off".into(),
             ai_provider: String::new(),
+            ai_review_scope: "fallback".into(),
             min_ai_session_minutes: 1,
             codex_plan: "pro-20x".into(),
             ai_base_url: "https://api.openai.com/v1".into(),
@@ -361,6 +363,11 @@ impl AppSettings {
         self.idle_category = clean_setting_label(&self.idle_category, "无效");
         self.idle_project_name = clean_setting_label(&self.idle_project_name, "离开");
         self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(0, 240);
+        self.ai_review_scope = match self.ai_review_scope.as_str() {
+            "all" => "all",
+            _ => "fallback",
+        }
+        .into();
         self.codex_plan = match self.codex_plan.as_str() {
             "plus" => "plus",
             "pro-5x" => "pro-5x",
@@ -461,13 +468,17 @@ mod tests {
         assert_eq!(normalized_existing.ai_provider, "codex-account");
         assert_eq!(normalized_existing.ai_model, "gpt-5.6-luna");
         assert_eq!(normalized_existing.min_ai_session_minutes, 1);
+        assert_eq!(normalized_existing.ai_review_scope, "fallback");
         assert_eq!(normalized_existing.codex_plan, "pro-20x");
 
         let review_all = AppSettings {
             min_ai_session_minutes: 0,
+            ai_review_scope: "all".into(),
             ..AppSettings::default()
         };
-        assert_eq!(review_all.normalized().min_ai_session_minutes, 0);
+        let review_all = review_all.normalized();
+        assert_eq!(review_all.min_ai_session_minutes, 0);
+        assert_eq!(review_all.ai_review_scope, "all");
 
         let legacy_manual = AppSettings {
             ai_mode: "manual".into(),

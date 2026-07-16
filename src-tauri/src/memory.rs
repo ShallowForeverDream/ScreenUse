@@ -57,6 +57,7 @@ pub struct MemoryRecord {
     pub task_id: String,
     pub task_title: String,
     pub confirmed_at: String,
+    pub user_confirmed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,7 @@ pub struct MemoryDecision {
     pub confidence: f32,
     pub matched_label: String,
     pub support: usize,
+    pub memory_session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +194,28 @@ pub fn is_discriminative(features: &ContextFeatures) -> bool {
         || (!features.window.is_empty() && !is_generic(&features.window))
 }
 
+pub fn relates_to_assignment(
+    features: &ContextFeatures,
+    project_name: &str,
+    task_title: &str,
+) -> bool {
+    let hay = [
+        features.page.as_str(),
+        features.window.as_str(),
+        features.workspace.as_str(),
+        features.file.as_str(),
+        features.domain.as_str(),
+    ]
+    .join(" ");
+    [project_name, task_title]
+        .into_iter()
+        .map(canonical_context)
+        .filter(|label| !label.is_empty())
+        .any(|label| {
+            hay.contains(&label) || set_similarity(&text_tokens(&label), &features.tokens) >= 0.72
+        })
+}
+
 pub fn choose_assignment(
     query: &ContextFeatures,
     records: &[MemoryRecord],
@@ -214,7 +238,89 @@ pub fn choose_assignment(
             .total_cmp(&left.1.score)
             .then_with(|| right.0.confirmed_at.cmp(&left.0.confirmed_at))
     });
-    candidates.truncate(12);
+    candidates.truncate(64);
+
+    // An explicit correction is also how the user changes the meaning of a
+    // context over time. For equally exact manual examples, the latest unique
+    // correction wins instead of forcing the user to outvote all old history.
+    let best_manual_score = candidates
+        .iter()
+        .filter(|(record, similarity)| {
+            record.user_confirmed && similarity.strong && similarity.score >= 0.86
+        })
+        .map(|(_, similarity)| similarity.score)
+        .max_by(f32::total_cmp);
+    if let Some(best_manual_score) = best_manual_score {
+        let exact_band = candidates
+            .iter()
+            .filter(|(record, similarity)| {
+                record.user_confirmed
+                    && similarity.strong
+                    && similarity.score >= best_manual_score - 0.02
+            })
+            .collect::<Vec<_>>();
+        let assignments = exact_band
+            .iter()
+            .map(|(record, _)| assignment_key(record))
+            .collect::<HashSet<_>>();
+        if assignments.len() == 1 && best_manual_score >= 0.90 {
+            let record = exact_band[0].0;
+            return Some(MemoryDecision {
+                category: record.category.clone(),
+                project_id: record.project_id.clone(),
+                task_id: record.task_id.clone(),
+                confidence: 0.96,
+                matched_label: strongest_label(query, &record.features),
+                support: exact_band.len(),
+                memory_session_id: record.session_id.clone(),
+            });
+        } else if assignments.len() > 1 {
+            let newest_at = exact_band
+                .iter()
+                .map(|(record, _)| record.confirmed_at.as_str())
+                .max()
+                .unwrap_or_default();
+            let newest = exact_band
+                .iter()
+                .filter(|(record, _)| record.confirmed_at == newest_at)
+                .collect::<Vec<_>>();
+            let newest_assignments = newest
+                .iter()
+                .map(|(record, _)| assignment_key(record))
+                .collect::<HashSet<_>>();
+            if newest_assignments.len() == 1 {
+                let record = newest[0].0;
+                let winner_key = assignment_key(record);
+                return Some(MemoryDecision {
+                    category: record.category.clone(),
+                    project_id: record.project_id.clone(),
+                    task_id: record.task_id.clone(),
+                    confidence: 0.95,
+                    matched_label: strongest_label(query, &record.features),
+                    support: exact_band
+                        .iter()
+                        .filter(|(candidate, _)| assignment_key(candidate) == winner_key)
+                        .count(),
+                    memory_session_id: record.session_id.clone(),
+                });
+            }
+        }
+    }
+
+    // A manual correction is authoritative for the same strong context. AI
+    // results may reinforce that assignment, but cannot outvote it by volume.
+    let manual_assignments = candidates
+        .iter()
+        .filter(|(record, similarity)| {
+            record.user_confirmed && similarity.strong && similarity.score >= 0.60
+        })
+        .map(|(record, _)| assignment_key(record))
+        .collect::<HashSet<_>>();
+    if !manual_assignments.is_empty() {
+        candidates.retain(|(record, _)| {
+            record.user_confirmed || manual_assignments.contains(&assignment_key(record))
+        });
+    }
 
     #[derive(Default)]
     struct Vote<'a> {
@@ -222,22 +328,20 @@ pub fn choose_assignment(
         best: f32,
         strong: bool,
         support: usize,
+        manual_support: usize,
         record: Option<&'a MemoryRecord>,
     }
     let mut votes: HashMap<String, Vote<'_>> = HashMap::new();
     for (rank, (record, similarity)) in candidates.iter().enumerate() {
         let key = assignment_key(record);
         let vote = votes.entry(key).or_default();
-        let decay = match rank {
-            0 => 1.0,
-            1 => 0.55,
-            2 => 0.38,
-            _ => 0.24,
-        };
-        vote.total += similarity.score * decay;
+        let freshness = 0.985_f32.powi(rank as i32);
+        let trust = if record.user_confirmed { 1.0 } else { 0.45 };
+        vote.total += similarity.score.powi(2) * freshness * trust;
         vote.best = vote.best.max(similarity.score);
         vote.strong |= similarity.strong;
         vote.support += 1;
+        vote.manual_support += usize::from(record.user_confirmed);
         if vote.record.is_none() {
             vote.record = Some(record);
         }
@@ -251,26 +355,55 @@ pub fn choose_assignment(
     });
     let winner = ranked.first()?;
     let runner_up = ranked.get(1);
+    let vote_total = ranked.iter().map(|vote| vote.total).sum::<f32>();
+    let consensus = if vote_total > 0.0 {
+        winner.total / vote_total
+    } else {
+        0.0
+    };
     let margin = runner_up
         .map(|runner| winner.total - runner.total)
         .unwrap_or(winner.total);
-    let conflicting_exact = runner_up
-        .is_some_and(|runner| winner.strong && runner.strong && runner.best >= winner.best - 0.04);
-    if conflicting_exact || winner.best < 0.60 {
+    if winner.best < 0.60 {
         return None;
     }
-    let confidence = if winner.support >= 2 && winner.best >= 0.72 && margin >= 0.18 {
-        0.95
-    } else if winner.best >= 0.86 && margin >= 0.12 {
+    let record = winner.record?;
+    let winner_key = assignment_key(record);
+    let recent_streak = candidates
+        .iter()
+        .take_while(|(candidate, similarity)| {
+            similarity.score >= winner.best - 0.04 && assignment_key(candidate) == winner_key
+        })
+        .count();
+    let mut confidence: f32 = if consensus >= 0.92
+        && winner.support >= 2
+        && winner.best >= 0.72
+        && (runner_up.is_none() || recent_streak >= 2)
+    {
+        0.97
+    } else if consensus >= 0.80 && winner.support >= 3 && winner.best >= 0.72 && recent_streak >= 2
+    {
+        0.94
+    } else if runner_up.is_none() && winner.best >= 0.68 {
         0.93
-    } else if winner.strong && winner.best >= 0.62 && margin >= 0.14 {
+    } else if runner_up.is_none() && winner.strong && winner.best >= 0.62 {
+        0.90
+    } else if winner.manual_support >= 2 && recent_streak >= 2 && consensus >= 0.68 && winner.strong
+    {
+        0.91
+    } else if consensus >= 0.80 && winner.support >= 3 && winner.best >= 0.72 {
+        0.89
+    } else if winner.best >= 0.86 && consensus >= 0.66 && margin >= 0.12 {
         0.88
-    } else if winner.best >= 0.74 && margin >= 0.20 {
-        0.86
     } else {
         return None;
     };
-    let record = winner.record?;
+    if winner.manual_support == 0 {
+        if winner.support < 2 {
+            return None;
+        }
+        confidence = confidence.min(if winner.support >= 3 { 0.92 } else { 0.86 });
+    }
     Some(MemoryDecision {
         category: record.category.clone(),
         project_id: record.project_id.clone(),
@@ -278,6 +411,7 @@ pub fn choose_assignment(
         confidence,
         matched_label: strongest_label(query, &record.features),
         support: winner.support,
+        memory_session_id: record.session_id.clone(),
     })
 }
 
@@ -362,11 +496,7 @@ pub fn canonical_context(value: &str) -> String {
 }
 
 pub fn clear_legacy_process_file(features: &mut ContextFeatures) -> bool {
-    let file_name = features
-        .file
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
+    let file_name = features.file.rsplit(['/', '\\']).next().unwrap_or_default();
     let Some(stem) = file_name
         .to_lowercase()
         .strip_suffix(".exe")
@@ -633,6 +763,7 @@ mod tests {
             task_id: task.into(),
             task_title: task.into(),
             confirmed_at: "2026-07-15T10:00:00Z".into(),
+            user_confirmed: true,
         }
     }
 
@@ -649,6 +780,23 @@ mod tests {
     }
 
     #[test]
+    fn exact_manual_context_beats_many_merely_similar_memories() {
+        let query = features_from_event(&event("ChatGPT.exe", "IOT week1"));
+        let mut records = vec![record("exact", "QQ.exe", "IOT week1", "IOT")];
+        for index in 0..20 {
+            records.push(record(
+                &format!("similar-{index}"),
+                "ChatGPT.exe",
+                &format!("IOT week{}", index + 2),
+                "其他任务",
+            ));
+        }
+        let decision = choose_assignment(&query, &records).expect("exact manual context wins");
+        assert_eq!(decision.task_id, "IOT");
+        assert_eq!(decision.confidence, 0.96);
+    }
+
+    #[test]
     fn generic_application_title_never_becomes_a_task_memory() {
         let query = features_from_event(&event("ChatGPT.exe", "ChatGPT"));
         assert!(!is_discriminative(&query));
@@ -657,6 +805,14 @@ mod tests {
             &[record("one", "ChatGPT.exe", "ChatGPT", "ScreenUse")]
         )
         .is_none());
+    }
+
+    #[test]
+    fn batch_memory_requires_the_observed_context_to_describe_the_assignment() {
+        let related = features_from_event(&event("chrome.exe", "IOT week1"));
+        let incidental = features_from_event(&event("screenuse.exe", "ScreenUse开发"));
+        assert!(relates_to_assignment(&related, "IOT", "会议"));
+        assert!(!relates_to_assignment(&incidental, "IOT", "会议"));
     }
 
     #[test]
@@ -670,6 +826,66 @@ mod tests {
             ],
         )
         .is_none());
+    }
+
+    #[test]
+    fn repeated_corrections_outvote_an_old_exact_outlier() {
+        let query = features_from_event(&event("WeMeetApp.exe", "申书豪预定的会议"));
+        let mut records = vec![record(
+            "old-outlier",
+            "WeMeetApp.exe",
+            "申书豪预定的会议",
+            "校内实习",
+        )];
+        for index in 0..6 {
+            let mut value = record(
+                &format!("iot-{index}"),
+                "WeMeetApp.exe",
+                "申书豪预定的会议",
+                "IOT",
+            );
+            value.confirmed_at = format!("2026-07-15T10:00:{:02}Z", index + 1);
+            records.push(value);
+        }
+        let decision = choose_assignment(&query, &records).expect("consensus should win");
+        assert_eq!(decision.task_id, "IOT");
+        assert!(decision.confidence >= 0.94);
+        assert_eq!(decision.support, 6);
+    }
+
+    #[test]
+    fn latest_exact_manual_correction_changes_future_classification() {
+        let query = features_from_event(&event("ChatGPT.exe", "ScreenUse开发"));
+        let mut old = record("old", "ChatGPT.exe", "ScreenUse开发", "旧任务");
+        old.confirmed_at = "2026-07-15T10:00:00Z".into();
+        let mut newest = record("new", "ChatGPT.exe", "ScreenUse开发", "新任务");
+        newest.confirmed_at = "2026-07-16T10:00:00Z".into();
+        let decision = choose_assignment(&query, &[old, newest]).expect("latest correction wins");
+        assert_eq!(decision.task_id, "新任务");
+        assert_eq!(decision.confidence, 0.95);
+    }
+
+    #[test]
+    fn ai_examples_cannot_outvote_a_manual_exact_context() {
+        let query = features_from_event(&event("QQ.exe", "IOT week1"));
+        let manual = record("manual", "QQ.exe", "IOT week1", "讨论");
+        let mut records = vec![manual];
+        for index in 0..12 {
+            let mut ai = record(&format!("ai-{index}"), "QQ.exe", "IOT week1", "日常杂务");
+            ai.user_confirmed = false;
+            records.push(ai);
+        }
+        let decision = choose_assignment(&query, &records).expect("manual memory should win");
+        assert_eq!(decision.task_id, "讨论");
+        assert_eq!(decision.support, 1);
+    }
+
+    #[test]
+    fn one_ai_result_is_prompt_context_not_a_permanent_local_rule() {
+        let mut ai = record("ai", "QQ.exe", "在线状态 小组群", "浪费");
+        ai.user_confirmed = false;
+        assert!(choose_assignment(&features_from_event(&event("QQ.exe", "在线状态 小组群")), &[ai])
+            .is_none());
     }
 
     #[test]

@@ -8,6 +8,7 @@ struct Assignment {
     task_id: Option<String>,
     category: String,
     confidence: f32,
+    specificity: i32,
 }
 
 pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkSession>> {
@@ -22,19 +23,18 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     }
 
     let contextual_assignment = resolve_project_task(db, event, &session.category)?;
+    let recent_assignment = recent_task_assignment(db, &session)?;
+    let assignment = strongest_assignment(contextual_assignment, recent_assignment);
     let is_complete =
         session.confidence >= 0.84 && session.project_id.is_some() && session.task_id.is_some();
-    let page_context_is_stronger = contextual_assignment.as_ref().is_some_and(|assignment| {
-        assignment.confidence >= 0.92 && assignment.confidence > session.confidence + 0.01
+    let external_context_is_stronger = assignment.as_ref().is_some_and(|assignment| {
+        (assignment.specificity >= 100 && assignment.task_id.is_some())
+            || assignment.confidence > session.confidence + 0.01
     });
-    if is_complete && !page_context_is_stronger {
+    if is_complete && !external_context_is_stronger {
         return Ok(Some(session));
     }
 
-    let assignment = match contextual_assignment {
-        Some(assignment) => Some(assignment),
-        None => recent_task_assignment(db, &session)?,
-    };
     let Some(assignment) = assignment else {
         return Ok(Some(session));
     };
@@ -84,7 +84,8 @@ fn recent_task_assignment(db: &AppDb, session: &WorkSession) -> Result<Option<As
         project_id,
         task_id: Some(task_id),
         category: context.category,
-        confidence: if context.user_confirmed { 0.92 } else { 0.90 },
+        confidence: if context.user_confirmed { 0.94 } else { 0.91 },
+        specificity: 10,
     }))
 }
 
@@ -130,9 +131,14 @@ pub fn finalize_context(
     let mut task_id = session.task_id.clone();
     let mut confidence = session.confidence.max(local_confidence);
 
-    if let Some(assignment) = resolve_project_task(db, event, &category)? {
+    let contextual_assignment = resolve_project_task(db, event, &category)?;
+    let recent_assignment = recent_task_assignment(db, &session)?;
+    if let Some(assignment) = strongest_assignment(contextual_assignment, recent_assignment) {
         let current_is_complete = project_id.is_some() && task_id.is_some() && confidence >= 0.84;
-        if !current_is_complete || assignment.confidence > confidence + 0.01 {
+        if !current_is_complete
+            || (assignment.specificity >= 100 && assignment.task_id.is_some())
+            || assignment.confidence > confidence + 0.01
+        {
             project_id = Some(assignment.project_id);
             task_id = assignment.task_id;
             category = assignment.category;
@@ -159,6 +165,18 @@ pub fn finalize_context(
     db.coalesce_session_neighbors(&updated.id).map(Some)
 }
 
+fn strongest_assignment(left: Option<Assignment>, right: Option<Assignment>) -> Option<Assignment> {
+    match (left, right) {
+        (Some(left), Some(right))
+            if (right.specificity, right.confidence) > (left.specificity, left.confidence) =>
+        {
+            Some(right)
+        }
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    }
+}
+
 fn resolve_project_task(
     db: &AppDb,
     event: &RawActivityEvent,
@@ -170,7 +188,9 @@ fn resolve_project_task(
     let projects = db.list_projects()?;
     let tasks = db.list_tasks()?;
     let hay = event_hay(event);
-    let page = event_current_page_title(event).map(normalize);
+    let page = event_current_page_title(event)
+        .or(event.window_title.as_deref())
+        .map(normalize);
     let workspace = event.workspace.as_deref().and_then(path_label);
 
     let mut best: Option<(&Project, i32)> = None;
@@ -229,6 +249,7 @@ fn resolve_project_task(
         task_id,
         category: assigned_category,
         confidence,
+        specificity: project_score,
     }))
 }
 
@@ -452,9 +473,28 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
         return ("开发", 0.88);
     }
     if [
-        "wechat", "weixin", "qq.exe", "teams", "slack", "discord", "telegram", "feishu", "lark",
-        "zoom", "dingtalk", "wecom", "wxwork", "wemeet", "voovmeeting", "webex",
-        "outlook", "olk.exe", "thunderbird", "foxmail", "tim.exe", "messenger",
+        "wechat",
+        "weixin",
+        "qq.exe",
+        "teams",
+        "slack",
+        "discord",
+        "telegram",
+        "feishu",
+        "lark",
+        "zoom",
+        "dingtalk",
+        "wecom",
+        "wxwork",
+        "wemeet",
+        "voovmeeting",
+        "webex",
+        "outlook",
+        "olk.exe",
+        "thunderbird",
+        "foxmail",
+        "tim.exe",
+        "messenger",
     ]
     .iter()
     .any(|needle| app.contains(needle))
@@ -462,21 +502,29 @@ fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (
         return ("沟通", 0.88);
     }
     if [
-        "winword", "wps", "et.exe", "wpp", "excel", "obsidian", "typora", "notion",
-        "powerpnt", "onenote", "logseq", "joplin", "zettlr", "soffice", "swriter",
-        "scalc", "simpress",
+        "winword", "wps", "et.exe", "wpp", "excel", "obsidian", "typora", "notion", "powerpnt",
+        "onenote", "logseq", "joplin", "zettlr", "soffice", "swriter", "scalc", "simpress",
     ]
-        .iter()
-        .any(|needle| app.contains(needle))
+    .iter()
+    .any(|needle| app.contains(needle))
     {
         return ("写作", 0.84);
     }
     if [
-        "steam", "epicgames", "battle.net", "spotify", "music", "bilibili", "iqiyi",
-        "youku", "vlc", "potplayer", "mpv",
+        "steam",
+        "epicgames",
+        "battle.net",
+        "spotify",
+        "music",
+        "bilibili",
+        "iqiyi",
+        "youku",
+        "vlc",
+        "potplayer",
+        "mpv",
     ]
-        .iter()
-        .any(|needle| app.contains(needle))
+    .iter()
+    .any(|needle| app.contains(needle))
         || app.contains("-win64-shipping")
         || app == "game.exe"
     {
@@ -691,9 +739,9 @@ pub(crate) fn active_context_type(metadata: &serde_json::Value) -> Option<&str> 
                 Some("document-window-title" | "selected-document-tab" | "wps-visible-window") => {
                     Some("document")
                 }
-                Some("explorer-address-bar" | "explorer-selected-tab" | "explorer-window-title") => {
-                    Some("folder")
-                }
+                Some(
+                    "explorer-address-bar" | "explorer-selected-tab" | "explorer-window-title",
+                ) => Some("folder"),
                 Some("vscode-extension") => Some("editor"),
                 _ => None,
             }
@@ -730,8 +778,8 @@ fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
         })
         .or_else(|| {
             (active_context_type(&event.metadata) == Some("conversation"))
-            .then(|| event_current_page_title(event))
-            .flatten()
+                .then(|| event_current_page_title(event))
+                .flatten()
         })
 }
 

@@ -4709,7 +4709,21 @@ function SettingsView({
                 <option value="openai-compatible">OpenAI-compatible API</option>
               </select>
             </Field>
-            <Field label="最低会话时长" hint="设为 0 分钟时，所有尚未人工确认的会话都进入复核。">
+            <Field label="复核范围" hint="推荐仅兜底：本地已高置信度归类及无有效线索的空壳窗口不会调用 AI。">
+              <select
+                value={settings.aiReviewScope}
+                onChange={(event) => update('aiReviewScope', event.target.value)}
+              >
+                <option value="fallback">仅复核本地不确定项</option>
+                <option value="all">复核全部时间段</option>
+              </select>
+            </Field>
+            <Field
+              label="最低会话时长"
+              hint={settings.aiReviewScope === 'all'
+                ? '设为 0 分钟时，全部尚未人工确认的会话都会复核。'
+                : '设为 0 分钟时，所有有可判断页面线索的本地不确定项都会进入兜底复核。'}
+            >
               <NumberInput
                 value={settings.minAiSessionMinutes}
                 min={0}

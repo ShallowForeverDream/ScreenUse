@@ -31,6 +31,7 @@ export const fallbackDashboard: DashboardData = {
     quickPauseEnabled: true,
     aiMode: 'off',
     aiProvider: 'codex-account',
+    aiReviewScope: 'fallback',
     minAiSessionMinutes: 1,
     codexPlan: 'pro-20x',
     aiBaseUrl: 'https://api.openai.com/v1',

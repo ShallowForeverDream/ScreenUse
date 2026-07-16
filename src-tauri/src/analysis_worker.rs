@@ -5,7 +5,8 @@ use crate::ai::{
 use crate::classification;
 use crate::db::{now, AppDb};
 use crate::models::{
-    AiUsage, AnalysisJob, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange, WorkSession,
+    AiUsage, AnalysisJob, AppSettings, EvidenceItem, RawActivityEvent, SessionPatch, TimeRange,
+    WorkSession,
 };
 use crate::secrets;
 use anyhow::{anyhow, Context, Result};
@@ -51,12 +52,11 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
         return Err(anyhow!("请先填写 AI 模型名"));
     }
 
-    let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
     let queued = db.analysis_job_session_ids()?;
     let candidates = db
         .list_sessions(2000)?
         .into_iter()
-        .filter(|session| is_review_candidate(session, minimum_seconds, &queued))
+        .filter(|session| is_review_candidate(session, &settings, &queued))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(false);
@@ -166,7 +166,7 @@ fn ensure_auto_review_enabled(db: &AppDb) -> Result<()> {
 async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
     let settings = db.get_settings()?.normalized();
     let mut targets = load_job_targets(db, &job)?;
-    targets.retain(|session| !session.user_confirmed && session.source != "ai-review");
+    targets.retain(|session| is_review_target(session, &settings));
     if targets.is_empty() {
         db.mark_analysis_job_status(
             &job.id,
@@ -490,18 +490,26 @@ fn deduplicate_evidence(evidence: &mut Vec<EvidenceItem>) {
 
 fn is_review_candidate(
     session: &WorkSession,
-    minimum_seconds: i64,
+    settings: &AppSettings,
     queued: &HashSet<String>,
 ) -> bool {
+    is_review_target(session, settings) && !queued.contains(&session.id)
+}
+
+fn is_review_target(session: &WorkSession, settings: &AppSettings) -> bool {
+    let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
+    let has_reviewable_context = crate::memory::is_discriminative(
+        &crate::memory::features_from_session_evidence(session),
+    );
     !session.user_confirmed
         && session.category != "离开"
         && !matches!(session.source.as_str(), "collector-idle" | "ai-review")
-        && (minimum_seconds == 0 || session.source != "collector-rule")
-        && (minimum_seconds == 0
-            || session.task_id.is_none()
-            || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)
+        && (settings.ai_review_scope == "all"
+            || (has_reviewable_context
+                && (session.task_id.is_none()
+                    || session.project_id.is_none()
+                    || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)))
         && duration_seconds(&session.started_at, &session.ended_at) >= minimum_seconds
-        && !queued.contains(&session.id)
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>> {
@@ -536,7 +544,12 @@ mod tests {
             category: "杂务".into(),
             summary: "待复核".into(),
             confidence: 0.55,
-            evidence: vec![],
+            evidence: vec![EvidenceItem {
+                kind: "page".into(),
+                label: "当前页面".into(),
+                value: "待识别页面".into(),
+                weight: 0.8,
+            }],
             user_confirmed: false,
             source: "context-complete".into(),
         }
@@ -568,52 +581,94 @@ mod tests {
         }
     }
 
+    fn review_settings(minimum_minutes: u32, scope: &str) -> AppSettings {
+        AppSettings {
+            min_ai_session_minutes: minimum_minutes,
+            ai_review_scope: scope.into(),
+            ..AppSettings::default()
+        }
+        .normalized()
+    }
+
     #[test]
     fn one_minute_is_the_minimum_ai_review_duration() {
         let queued = HashSet::new();
-        assert!(!is_review_candidate(&session(59), 60, &queued));
-        assert!(is_review_candidate(&session(60), 60, &queued));
+        let settings = review_settings(1, "fallback");
+        assert!(!is_review_candidate(&session(59), &settings, &queued));
+        assert!(is_review_candidate(&session(60), &settings, &queued));
     }
 
     #[test]
     fn a_high_confidence_session_without_a_task_still_needs_ai_review() {
         let queued = HashSet::new();
+        let settings = review_settings(1, "fallback");
         let mut value = session(60);
         value.confidence = 0.96;
-        assert!(is_review_candidate(&value, 60, &queued));
+        assert!(is_review_candidate(&value, &settings, &queued));
 
         value.project_id = Some("project".into());
         value.task_id = Some("task".into());
-        assert!(!is_review_candidate(&value, 60, &queued));
+        assert!(!is_review_candidate(&value, &settings, &queued));
     }
 
     #[test]
     fn zero_minutes_reviews_every_unconfirmed_eligible_session() {
         let queued = HashSet::new();
+        let settings = review_settings(0, "all");
         let mut value = session(5);
         value.confidence = 0.99;
         value.project_id = Some("project".into());
         value.task_id = Some("task".into());
-        assert!(is_review_candidate(&value, 0, &queued));
+        assert!(is_review_candidate(&value, &settings, &queued));
 
         value.source = "collector-rule".into();
-        assert!(is_review_candidate(&value, 0, &queued));
+        assert!(is_review_candidate(&value, &settings, &queued));
 
         value.user_confirmed = true;
-        assert!(!is_review_candidate(&value, 0, &queued));
+        assert!(!is_review_candidate(&value, &settings, &queued));
+    }
+
+    #[test]
+    fn zero_minutes_in_fallback_scope_skips_reliable_local_results() {
+        let queued = HashSet::new();
+        let settings = review_settings(0, "fallback");
+        let mut value = session(5);
+        value.confidence = 0.97;
+        value.project_id = Some("project".into());
+        value.task_id = Some("task".into());
+        assert!(!is_review_candidate(&value, &settings, &queued));
+        value.confidence = 0.79;
+        assert!(is_review_candidate(&value, &settings, &queued));
+    }
+
+    #[test]
+    fn fallback_scope_does_not_spend_ai_on_generic_shell_surfaces() {
+        let queued = HashSet::new();
+        let settings = review_settings(0, "fallback");
+        for title in ["ChatGPT", "Program Manager", "release"] {
+            let mut value = session(120);
+            value.evidence = vec![EvidenceItem {
+                kind: "window".into(),
+                label: "窗口".into(),
+                value: title.into(),
+                weight: 0.8,
+            }];
+            assert!(!is_review_candidate(&value, &settings, &queued));
+        }
     }
 
     #[test]
     fn confirmed_idle_and_already_reviewed_sessions_are_not_candidates() {
         let queued = HashSet::new();
+        let settings = review_settings(1, "fallback");
         let mut value = session(60);
         value.user_confirmed = true;
-        assert!(!is_review_candidate(&value, 60, &queued));
+        assert!(!is_review_candidate(&value, &settings, &queued));
         value.user_confirmed = false;
         value.source = "ai-review".into();
-        assert!(!is_review_candidate(&value, 60, &queued));
+        assert!(!is_review_candidate(&value, &settings, &queued));
         value.source = "collector-idle".into();
-        assert!(!is_review_candidate(&value, 60, &queued));
+        assert!(!is_review_candidate(&value, &settings, &queued));
     }
 
     #[tokio::test]

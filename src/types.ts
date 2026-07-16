@@ -127,6 +127,7 @@ export interface AppSettings {
   quickPauseEnabled: boolean;
   aiMode: AiMode;
   aiProvider: 'codex-account' | 'openai-compatible' | string;
+  aiReviewScope: 'fallback' | 'all' | string;
   minAiSessionMinutes: number;
   codexPlan: 'plus' | 'pro-5x' | 'pro-20x' | string;
   aiBaseUrl: string;
