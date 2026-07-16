@@ -242,7 +242,7 @@ pub fn features_from_session_evidence(session: &WorkSession) -> ContextFeatures 
 }
 
 pub fn is_discriminative(features: &ContextFeatures) -> bool {
-    !features.page.is_empty()
+    (!features.page.is_empty() && !is_generic(&features.page))
         || !features.domain.is_empty()
         || !features.workspace.is_empty()
         || !features.file.is_empty()
@@ -1409,6 +1409,24 @@ mod tests {
         let query = features_from_event(&self_titled);
         assert_eq!(query.app, query.window);
         assert!(!is_discriminative(&query));
+    }
+
+    #[test]
+    fn generic_shell_pages_are_not_discriminative_ai_evidence() {
+        for page in ["ChatGPT", "系统托盘溢出窗口。", "正在读取本地时间账本…"] {
+            let features = build_features("explorer.exe", page, page, "", "", "");
+            assert!(!is_discriminative(&features), "generic page: {page}");
+        }
+
+        let semantic = build_features(
+            "ChatGPT.exe",
+            "codex_work_bridge",
+            "ChatGPT",
+            "",
+            "HDU",
+            "",
+        );
+        assert!(is_discriminative(&semantic));
     }
 
     #[test]
