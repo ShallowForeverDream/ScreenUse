@@ -1070,6 +1070,9 @@ fn active_page_context(
         }
     }
     if is_chat_client_app(app) {
+        if let Some(context) = chat_header_context(window, app).ok().flatten() {
+            return Some(context);
+        }
         if let Some(context) = selected_page_context(window, app).ok().flatten() {
             return Some(context);
         }
@@ -1166,14 +1169,22 @@ fn is_chat_client_app(app: &str) -> bool {
             | "weixin"
             | "wechat"
             | "wechatappex"
+            | "wechatbrowser"
             | "dingtalk"
             | "dingtalklauncher"
+            | "dingtalkapp"
             | "feishu"
+            | "feishuapp"
             | "lark"
+            | "larkapp"
             | "wxwork"
+            | "wxworkweb"
             | "wecom"
+            | "wecomweb"
+            | "wework"
             | "teams"
             | "ms-teams"
+            | "msteams"
             | "slack"
             | "discord"
             | "telegram"
@@ -1184,6 +1195,9 @@ fn is_chat_client_app(app: &str) -> bool {
             | "skype"
             | "tim"
             | "messenger"
+            | "mattermost"
+            | "element"
+            | "viber"
     )
 }
 
@@ -1550,7 +1564,22 @@ fn qq_active_conversation_context(
 
 #[cfg(windows)]
 fn clean_qq_conversation_title(value: &str) -> Option<String> {
-    let title = clean_page_label(value, "QQ.exe")?;
+    let mut title = value.trim();
+    for prefix in [
+        "在线状态 ",
+        "离线状态 ",
+        "手机在线 ",
+        "忙碌状态 ",
+        "Online status ",
+        "Offline status ",
+        "Mobile online ",
+    ] {
+        if let Some(stripped) = title.strip_prefix(prefix) {
+            title = stripped.trim();
+            break;
+        }
+    }
+    let title = clean_chat_header_title(title, "QQ.exe")?;
     let normalized = title.to_lowercase();
     if [
         "语音通话",
@@ -1570,6 +1599,159 @@ fn clean_qq_conversation_title(value: &str) -> Option<String> {
     } else {
         Some(title)
     }
+}
+
+#[cfg(windows)]
+fn chat_header_context(
+    window: windows::Win32::Foundation::HWND,
+    app: &str,
+) -> Result<Option<ActivePageContext>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_EditControlTypeId, UIA_TextControlTypeId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let mut best: Option<(i32, String)> = None;
+            let text_condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_TextControlTypeId.0),
+            )?;
+            let edit_condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_EditControlTypeId.0),
+            )?;
+            let condition = automation.CreateOrCondition(&text_condition, &edit_condition)?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition)?;
+            for index in 0..elements.Length()? {
+                let Ok(element) = elements.GetElement(index) else {
+                    continue;
+                };
+                if !matches!(element.CurrentIsOffscreen(), Ok(value) if !value.as_bool()) {
+                    continue;
+                }
+                let is_edit = element.CurrentControlType().ok() == Some(UIA_EditControlTypeId);
+                let automation_id = element
+                    .CurrentAutomationId()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let class_name = element
+                    .CurrentClassName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let Some(mut score) =
+                    chat_header_identity_score(&automation_id, &class_name, is_edit)
+                else {
+                    continue;
+                };
+                let name = element
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let Some(title) = clean_chat_header_title(&name, app) else {
+                    continue;
+                };
+                score += title.chars().count().min(30) as i32;
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_score, _)| score > *best_score)
+                {
+                    best = Some((score, title));
+                }
+            }
+            Ok(best.map(|(_, title)| ActivePageContext {
+                title,
+                workspace: None,
+                source: if is_qq_app(app) {
+                    "qq-conversation-header"
+                } else {
+                    "chat-conversation-header"
+                },
+                kind: "conversation",
+            }))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn chat_header_identity_score(automation_id: &str, class_name: &str, is_edit: bool) -> Option<i32> {
+    let identity = format!("{automation_id} {class_name}").to_lowercase();
+    if [
+        "current_chat_name",
+        "currentchatname",
+        "conversation_title",
+        "conversationtitle",
+        "chat_title",
+        "chattitle",
+        "session_title",
+        "sessiontitle",
+        "chat_name_label",
+        "chatnamelabel",
+        "channel_title",
+        "channeltitle",
+    ]
+    .iter()
+    .any(|marker| identity.contains(marker))
+    {
+        return Some(if is_edit { 260 } else { 320 });
+    }
+    if [
+        "chatheader",
+        "chat_header",
+        "conversationheader",
+        "conversation_header",
+        "sessionheader",
+        "session_header",
+        "channelheader",
+        "channel_header",
+    ]
+    .iter()
+    .any(|marker| identity.contains(marker))
+    {
+        return Some(if is_edit { 220 } else { 280 });
+    }
+    if is_edit && identity.contains("chat_input_field") {
+        return Some(180);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn clean_chat_header_title(value: &str, app: &str) -> Option<String> {
+    let line = value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut title = clean_page_label(line, app)?;
+    for (open, close) in [('(', ')'), ('（', '）')] {
+        if title.ends_with(close) {
+            if let Some(index) = title.rfind(open) {
+                let count = title[index + open.len_utf8()..title.len() - close.len_utf8()].trim();
+                if !count.is_empty()
+                    && count.chars().count() <= 6
+                    && count.chars().all(|character| character.is_ascii_digit())
+                {
+                    title.truncate(index);
+                    title = title.trim().to_string();
+                }
+            }
+        }
+    }
+    clean_page_label(&title, app)
 }
 
 #[cfg(windows)]
@@ -1892,12 +2074,24 @@ fn selected_item_page_title(name: &str, automation_id: &str, app: &str) -> Optio
     for marker in ["session_item_", "conversation_item_", "chat_item_"] {
         if let Some(index) = normalized_id.find(marker) {
             let value = &automation_id[index + marker.len()..];
-            if let Some(title) = clean_page_label(value, app) {
+            if let Some(title) = clean_selected_chat_label(value, app) {
                 return Some(title);
             }
         }
     }
-    name.lines().find_map(|line| clean_page_label(line, app))
+    name.lines()
+        .find_map(|line| clean_selected_chat_label(line, app))
+}
+
+#[cfg(windows)]
+fn clean_selected_chat_label(value: &str, app: &str) -> Option<String> {
+    if is_qq_app(app) {
+        clean_qq_conversation_title(value)
+    } else if is_chat_client_app(app) {
+        clean_chat_header_title(value, app)
+    } else {
+        clean_page_label(value, app)
+    }
 }
 
 #[cfg(windows)]
@@ -2852,9 +3046,14 @@ mod tests {
             "QQ.exe",
             "Weixin.exe",
             "DingTalk.exe",
+            "DingTalkApp.exe",
             "Feishu.exe",
+            "FeishuApp.exe",
             "wxwork.exe",
+            "WXWorkWeb.exe",
+            "WeCom.exe",
             "ms-teams.exe",
+            "msteams.exe",
             "Slack.exe",
             "Discord.exe",
             "Telegram.exe",
@@ -3027,6 +3226,14 @@ mod tests {
             Some("微信ClawBot".into())
         );
         assert_eq!(
+            selected_item_page_title(
+                "AI众测-cncert团队白帽子1群(498)\n最新消息",
+                "session_item_AI众测-cncert团队白帽子1群(498)",
+                "Weixin.exe",
+            ),
+            Some("AI众测-cncert团队白帽子1群".into())
+        );
+        assert_eq!(
             selected_item_page_title("ICPC 讨论群\n今晚训练", "", "QQ.exe"),
             Some("ICPC 讨论群".into())
         );
@@ -3043,9 +3250,38 @@ mod tests {
             clean_qq_conversation_title("张三"),
             Some("张三".into())
         );
+        assert_eq!(
+            clean_qq_conversation_title("在线状态 我crush了"),
+            Some("我crush了".into())
+        );
+        assert_eq!(
+            clean_qq_conversation_title("Mobile online Alice"),
+            Some("Alice".into())
+        );
         assert_eq!(clean_qq_conversation_title("QQ"), None);
         assert_eq!(clean_qq_conversation_title("语音通话"), None);
         assert_eq!(clean_qq_conversation_title("11:13"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chat_header_detection_accepts_only_semantic_current_conversation_controls() {
+        assert!(chat_header_identity_score(
+            "content_view.current_chat_name_label",
+            "mmui::XTextView",
+            false,
+        )
+        .is_some());
+        assert!(chat_header_identity_score("chat_input_field", "mmui::ChatInputField", true)
+            .is_some());
+        assert!(chat_header_identity_score("conversation_title", "TextBlock", false).is_some());
+        assert!(chat_header_identity_score("search_box", "Edit", true).is_none());
+        assert!(chat_header_identity_score("message_list", "List", false).is_none());
+        assert_eq!(
+            clean_chat_header_title("科研讨论群(123)", "Weixin.exe"),
+            Some("科研讨论群".into())
+        );
+        assert_eq!(clean_chat_header_title("微信", "Weixin.exe"), None);
     }
 
     #[cfg(windows)]

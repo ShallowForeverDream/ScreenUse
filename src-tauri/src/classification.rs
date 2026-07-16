@@ -1051,6 +1051,7 @@ pub(crate) fn active_context_type(metadata: &serde_json::Value) -> Option<&str> 
                 Some(
                     "chatgpt-conversation"
                     | "qq-conversation-header"
+                    | "chat-conversation-header"
                     | "chat-conversation-selection",
                 ) => Some("conversation"),
                 Some("document-window-title" | "selected-document-tab" | "wps-visible-window") => {
@@ -1316,6 +1317,10 @@ mod tests {
                 label,
             );
         }
+        assert_eq!(
+            active_context_type(&json!({"activePageSource": "chat-conversation-header"})),
+            Some("conversation"),
+        );
     }
 
     #[test]
