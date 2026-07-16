@@ -6595,14 +6595,22 @@ mod tests {
         let changed = db
             .propagate_context_from_sessions(&[anchor.id])
             .expect("propagate correction");
-        assert_eq!(changed, 2);
-        for id in [&first.id, &third.id] {
-            let repaired = db.get_session(id).expect("load repaired").expect("session");
-            assert_eq!(repaired.project_id.as_deref(), Some(project.id.as_str()));
-            assert_eq!(repaired.task_id.as_deref(), Some(task.id.as_str()));
-            assert_ne!(repaired.summary, "离开/空闲");
-            assert!(!repaired.user_confirmed);
-        }
+        assert_eq!(changed, 1);
+        let idle_before = db
+            .get_session(&first.id)
+            .expect("load idle boundary")
+            .expect("idle boundary");
+        assert_eq!(idle_before.source, "collector-idle");
+        assert_eq!(idle_before.summary, "离开/空闲");
+        assert!(idle_before.task_id.is_none());
+
+        let repaired = db
+            .get_session(&third.id)
+            .expect("load repaired")
+            .expect("session");
+        assert_eq!(repaired.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(repaired.task_id.as_deref(), Some(task.id.as_str()));
+        assert!(!repaired.user_confirmed);
         let untouched = db
             .get_session(&after_idle.id)
             .expect("load after idle")
