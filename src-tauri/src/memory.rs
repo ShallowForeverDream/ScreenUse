@@ -282,6 +282,83 @@ pub fn choose_assignment(
     }
     choose_similarity_assignment(query, records)
         .or_else(|| choose_manual_keyword_signature(query, records))
+        .or_else(|| choose_stable_app_assignment(query, records))
+}
+
+fn choose_stable_app_assignment(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    if query.app.is_empty() || is_contextual_application(&query.app) {
+        return None;
+    }
+    let matching = records
+        .iter()
+        .filter(|record| record.user_confirmed && record.features.app == query.app)
+        .collect::<Vec<_>>();
+    if matching.len() < 2 {
+        return None;
+    }
+    let assignments = matching
+        .iter()
+        .map(|record| assignment_key(record))
+        .collect::<HashSet<_>>();
+    if assignments.len() != 1 {
+        return None;
+    }
+    let record = matching
+        .iter()
+        .copied()
+        .max_by(|left, right| left.confirmed_at.cmp(&right.confirmed_at))?;
+    Some(MemoryDecision {
+        category: record.category.clone(),
+        project_id: record.project_id.clone(),
+        task_id: record.task_id.clone(),
+        confidence: if matching.len() >= 4 { 0.94 } else { 0.90 },
+        matched_label: format!("专用应用：{}", query.app),
+        support: matching.len(),
+        memory_session_id: record.session_id.clone(),
+    })
+}
+
+fn is_contextual_application(app: &str) -> bool {
+    matches!(
+        app,
+        "chatgpt"
+            | "codex"
+            | "chrome"
+            | "msedge"
+            | "firefox"
+            | "brave"
+            | "tabbit browser"
+            | "qq"
+            | "weixin"
+            | "wechat"
+            | "wps"
+            | "wpsoffice"
+            | "winword"
+            | "excel"
+            | "powerpnt"
+            | "explorer"
+            | "windowsterminal"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "conhost"
+            | "code"
+            | "cursor"
+            | "windsurf"
+            | "typora"
+            | "obsidian"
+            | "notepad"
+            | "wemeetapp"
+            | "zoom"
+            | "teams"
+            | "msteams"
+            | "dingtalk"
+            | "feishu"
+            | "snipaste"
+    )
 }
 
 fn choose_similarity_assignment(
@@ -533,16 +610,15 @@ fn choose_manual_keyword_signature(
     records: &[MemoryRecord],
 ) -> Option<MemoryDecision> {
     const MIN_TOKEN_SUPPORT: usize = 2;
-    const MIN_MATCHED_TOKENS: usize = 4;
-
-    if query.tokens.len() < MIN_MATCHED_TOKENS {
-        return None;
-    }
     let query_tokens = query
         .tokens
         .iter()
+        .filter(|token| is_signature_token(token))
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    if query_tokens.is_empty() {
+        return None;
+    }
 
     #[derive(Default)]
     struct TokenAssignment<'a> {
@@ -577,6 +653,7 @@ fn choose_manual_keyword_signature(
     #[derive(Default)]
     struct SignatureVote<'a> {
         tokens: Vec<String>,
+        max_token_support: usize,
         record: Option<&'a MemoryRecord>,
     }
 
@@ -591,6 +668,7 @@ fn choose_manual_keyword_signature(
         }
         let vote = votes.entry(assignment).or_default();
         vote.tokens.push(token);
+        vote.max_token_support = vote.max_token_support.max(stats.count);
         if let Some(record) = stats.latest {
             if vote
                 .record
@@ -608,9 +686,6 @@ fn choose_manual_keyword_signature(
         return None;
     }
     let (_, mut vote) = votes.into_iter().next()?;
-    if vote.tokens.len() < MIN_MATCHED_TOKENS {
-        return None;
-    }
     let record = vote.record?;
     let winner = assignment_key(record);
     let supporting_memories = records
@@ -625,6 +700,28 @@ fn choose_manual_keyword_signature(
         })
         .count();
     if supporting_memories < MIN_TOKEN_SUPPORT {
+        return None;
+    }
+
+    let longest_token = vote
+        .tokens
+        .iter()
+        .map(|token| token.chars().count())
+        .max()
+        .unwrap_or_default();
+    let has_semantic_page = !query.page.is_empty() || !query.domain.is_empty();
+    let enough_evidence = vote.tokens.len() >= 4
+        || (has_semantic_page
+            && ((vote.tokens.len() >= 3
+                && vote.max_token_support >= 3
+                && supporting_memories >= 3)
+                || (vote.tokens.len() >= 2
+                    && vote.max_token_support >= 4
+                    && supporting_memories >= 4)
+                || (longest_token >= 4
+                    && vote.max_token_support >= 6
+                    && supporting_memories >= 6)));
+    if !enough_evidence {
         return None;
     }
 
@@ -652,6 +749,44 @@ fn choose_manual_keyword_signature(
         support: supporting_memories,
         memory_session_id: record.session_id.clone(),
     })
+}
+
+fn is_signature_token(token: &str) -> bool {
+    !token.chars().all(|character| character.is_ascii_digit())
+        && !matches!(
+            token,
+            "会议"
+                | "文档"
+                | "开发"
+                | "学习"
+                | "任务"
+                | "项目"
+                | "工作"
+                | "使用"
+                | "查看"
+                | "处理"
+                | "聊天"
+                | "页面"
+                | "当前"
+                | "其他"
+                | "系统"
+                | "文件"
+                | "资料"
+                | "研究"
+                | "论文"
+                | "复核"
+                | "测试"
+                | "修复"
+                | "浏览"
+                | "分析"
+                | "时间"
+                | "活动"
+                | "微信"
+                | "qq"
+                | "chatgpt"
+                | "chrome"
+                | "wps"
+        )
 }
 
 pub fn retrieve_examples(
@@ -1156,6 +1291,51 @@ mod tests {
         assert_eq!(decision.task_id, "成果填报");
         assert!(decision.confidence >= 0.90);
         assert!(decision.matched_label.starts_with("个人关键词："));
+    }
+
+    #[test]
+    fn two_high_support_personal_keywords_can_replace_four_weak_words() {
+        let records = (1..=4)
+            .map(|index| {
+                record(
+                    &format!("network-{index}"),
+                    "Typora.exe",
+                    &format!("计网 刷题 T{index}"),
+                    "计算机网络刷题",
+                )
+            })
+            .collect::<Vec<_>>();
+        let query = features_from_event(&event("ChatGPT.exe", "计网 刷题 新题"));
+
+        let decision = choose_manual_keyword_signature(&query, &records)
+            .expect("two repeatedly confirmed personal terms should be enough");
+        assert_eq!(decision.task_id, "计算机网络刷题");
+        assert!(decision.support >= 4);
+    }
+
+    #[test]
+    fn a_dedicated_application_learns_only_after_consistent_manual_use() {
+        let records = vec![
+            record("one", "Atlas-Win64-Shipping.exe", "关卡一", "小小梦魇"),
+            record("two", "Atlas-Win64-Shipping.exe", "关卡二", "小小梦魇"),
+        ];
+        let query = features_from_event(&event("Atlas-Win64-Shipping.exe", "Enhanced Edition"));
+
+        let decision = choose_stable_app_assignment(&query, &records)
+            .expect("a dedicated executable should learn its stable task");
+        assert_eq!(decision.task_id, "小小梦魇");
+        assert_eq!(decision.support, 2);
+    }
+
+    #[test]
+    fn contextual_apps_never_become_permanent_task_anchors() {
+        let records = vec![
+            record("one", "ChatGPT.exe", "ScreenUse开发一", "ScreenUse"),
+            record("two", "ChatGPT.exe", "ScreenUse开发二", "ScreenUse"),
+        ];
+        let query = features_from_event(&event("ChatGPT.exe", "完全不同的新会话"));
+
+        assert!(choose_stable_app_assignment(&query, &records).is_none());
     }
 
     #[test]
