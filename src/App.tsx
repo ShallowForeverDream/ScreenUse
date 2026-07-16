@@ -637,6 +637,129 @@ function TextInputDialog({
   );
 }
 
+function SplitSessionDialog({
+  startedAt,
+  endedAt,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  startedAt: string;
+  endedAt: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (splitAt: Date) => void;
+}) {
+  const startedAtMs = new Date(startedAt).getTime();
+  const endedAtMs = new Date(endedAt).getTime();
+  const totalSeconds = Math.max(10, Math.floor((endedAtMs - startedAtMs) / 1_000));
+  const minOffsetSeconds = 5;
+  const maxOffsetSeconds = Math.max(minOffsetSeconds, totalSeconds - 5);
+  const [offsetSeconds, setOffsetSeconds] = useState(() => Math.min(
+    maxOffsetSeconds,
+    Math.max(minOffsetSeconds, Math.round(totalSeconds / 2)),
+  ));
+  const splitAtMs = startedAtMs + offsetSeconds * 1_000;
+  const splitAt = new Date(splitAtMs);
+  const splitPosition = Math.max(0, Math.min(100, (offsetSeconds / totalSeconds) * 100));
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || busy) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [busy, onCancel]);
+
+  const updateFromDateTime = (value: string) => {
+    const next = new Date(value).getTime();
+    if (!Number.isFinite(next)) return;
+    const nextOffset = Math.round((next - startedAtMs) / 1_000);
+    setOffsetSeconds(Math.min(maxOffsetSeconds, Math.max(minOffsetSeconds, nextOffset)));
+  };
+
+  return createPortal(
+    <div
+      className="confirm-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (!busy) onCancel();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="split-session-dialog-title"
+        aria-modal="true"
+        className="confirm-dialog split-session-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-dialog-icon rename"><SplitSquareHorizontal size={19} /></div>
+        <div>
+          <h2 id="split-session-dialog-title">拆分会话</h2>
+          <p>拖动分界点，前后两段至少各保留 5 秒。</p>
+        </div>
+
+        <div className="split-session-times" aria-label="拆分时间预览">
+          <span><small>开始</small><strong>{formatClock(startedAt)}</strong></span>
+          <span className="split-point"><small>分界</small><strong>{formatClock(splitAt.toISOString())}</strong></span>
+          <span><small>结束</small><strong>{formatClock(endedAt)}</strong></span>
+        </div>
+
+        <div className="split-session-slider">
+          <input
+            aria-label="拖动调整会话拆分时间"
+            aria-valuetext={`${formatClock(splitAt.toISOString())}，前段 ${formatPreciseDuration(offsetSeconds)}，后段 ${formatPreciseDuration(totalSeconds - offsetSeconds)}`}
+            disabled={busy}
+            max={maxOffsetSeconds}
+            min={minOffsetSeconds}
+            onChange={(event) => setOffsetSeconds(Number(event.target.value))}
+            step={1}
+            style={{ '--split-position': `${splitPosition}%` } as CSSProperties}
+            type="range"
+            value={offsetSeconds}
+          />
+          <div className="split-session-durations">
+            <span>前段 <strong>{formatPreciseDuration(offsetSeconds)}</strong></span>
+            <span>后段 <strong>{formatPreciseDuration(totalSeconds - offsetSeconds)}</strong></span>
+          </div>
+        </div>
+
+        <label className="split-session-exact">
+          <span>精确时间</span>
+          <input
+            aria-label="精确输入会话拆分时间"
+            disabled={busy}
+            max={toDateTimeLocalValue(new Date(endedAtMs - 5_000))}
+            min={toDateTimeLocalValue(new Date(startedAtMs + 5_000))}
+            onChange={(event) => updateFromDateTime(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !busy) {
+                event.preventDefault();
+                onConfirm(splitAt);
+              }
+            }}
+            step={1}
+            type="datetime-local"
+            value={toDateTimeLocalValue(splitAt)}
+          />
+        </label>
+
+        <div className="confirm-dialog-actions">
+          <button className="confirm-cancel" disabled={busy} onClick={onCancel} type="button">取消</button>
+          <button className="primary" disabled={busy} onClick={() => onConfirm(splitAt)} type="button">
+            {busy ? '拆分中…' : '确认拆分'}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [data, setData] = useState<DashboardData | null>(null);
@@ -5640,8 +5763,7 @@ function EditSessionModal({
     }
   };
 
-  const split = async (localValue: string) => {
-    const splitAt = new Date(localValue);
+  const split = async (splitAt: Date) => {
     if (Number.isNaN(splitAt.getTime())) return;
     setSplitBusy(true);
     try {
@@ -5873,28 +5995,14 @@ function EditSessionModal({
         />
       )}
       {splitDialogOpen && (
-        <TextInputDialog
+        <SplitSessionDialog
           busy={splitBusy}
-          confirmLabel="确认拆分"
-          detail="选择分界时间；拆分后的两段都至少保留 5 秒。"
-          initialValue={toDateTimeLocalValue(new Date(
-            (new Date(session.startedAt).getTime() + new Date(session.endedAt).getTime()) / 2,
-          ))}
-          inputLabel="会话拆分时间"
-          isValid={(value) => {
-            const timestamp = new Date(value).getTime();
-            return timestamp >= new Date(session.startedAt).getTime() + 5_000
-              && timestamp <= new Date(session.endedAt).getTime() - 5_000;
-          }}
-          max={toDateTimeLocalValue(new Date(new Date(session.endedAt).getTime() - 5_000))}
-          min={toDateTimeLocalValue(new Date(new Date(session.startedAt).getTime() + 5_000))}
+          endedAt={session.endedAt}
           onCancel={() => {
             if (!splitBusy) setSplitDialogOpen(false);
           }}
           onConfirm={(value) => void split(value)}
-          step={5}
-          title="拆分会话"
-          type="datetime-local"
+          startedAt={session.startedAt}
         />
       )}
     </div>
@@ -6243,6 +6351,18 @@ function formatDuration(minutes: number) {
     return minutePart ? `${hours} 小时 ${minutePart} 分钟` : `${hours} 小时`;
   }
   return secondPart ? `${minutePart} 分 ${secondPart} 秒` : `${minutePart} 分钟`;
+}
+
+function formatPreciseDuration(totalSeconds: number) {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const secondPart = seconds % 60;
+  const parts: string[] = [];
+  if (hours) parts.push(`${hours} 小时`);
+  if (minutes) parts.push(`${minutes} 分`);
+  if (secondPart || !parts.length) parts.push(`${secondPart} 秒`);
+  return parts.join(' ');
 }
 
 function formatCompactDuration(minutes: number) {
