@@ -5251,10 +5251,19 @@ function SearchCreateSelect({
   onCreate?: (query: string) => Promise<void>;
 }) {
   const listboxId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
+  const [menuPosition, setMenuPosition] = useState<{
+    left: number;
+    top?: number;
+    bottom?: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
   const selected = options.find((option) => option.value === value);
   const normalizedQuery = normalizeSearchText(query);
   const trimmedQuery = query.trim();
@@ -5289,6 +5298,52 @@ function SearchCreateSelect({
   useEffect(() => {
     setActiveIndex((current) => Math.min(current, Math.max(0, itemCount - 1)));
   }, [itemCount]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setMenuPosition(null);
+      return undefined;
+    }
+    const updatePosition = () => {
+      const rect = rootRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const margin = 8;
+      const gap = 6;
+      const desiredHeight = 264;
+      const availableBelow = Math.max(0, window.innerHeight - rect.bottom - gap - margin);
+      const availableAbove = Math.max(0, rect.top - gap - margin);
+      const placeAbove = availableBelow < Math.min(180, desiredHeight)
+        && availableAbove > availableBelow;
+      const availableHeight = placeAbove ? availableAbove : availableBelow;
+      const width = Math.min(
+        Math.max(rect.width, 270),
+        Math.max(160, window.innerWidth - margin * 2),
+      );
+      const left = Math.min(
+        Math.max(margin, rect.left),
+        Math.max(margin, window.innerWidth - width - margin),
+      );
+      setMenuPosition({
+        left,
+        ...(placeAbove
+          ? { bottom: window.innerHeight - rect.top + gap }
+          : { top: rect.bottom + gap }),
+        width,
+        maxHeight: Math.max(96, Math.min(desiredHeight, availableHeight)),
+      });
+    };
+    const onScroll = (event: Event) => {
+      if (menuRef.current?.contains(event.target as Node | null)) return;
+      updatePosition();
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [open]);
 
   const close = () => {
     setOpen(false);
@@ -5370,9 +5425,11 @@ function SearchCreateSelect({
 
   return (
     <div
+      ref={rootRef}
       className={`search-create-select${open ? ' open' : ''}`}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) close();
+        const next = event.relatedTarget as Node | null;
+        if (!event.currentTarget.contains(next) && !menuRef.current?.contains(next)) close();
       }}
     >
       <div className="search-create-input">
@@ -5428,8 +5485,20 @@ function SearchCreateSelect({
           <ChevronDown size={15} />
         </button>
       </div>
-      {open && (
-        <div className="search-create-menu" id={listboxId} role="listbox">
+      {open && menuPosition && createPortal(
+        <div
+          ref={menuRef}
+          className="search-create-menu portal"
+          id={listboxId}
+          role="listbox"
+          style={{
+            left: menuPosition.left,
+            top: menuPosition.top ?? 'auto',
+            bottom: menuPosition.bottom ?? 'auto',
+            width: menuPosition.width,
+            maxHeight: menuPosition.maxHeight,
+          }}
+        >
           {createIsFirst && renderCreateOption(0)}
           {filtered.map((option, index) => (
             <button
@@ -5457,7 +5526,8 @@ function SearchCreateSelect({
           ))}
           {!createIsFirst && renderCreateOption(filtered.length)}
           {!filtered.length && !showCreate && <p>{emptyText}</p>}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

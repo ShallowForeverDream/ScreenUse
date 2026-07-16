@@ -1499,6 +1499,11 @@ kbd {
   background: var(--panel-solid);
   box-shadow: 0 16px 38px rgba(34, 20, 42, .17);
 }
+.search-create-menu.portal {
+  position: fixed;
+  z-index: 1400;
+  overscroll-behavior: contain;
+}
 .modal .field-grid .field:last-child .search-create-menu { right: 0; left: auto; }
 .search-create-menu > button {
   width: 100%;
