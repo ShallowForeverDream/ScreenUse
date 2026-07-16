@@ -4454,10 +4454,18 @@ fn context_is_disconnected(left_end: &str, right_start: &str, max_seconds: i64) 
 }
 
 fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
-    if left.user_confirmed
-        || right.user_confirmed
-        || !within_gap_seconds(&left.ended_at, &right.started_at, 5)
-    {
+    if right.user_confirmed || !within_gap_seconds(&left.ended_at, &right.started_at, 5) {
+        return false;
+    }
+    // Screenshot utilities are part of the task that was active immediately before them.
+    // The previous task may have been corrected by the user, so it remains a valid anchor;
+    // only an automatically collected overlay is allowed to be absorbed.
+    if is_task_overlay_session(right) {
+        return is_auto_session_source(&right.source)
+            && left.source != "collector-idle"
+            && left.category != "离开";
+    }
+    if left.user_confirmed {
         return false;
     }
     if left.source == "collector-idle" && right.source == "collector-idle" {
@@ -4465,10 +4473,6 @@ fn can_auto_coalesce(left: &WorkSession, right: &WorkSession) -> bool {
     }
     if left.source != "context-complete" || right.source != "context-complete" {
         return false;
-    }
-    if is_task_overlay_session(right) {
-        return left.category != "离开"
-            && session_duration_seconds(right).is_some_and(|seconds| seconds <= 5 * 60);
     }
     if left.project_id != right.project_id
         || left.task_id != right.task_id
@@ -4592,6 +4596,11 @@ fn is_task_overlay_session(session: &WorkSession) -> bool {
     primary_session_app(session)
         .as_deref()
         .is_some_and(is_task_overlay_app_name)
+        || is_screenshot_overlay_title(&session.summary)
+        || session.evidence.iter().any(|item| {
+            matches!(item.kind.as_str(), "window" | "page")
+                && is_screenshot_overlay_title(&item.value)
+        })
 }
 
 fn is_task_overlay_app_name(app: &str) -> bool {
@@ -4601,11 +4610,45 @@ fn is_task_overlay_app_name(app: &str) -> bool {
         "snipaste"
             | "snippingtool"
             | "screenclippinghost"
+            | "qqscreenshot"
+            | "qqscreenclip"
+            | "qqsc"
             | "sharex"
             | "greenshot"
             | "picpick"
             | "lightshot"
             | "flameshot"
+    )
+}
+
+fn is_screenshot_overlay_title(title: &str) -> bool {
+    let compact = title
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(character, '·' | '•' | '-' | '—' | '_' | ':' | '：')
+        })
+        .collect::<String>();
+    let compact = ["qq", "微信", "wechat", "weixin", "钉钉", "dingtalk"]
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+        .unwrap_or(&compact);
+    matches!(
+        compact,
+        "截图"
+            | "qq截图"
+            | "截屏"
+            | "屏幕截图"
+            | "屏幕截取"
+            | "截图工具"
+            | "截图编辑"
+            | "screenshot"
+            | "screencapture"
+            | "screenclipping"
+            | "snippingtool"
+            | "snippersnipaste"
     )
 }
 
@@ -5346,7 +5389,7 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_utility_is_assigned_to_the_previous_session() {
+    fn screenshot_utility_is_merged_into_confirmed_previous_session() {
         let data_dir = std::env::temp_dir().join(format!(
             "screenuse-screenshot-overlay-test-{}",
             Uuid::new_v4()
@@ -5371,7 +5414,7 @@ mod tests {
         {
             let conn = db.conn.lock();
             conn.execute(
-                "INSERT INTO work_sessions VALUES ('work-before',?1,?2,?3,?4,'开发','ScreenUse',0.9,?5,0,'context-complete',?6)",
+                "INSERT INTO work_sessions VALUES ('work-before',?1,?2,?3,?4,'开发','ScreenUse',0.9,?5,1,'manual-correction',?6)",
                 params![fmt(base), fmt(base + Duration::seconds(40)), project.id, task.id, evidence("screenuse.exe"), now()],
             )
             .expect("insert work");
@@ -5380,18 +5423,27 @@ mod tests {
                 params![fmt(base + Duration::seconds(40)), fmt(base + Duration::seconds(55)), evidence("Snipaste.exe"), now()],
             )
             .expect("insert screenshot overlay");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('qq-screenshot-overlay',?1,?2,NULL,NULL,'沟通','QQ · QQ截图',0.56,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(55)), fmt(base + Duration::seconds(70)), evidence("QQ.exe"), now()],
+            )
+            .expect("insert QQ screenshot overlay");
         }
 
-        assert_eq!(db.compact_sessions().expect("compact screenshot"), 1);
+        assert_eq!(db.compact_sessions().expect("compact screenshot"), 2);
         let merged = db
             .get_session("work-before")
             .expect("load merged")
             .expect("merged exists");
-        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(55)));
+        assert_eq!(merged.ended_at, fmt(base + Duration::seconds(70)));
         assert_eq!(merged.project_id.as_deref(), Some(project.id.as_str()));
         assert!(db
             .get_session("snipaste-overlay")
             .expect("load screenshot")
+            .is_none());
+        assert!(db
+            .get_session("qq-screenshot-overlay")
+            .expect("load QQ screenshot")
             .is_none());
 
         drop(db);

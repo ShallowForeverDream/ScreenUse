@@ -504,6 +504,9 @@ fn is_task_overlay_app(event: &RawActivityEvent) -> bool {
         "snipaste"
             | "snippingtool"
             | "screenclippinghost"
+            | "qqscreenshot"
+            | "qqscreenclip"
+            | "qqsc"
             | "sharex"
             | "greenshot"
             | "picpick"
@@ -518,8 +521,38 @@ fn is_task_overlay_app(event: &RawActivityEvent) -> bool {
         .unwrap_or_default()
         .trim()
         .to_lowercase();
-    title.contains("snipper - snipaste")
-        || matches!(title.as_str(), "截图工具" | "snipping tool" | "screen clipping")
+    is_screenshot_overlay_title(&title)
+}
+
+fn is_screenshot_overlay_title(title: &str) -> bool {
+    let compact = title
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(character, '·' | '•' | '-' | '—' | '_' | ':' | '：')
+        })
+        .collect::<String>();
+    let compact = ["qq", "微信", "wechat", "weixin", "钉钉", "dingtalk"]
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+        .unwrap_or(&compact);
+    matches!(
+        compact,
+        "截图"
+            | "qq截图"
+            | "截屏"
+            | "屏幕截图"
+            | "屏幕截取"
+            | "截图工具"
+            | "截图编辑"
+            | "screenshot"
+            | "screencapture"
+            | "screenclipping"
+            | "snippingtool"
+            | "snippersnipaste"
+    )
 }
 
 fn signature_window_title<'a>(app: &str, title: Option<&'a str>) -> &'a str {
@@ -2515,6 +2548,16 @@ mod tests {
         assert!(!should_inherit_active_context("", &observed, &event));
         assert!(should_inherit_active_context("code|ScreenUse||||", &observed, &event));
         assert!(!should_inherit_active_context("idle", &observed, &event));
+
+        let mut qq_screenshot = event.clone();
+        qq_screenshot.app = Some("QQ.exe".into());
+        qq_screenshot.window_title = Some("QQ截图".into());
+        let qq_screenshot_signature = context_signature(&qq_screenshot, 180);
+        assert!(should_inherit_active_context(
+            "chrome.exe|成果填报||||",
+            &qq_screenshot_signature,
+            &qq_screenshot,
+        ));
 
         let mut normal = event;
         normal.app = Some("Code.exe".into());
