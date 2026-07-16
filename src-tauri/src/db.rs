@@ -703,7 +703,7 @@ impl AppDb {
             "UPDATE work_sessions
              SET project_id=?1,task_id=NULL,category=?2,source='collector-idle',updated_at=?3
              WHERE user_confirmed=0
-               AND (source='collector-idle' OR (category='离开' AND summary='离开/空闲'))
+               AND (source='collector-idle' OR summary='离开/空闲')
                AND (project_id IS NOT ?1 OR task_id IS NOT NULL OR category<>?2 OR source<>'collector-idle')",
             params![project_id, settings.idle_category, timestamp],
         )?;
@@ -7007,6 +7007,35 @@ mod tests {
         let latest = db.list_sessions(1).expect("load custom idle session")[0].clone();
         assert_eq!(latest.category, "休息");
         assert_eq!(latest.project_name.as_deref(), Some("暂离"));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn idle_context_with_a_project_like_page_cannot_be_reclassified_as_work() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-idle-project-title-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("ScreenUse 专项", "开发")
+            .expect("create project");
+        db.create_task(&project.id, "开发与测试")
+            .expect("create task");
+        let mut event = context_event(
+            "idle-project-title",
+            "ChatGPT.exe",
+            "ScreenUse 专项",
+            Utc::now() + Duration::hours(1),
+        );
+        event.input_stats.idle_seconds = 300;
+        let idle = classification::ingest_event(&db, &event)
+            .expect("ingest idle context")
+            .expect("idle session");
+        assert_eq!(idle.source, "collector-idle");
+        assert_eq!(idle.summary, "离开/空闲");
+        assert_eq!(idle.category, "无效");
+        assert!(idle.task_id.is_none());
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
