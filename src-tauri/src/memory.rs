@@ -326,6 +326,7 @@ pub fn choose_assignment(
     }
     choose_similarity_assignment(query, records)
         .or_else(|| choose_manual_keyword_signature(query, records))
+        .or_else(|| choose_manual_token_pair_signature(query, records))
         .or_else(|| choose_stable_app_assignment(query, records))
 }
 
@@ -865,6 +866,189 @@ fn choose_manual_keyword_signature(
         support: supporting_memories,
         memory_session_id: record.session_id.clone(),
     })
+}
+
+fn choose_manual_token_pair_signature(
+    query: &ContextFeatures,
+    records: &[MemoryRecord],
+) -> Option<MemoryDecision> {
+    #[derive(Default)]
+    struct PairAssignment<'a> {
+        count: usize,
+        latest: Option<&'a MemoryRecord>,
+    }
+
+    #[derive(Default)]
+    struct PairVote<'a> {
+        pairs: Vec<(String, String)>,
+        max_support: usize,
+        record: Option<&'a MemoryRecord>,
+    }
+
+    let query_tokens = signature_tokens(query);
+    if query_tokens.len() < 2 {
+        return None;
+    }
+
+    let query_pairs = token_pairs(&query_tokens)
+        .into_iter()
+        .filter(is_specific_token_pair)
+        .collect::<HashSet<_>>();
+    if query_pairs.is_empty() {
+        return None;
+    }
+
+    let mut assignments = HashMap::<(String, String), HashMap<String, PairAssignment<'_>>>::new();
+    for record in records.iter().filter(|record| record.user_confirmed) {
+        let assignment = assignment_key(record);
+        let matching_tokens = signature_tokens(&record.features)
+            .into_iter()
+            .filter(|token| query_tokens.binary_search(token).is_ok())
+            .collect::<Vec<_>>();
+        for pair in token_pairs(&matching_tokens) {
+            if !query_pairs.contains(&pair) {
+                continue;
+            }
+            let stats = assignments
+                .entry(pair)
+                .or_default()
+                .entry(assignment.clone())
+                .or_default();
+            stats.count += 1;
+            if stats
+                .latest
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                stats.latest = Some(record);
+            }
+        }
+    }
+
+    let mut votes = HashMap::<String, PairVote<'_>>::new();
+    for (pair, pair_assignments) in assignments {
+        if pair_assignments.len() != 1 {
+            return None;
+        }
+        let (assignment, stats) = pair_assignments.into_iter().next()?;
+        if stats.count < 2 {
+            continue;
+        }
+        let vote = votes.entry(assignment).or_default();
+        vote.pairs.push(pair);
+        vote.max_support = vote.max_support.max(stats.count);
+        if let Some(record) = stats.latest {
+            if vote
+                .record
+                .map_or(true, |latest| record.confirmed_at > latest.confirmed_at)
+            {
+                vote.record = Some(record);
+            }
+        }
+    }
+
+    // A pair is useful only when every learned pair visible in the current
+    // context agrees on the complete category/project/task path. This keeps a
+    // broad workspace word from overruling a more specific conversation or
+    // document signal.
+    if votes.len() != 1 {
+        return None;
+    }
+    let (_, mut vote) = votes.into_iter().next()?;
+    let record = vote.record?;
+    vote.pairs.sort_by(|left, right| {
+        pair_specificity(right)
+            .cmp(&pair_specificity(left))
+            .then_with(|| left.cmp(right))
+    });
+    let matched = vote
+        .pairs
+        .first()
+        .map(|(left, right)| format!("{left} + {right}"))?;
+    Some(MemoryDecision {
+        category: record.category.clone(),
+        project_id: record.project_id.clone(),
+        task_id: record.task_id.clone(),
+        confidence: if vote.max_support >= 4 { 0.93 } else { 0.90 },
+        matched_label: format!("个人组合词：{matched}"),
+        support: vote.max_support,
+        memory_session_id: record.session_id.clone(),
+    })
+}
+
+fn signature_tokens(features: &ContextFeatures) -> Vec<String> {
+    let mut tokens = features
+        .tokens
+        .iter()
+        .filter(|token| is_signature_token(token))
+        .filter(|token| {
+            let token = canonical_context(token);
+            token != features.app && !features.app.ends_with(&token)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn token_pairs(tokens: &[String]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for (index, left) in tokens.iter().enumerate() {
+        for right in &tokens[index + 1..] {
+            pairs.push((left.clone(), right.clone()));
+        }
+    }
+    pairs
+}
+
+fn is_specific_token_pair((left, right): &(String, String)) -> bool {
+    let longest = left.chars().count().max(right.chars().count());
+    !(longest < 4
+        || is_context_container_anchor(left)
+        || is_context_container_anchor(right)
+        || is_weak_pair_token(left) && is_weak_pair_token(right))
+}
+
+fn pair_specificity((left, right): &(String, String)) -> usize {
+    left.chars().count() + right.chars().count()
+}
+
+fn is_weak_pair_token(token: &str) -> bool {
+    matches!(
+        token,
+        "hdu"
+            | "college"
+            | "runtime"
+            | "root"
+            | "pdf"
+            | "docx"
+            | "txt"
+            | "exe"
+            | "大学"
+            | "学校"
+            | "校园"
+            | "学院"
+            | "湖北"
+            | "北大"
+            | "中心"
+            | "平台"
+            | "统一"
+            | "身份"
+            | "认证"
+            | "管理员"
+            | "administrator"
+            | "powershell"
+            | "pwsh"
+            | "shell"
+            | "installer"
+            | "isolated"
+            | "onekey"
+            | "加入"
+            | "个人"
+            | "老师"
+            | "博士"
+            | "师兄"
+    )
 }
 
 fn is_signature_token(token: &str) -> bool {
@@ -1457,6 +1641,83 @@ mod tests {
             .expect("two repeatedly confirmed personal terms should be enough");
         assert_eq!(decision.task_id, "计算机网络刷题");
         assert!(decision.support >= 4);
+    }
+
+    #[test]
+    fn repeated_pure_token_pair_generalizes_to_a_new_page() {
+        let records = vec![
+            record(
+                "aliyun-one",
+                "Chrome.exe",
+                "root@server-one - Aliyun Workbench",
+                "云端开发",
+            ),
+            record(
+                "aliyun-two",
+                "Chrome.exe",
+                "root@server-two - Aliyun Workbench",
+                "云端开发",
+            ),
+        ];
+        let query = features_from_event(&event("Chrome.exe", "root@new-server - Aliyun Workbench"));
+
+        let decision = choose_manual_token_pair_signature(&query, &records)
+            .expect("a repeated platform pair should resolve the concrete task");
+        assert_eq!(decision.task_id, "云端开发");
+        assert_eq!(decision.support, 2);
+        assert!(decision.matched_label.contains("aliyun"));
+        assert!(decision.matched_label.contains("workbench"));
+    }
+
+    #[test]
+    fn broad_path_words_cannot_form_a_task_pair() {
+        let records = vec![
+            record(
+                "iot-one",
+                "WindowsTerminal.exe",
+                "root@host: C:/college/HDU/runtime",
+                "IOT复现",
+            ),
+            record(
+                "iot-two",
+                "WindowsTerminal.exe",
+                "root@other: C:/college/HDU/runtime",
+                "IOT复现",
+            ),
+        ];
+        let query = features_from_event(&event(
+            "WindowsTerminal.exe",
+            "C:/college/HDU/runtime/NapCat/WeChat bridge",
+        ));
+
+        assert!(choose_manual_token_pair_signature(&query, &records).is_none());
+    }
+
+    #[test]
+    fn conflicting_token_pair_history_abstains() {
+        let mut records = vec![
+            record(
+                "aliyun-one",
+                "Chrome.exe",
+                "Aliyun Workbench server one",
+                "任务一",
+            ),
+            record(
+                "aliyun-two",
+                "Chrome.exe",
+                "Aliyun Workbench server two",
+                "任务一",
+            ),
+        ];
+        records.push(record(
+            "aliyun-other",
+            "Chrome.exe",
+            "Aliyun Workbench billing",
+            "任务二",
+        ));
+        let query = features_from_event(&event("Chrome.exe", "Aliyun Workbench new server"));
+
+        assert!(choose_manual_token_pair_signature(&query, &records).is_none());
     }
 
     #[test]
