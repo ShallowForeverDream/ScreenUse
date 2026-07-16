@@ -420,6 +420,126 @@ function EditProjectDialog({
   );
 }
 
+function ManageCategoriesDialog({
+  categories,
+  idleCategory,
+  stats,
+  busyCategory,
+  blocked,
+  onCancel,
+  onRename,
+  onDelete,
+}: {
+  categories: CategoryOption[];
+  idleCategory: string;
+  stats: Map<string, { projects: number; minutes: number }>;
+  busyCategory: string;
+  blocked: boolean;
+  onCancel: () => void;
+  onRename: (category: CategoryOption) => void;
+  onDelete: (category: CategoryOption) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+  const needle = normalizeSearchText(query);
+  const visibleCategories = categories.filter((category) => (
+    !needle || normalizeSearchText(category.name).includes(needle)
+  ));
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || busyCategory || blocked) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [blocked, busyCategory, onCancel]);
+
+  return createPortal(
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (!busyCategory && !blocked) onCancel();
+      }}
+      role="presentation"
+    >
+      <section
+        aria-labelledby="manage-categories-title"
+        aria-modal="true"
+        className="modal category-manager-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="modal-head category-manager-head">
+          <div>
+            <h2 id="manage-categories-title">分类管理</h2>
+            <p>改名会同步更新项目、规则和历史时间段。</p>
+          </div>
+          <button className="icon-button" disabled={Boolean(busyCategory)} onClick={onCancel} type="button" aria-label="关闭分类管理">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="category-manager-search">
+          <Search size={16} />
+          <input
+            aria-label="搜索分类"
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索分类"
+            ref={inputRef}
+            value={query}
+          />
+          {query && (
+            <button onClick={() => setQuery('')} type="button" aria-label="清空分类搜索">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <div className="category-manager-list">
+          {visibleCategories.map((category) => {
+            const categoryStats = stats.get(category.name) || { projects: 0, minutes: 0 };
+            const isIdleCategory = category.name === idleCategory;
+            const isBusy = busyCategory === category.name;
+            const cannotDelete = categories.length <= 1 || isIdleCategory;
+            return (
+              <article className="category-manager-row" key={category.name}>
+                <i style={{ background: category.color || categoryColor(category.name) }} />
+                <span>
+                  <strong>{category.name}</strong>
+                  <small>
+                    {isIdleCategory
+                      ? `离开时间归属 · ${categoryStats.projects} 个项目`
+                      : `${categoryStats.projects} 个项目 · ${formatDuration(categoryStats.minutes)}`}
+                  </small>
+                </span>
+                <div>
+                  <button disabled={Boolean(busyCategory)} onClick={() => onRename(category)} type="button">
+                    <Pencil size={14} />改名
+                  </button>
+                  <button
+                    className="danger-button"
+                    disabled={Boolean(busyCategory) || cannotDelete}
+                    onClick={() => onDelete(category)}
+                    title={isIdleCategory ? '请先在设置中更换离开时间归属' : categories.length <= 1 ? '至少保留一个分类' : '删除分类'}
+                    type="button"
+                  >
+                    <Trash2 size={14} />{isBusy ? '删除中…' : '删除'}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+          {!visibleCategories.length && <EmptyState title="没有匹配分类" detail="换个名称试试。" />}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function TextInputDialog({
   title,
   detail,
@@ -956,6 +1076,7 @@ export default function App() {
             selectedDate={selectedDate}
             runAction={runAction}
             categoryOptions={data.categoryOptions}
+            idleCategory={data.settings.idleCategory}
             focusProjectId={projectFocusId}
             selectionResetKey={selectionResetKey}
             onEdit={setEditing}
@@ -3518,6 +3639,7 @@ function ProjectsView({
   selectedDate,
   runAction,
   categoryOptions,
+  idleCategory,
   focusProjectId,
   selectionResetKey,
   onEdit,
@@ -3528,6 +3650,7 @@ function ProjectsView({
   selectedDate: string;
   runAction: ActionRunner;
   categoryOptions: CategoryOption[];
+  idleCategory: string;
   focusProjectId: string;
   selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
@@ -3537,6 +3660,9 @@ function ProjectsView({
   const [name, setName] = useState('');
   const [category, setCategory] = useState('开发');
   const [categoryName, setCategoryName] = useState('');
+  const [managingCategories, setManagingCategories] = useState(false);
+  const [renamingCategory, setRenamingCategory] = useState<CategoryOption | null>(null);
+  const [busyCategory, setBusyCategory] = useState('');
   const [busyProjectId, setBusyProjectId] = useState('');
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [busyTaskId, setBusyTaskId] = useState('');
@@ -3600,6 +3726,19 @@ function ProjectsView({
     }
     return result;
   }, [rangeBounds, rangeSessions]);
+  const categoryStats = useMemo(() => {
+    const result = new Map<string, { projects: number; minutes: number }>();
+    for (const option of categoryOptions) {
+      result.set(option.name, { projects: 0, minutes: 0 });
+    }
+    for (const project of projects) {
+      const current = result.get(project.category) || { projects: 0, minutes: 0 };
+      current.projects += 1;
+      current.minutes += minutesByProject.get(project.id) || 0;
+      result.set(project.category, current);
+    }
+    return result;
+  }, [categoryOptions, minutesByProject, projects]);
   const taskStats = useMemo(() => {
     const result = new Map<string, { count: number; minutes: number }>();
     for (const session of rangeSessions) {
@@ -3711,6 +3850,45 @@ function ProjectsView({
     setCreatingCategory(false);
   };
 
+  const renameCategory = async (newName: string) => {
+    const selected = renamingCategory;
+    if (!selected || busyCategory) return;
+    setBusyCategory(selected.name);
+    try {
+      const renamed = (await runAction(
+        () => api.renameCategory(selected.name, newName),
+        `分类“${selected.name}”已改名为“${newName}”`,
+      )) as CategoryOption;
+      if (category === selected.name) setCategory(renamed.name);
+      setRenamingCategory(null);
+    } finally {
+      setBusyCategory('');
+    }
+  };
+
+  const deleteCategory = async (selected: CategoryOption) => {
+    if (busyCategory || selected.name === idleCategory) return;
+    const fallback = categoryOptions.find((item) => item.name === '杂务' && item.name !== selected.name)
+      || categoryOptions.find((item) => item.name !== selected.name);
+    if (!fallback) return;
+    const accepted = await confirmation.confirm({
+      title: `删除分类“${selected.name}”？`,
+      detail: `该分类下的项目、规则和历史时间段会转到“${fallback.name}”。`,
+    });
+    if (!accepted) return;
+    setBusyCategory(selected.name);
+    try {
+      const fallbackName = (await runAction(
+        () => api.deleteCategory(selected.name),
+        `分类“${selected.name}”已删除，内容已转入`,
+      )) as string;
+      if (category === selected.name) setCategory(fallbackName);
+      if (renamingCategory?.name === selected.name) setRenamingCategory(null);
+    } finally {
+      setBusyCategory('');
+    }
+  };
+
   const createProject = async () => {
     const projectName = name.trim();
     if (!projectName || !category) return;
@@ -3778,6 +3956,17 @@ function ProjectsView({
           subtitle={`${rangeLabel} · 显示 ${visibleProjects.length}/${projects.length} 个项目`}
           action={(
             <div className="project-header-actions">
+              <button
+                aria-expanded={managingCategories}
+                onClick={() => {
+                  setManagingCategories(true);
+                  setCreating(false);
+                  setCreatingCategory(false);
+                }}
+                type="button"
+              >
+                <Tags size={15} />管理分类
+              </button>
               <button
                 aria-expanded={creatingCategory}
                 onClick={() => {
@@ -4069,6 +4258,28 @@ function ProjectsView({
           {!selectedProject && <EmptyState title="还没有项目" detail="创建项目后即可添加任务。" />}
         </div>
       </section>
+      {managingCategories && (
+        <ManageCategoriesDialog
+          blocked={Boolean(renamingCategory) || confirmation.isOpen}
+          busyCategory={busyCategory}
+          categories={categoryOptions}
+          idleCategory={idleCategory}
+          onCancel={() => setManagingCategories(false)}
+          onDelete={(selected) => void deleteCategory(selected)}
+          onRename={setRenamingCategory}
+          stats={categoryStats}
+        />
+      )}
+      {renamingCategory && (
+        <RenameCategoryDialog
+          busy={busyCategory === renamingCategory.name}
+          currentName={renamingCategory.name}
+          onCancel={() => {
+            if (!busyCategory) setRenamingCategory(null);
+          }}
+          onRename={(newName) => void renameCategory(newName)}
+        />
+      )}
       {confirmation.dialog}
       {editingProject && (
         <EditProjectDialog

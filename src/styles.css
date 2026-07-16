@@ -955,6 +955,41 @@ kbd {
 .projects-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 13px; align-items: start; }
 .project-header-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .project-header-actions button { white-space: nowrap; }
+.category-manager-dialog { width: min(620px, 100%); }
+.category-manager-head { align-items: center; }
+.category-manager-search {
+  min-height: 42px;
+  padding: 0 8px 0 11px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 7px;
+  color: var(--subtle);
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  background: var(--input);
+}
+.category-manager-search input { min-height: 40px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.category-manager-search input:focus { border: 0; box-shadow: none; }
+.category-manager-search button { width: 29px; height: 29px; padding: 0; border-color: transparent; background: transparent; }
+.category-manager-list { display: grid; gap: 8px; }
+.category-manager-row {
+  min-width: 0;
+  padding: 10px 11px;
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+.category-manager-row > i { width: 9px; height: 9px; border-radius: 999px; }
+.category-manager-row > span, .category-manager-row strong, .category-manager-row small { min-width: 0; display: block; }
+.category-manager-row strong { overflow: hidden; color: var(--text-secondary); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.category-manager-row small { margin-top: 3px; color: var(--subtle); font-size: 10px; }
+.category-manager-row > div { display: flex; align-items: center; gap: 6px; }
+.category-manager-row button { min-height: 32px; padding: 5px 8px; display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
 .project-create-row {
   margin: -3px 0 13px;
   padding: 10px;
