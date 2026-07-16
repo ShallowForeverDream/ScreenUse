@@ -741,7 +741,16 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             metadata["activePageTitle"] = serde_json::Value::String(context.title.clone());
             metadata["activePageSource"] = serde_json::Value::String(context.source.into());
             if context.source == "chatgpt-conversation" {
-                metadata["chatgptConversationTitle"] = serde_json::Value::String(context.title);
+                metadata["conversationTitle"] =
+                    serde_json::Value::String(context.title.clone());
+                metadata["chatgptConversationTitle"] =
+                    serde_json::Value::String(context.title.clone());
+            }
+            if context.source == "qq-conversation-header" {
+                metadata["conversationTitle"] =
+                    serde_json::Value::String(context.title.clone());
+                metadata["qqConversationTitle"] =
+                    serde_json::Value::String(context.title.clone());
             }
             if let Some(project) = context.project {
                 metadata["chatgptProject"] = serde_json::Value::String(project);
@@ -780,6 +789,11 @@ fn active_page_context(
     app: &str,
     native_title: &str,
 ) -> Option<ActivePageContext> {
+    if is_qq_app(app) {
+        if let Some(context) = qq_active_conversation_context(window).ok().flatten() {
+            return Some(context);
+        }
+    }
     if is_chat_workspace_app(app) {
         if let Some(context) = chatgpt_selected_context(window).ok().flatten() {
             return Some(context);
@@ -819,10 +833,138 @@ fn active_page_context(
 }
 
 #[cfg(windows)]
+fn is_qq_app(app: &str) -> bool {
+    app.eq_ignore_ascii_case("qq.exe") || app.eq_ignore_ascii_case("qq")
+}
+
+#[cfg(windows)]
 fn is_chat_workspace_app(app: &str) -> bool {
     ["chatgpt.exe", "codex.exe"]
         .iter()
         .any(|name| app.eq_ignore_ascii_case(name))
+}
+
+#[cfg(windows)]
+fn qq_active_conversation_context(
+    window: windows::Win32::Foundation::HWND,
+) -> Result<Option<ActivePageContext>> {
+    use windows::core::VARIANT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_NamePropertyId,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let root = automation.ElementFromHandle(window)?;
+            let walker = automation.ControlViewWalker()?;
+
+            // QQ NT does not expose the selected chat as a SelectionItem. Its
+            // current conversation header is the sibling immediately before the
+            // call/action toolbar, which remains stable across people and groups.
+            for action_name in [
+                "语音通话",
+                "视频通话",
+                "屏幕共享",
+                "Voice call",
+                "Video call",
+                "Share screen",
+            ] {
+                let condition = automation.CreatePropertyCondition(
+                    UIA_NamePropertyId,
+                    &VARIANT::from(action_name),
+                )?;
+                let Ok(action) = root.FindFirst(TreeScope_Descendants, &condition) else {
+                    continue;
+                };
+                let Ok(toolbar) = walker.GetParentElement(&action) else {
+                    continue;
+                };
+                let Ok(header) = walker.GetPreviousSiblingElement(&toolbar) else {
+                    continue;
+                };
+                let name = header
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                if let Some(title) = clean_qq_conversation_title(&name) {
+                    return Ok(Some(ActivePageContext {
+                        title,
+                        project: None,
+                        source: "qq-conversation-header",
+                    }));
+                }
+            }
+
+            // Compact QQ layouts may collapse the call buttons. The message
+            // list remains exposed, and its preceding siblings are the toolbar
+            // and the same conversation header.
+            for message_list_name in ["消息列表", "Message list"] {
+                let condition = automation.CreatePropertyCondition(
+                    UIA_NamePropertyId,
+                    &VARIANT::from(message_list_name),
+                )?;
+                let Ok(message_list) = root.FindFirst(TreeScope_Descendants, &condition) else {
+                    continue;
+                };
+                let Ok(main) = walker.GetParentElement(&message_list) else {
+                    continue;
+                };
+                let Ok(toolbar) = walker.GetPreviousSiblingElement(&main) else {
+                    continue;
+                };
+                let Ok(header) = walker.GetPreviousSiblingElement(&toolbar) else {
+                    continue;
+                };
+                let name = header
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                if let Some(title) = clean_qq_conversation_title(&name) {
+                    return Ok(Some(ActivePageContext {
+                        title,
+                        project: None,
+                        source: "qq-conversation-header",
+                    }));
+                }
+            }
+            Ok(None)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn clean_qq_conversation_title(value: &str) -> Option<String> {
+    let title = clean_page_label(value, "QQ.exe")?;
+    let normalized = title.to_lowercase();
+    if [
+        "语音通话",
+        "视频通话",
+        "屏幕共享",
+        "邀请加群",
+        "群应用",
+        "发送",
+        "voice call",
+        "video call",
+        "share screen",
+        "send",
+    ]
+    .contains(&normalized.as_str())
+    {
+        None
+    } else {
+        Some(title)
+    }
 }
 
 #[cfg(windows)]
@@ -1617,6 +1759,22 @@ mod tests {
             selected_item_page_title("ICPC 讨论群\n今晚训练", "", "QQ.exe"),
             Some("ICPC 讨论群".into())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qq_header_keeps_people_and_groups_but_rejects_toolbar_actions() {
+        assert_eq!(
+            clean_qq_conversation_title("科研讨论群"),
+            Some("科研讨论群".into())
+        );
+        assert_eq!(
+            clean_qq_conversation_title("张三"),
+            Some("张三".into())
+        );
+        assert_eq!(clean_qq_conversation_title("QQ"), None);
+        assert_eq!(clean_qq_conversation_title("语音通话"), None);
+        assert_eq!(clean_qq_conversation_title("11:13"), None);
     }
 
     #[cfg(windows)]

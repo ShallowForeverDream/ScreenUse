@@ -2417,6 +2417,13 @@ impl AppDb {
             .get("activePageTitle")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty());
+        let page_is_conversation = matches!(
+            event
+                .metadata
+                .get("activePageSource")
+                .and_then(serde_json::Value::as_str),
+            Some("chatgpt-conversation" | "qq-conversation-header")
+        );
         let mut evidence = vec![
             EvidenceItem {
                 kind: if page_title.is_some() {
@@ -2425,7 +2432,11 @@ impl AppDb {
                     "window".into()
                 },
                 label: if page_title.is_some() {
-                    "当前页面".into()
+                    if page_is_conversation {
+                        "当前会话".into()
+                    } else {
+                        "当前页面".into()
+                    }
                 } else {
                     "窗口".into()
                 },
@@ -4724,6 +4735,37 @@ mod tests {
         assert_eq!(session.evidence[0].kind, "page");
         assert_eq!(session.evidence[0].label, "当前页面");
         assert_eq!(session.evidence[0].value, "ICPC 训练计划.docx");
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn qq_conversation_is_labeled_as_the_current_chat() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-qq-evidence-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        db.ingest_raw_event(RawActivityEvent {
+            id: "qq-conversation-evidence".into(),
+            source: "windows-foreground".into(),
+            timestamp: now(),
+            app: Some("QQ.exe".into()),
+            window_title: Some("科研讨论群".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: serde_json::json!({
+                "contextStart": true,
+                "activePageTitle": "科研讨论群",
+                "activePageSource": "qq-conversation-header",
+                "conversationTitle": "科研讨论群"
+            }),
+        })
+        .expect("ingest QQ conversation event");
+        let session = db.list_sessions(1).expect("list sessions")[0].clone();
+        assert_eq!(session.evidence[0].kind, "page");
+        assert_eq!(session.evidence[0].label, "当前会话");
+        assert_eq!(session.evidence[0].value, "科研讨论群");
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }

@@ -577,16 +577,26 @@ fn event_current_page_title(event: &RawActivityEvent) -> Option<&str> {
 fn chat_conversation_title(event: &RawActivityEvent) -> Option<&str> {
     event
         .metadata
-        .get("chatgptConversationTitle")
+        .get("conversationTitle")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            (event
+            event
                 .metadata
-                .get("activePageSource")
+                .get("chatgptConversationTitle")
                 .and_then(serde_json::Value::as_str)
-                == Some("chatgpt-conversation"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            (matches!(
+                event
+                    .metadata
+                    .get("activePageSource")
+                    .and_then(serde_json::Value::as_str),
+                Some("chatgpt-conversation" | "qq-conversation-header")
+            ))
             .then(|| event_current_page_title(event))
             .flatten()
         })
@@ -755,6 +765,19 @@ mod tests {
         });
 
         assert_eq!(summary_for_event(&event, "开发"), "codex_work_bridge · HDU");
+    }
+
+    #[test]
+    fn qq_summary_uses_the_current_person_or_group_as_the_primary_label() {
+        let mut event = event("QQ.exe", "科研讨论群");
+        event.metadata = json!({
+            "activePageTitle": "科研讨论群",
+            "activePageSource": "qq-conversation-header",
+            "conversationTitle": "科研讨论群",
+            "qqConversationTitle": "科研讨论群"
+        });
+
+        assert_eq!(summary_for_event(&event, "学习"), "科研讨论群");
     }
 
     #[test]
