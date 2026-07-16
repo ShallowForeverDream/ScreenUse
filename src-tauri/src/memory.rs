@@ -152,10 +152,7 @@ pub fn features_from_session(
     )
 }
 
-pub fn has_ambiguous_session_context(
-    session: &WorkSession,
-    events: &[RawActivityEvent],
-) -> bool {
+pub fn has_ambiguous_session_context(session: &WorkSession, events: &[RawActivityEvent]) -> bool {
     let primary_app = primary_session_app(session, events);
     let contexts = events
         .iter()
@@ -198,9 +195,10 @@ fn primary_session_app(session: &WorkSession, events: &[RawActivityEvent]) -> St
 
 fn assignment_event_score(session: &WorkSession, event: &RawActivityEvent) -> u8 {
     let features = features_from_event(event);
-    let task_match = session.task_title.as_deref().is_some_and(|task| {
-        !task.trim().is_empty() && relates_to_assignment(&features, "", task)
-    });
+    let task_match = session
+        .task_title
+        .as_deref()
+        .is_some_and(|task| !task.trim().is_empty() && relates_to_assignment(&features, "", task));
     let project_match = session.project_name.as_deref().is_some_and(|project| {
         !project.trim().is_empty() && relates_to_assignment(&features, project, "")
     });
@@ -439,10 +437,10 @@ pub fn choose_assignment(
         return None;
     };
     if winner.manual_support == 0 {
-        if winner.support < 2 {
+        if winner.support < 3 {
             return None;
         }
-        confidence = confidence.min(if winner.support >= 3 { 0.92 } else { 0.86 });
+        confidence = confidence.min(0.90);
     }
     Some(MemoryDecision {
         category: record.category.clone(),
@@ -1009,8 +1007,29 @@ mod tests {
     fn one_ai_result_is_prompt_context_not_a_permanent_local_rule() {
         let mut ai = record("ai", "QQ.exe", "在线状态 小组群", "浪费");
         ai.user_confirmed = false;
-        assert!(choose_assignment(&features_from_event(&event("QQ.exe", "在线状态 小组群")), &[ai])
-            .is_none());
+        assert!(choose_assignment(
+            &features_from_event(&event("QQ.exe", "在线状态 小组群")),
+            &[ai]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn three_consistent_ai_observations_can_resolve_an_exact_repeat() {
+        let query = features_from_event(&event("QQ.exe", "成果填报群"));
+        let observations = (0..3)
+            .map(|index| {
+                let mut ai = record(&format!("ai-{index}"), "QQ.exe", "成果填报群", "成果填报");
+                ai.user_confirmed = false;
+                ai
+            })
+            .collect::<Vec<_>>();
+
+        assert!(choose_assignment(&query, &observations[..2]).is_none());
+        let decision = choose_assignment(&query, &observations).expect("three AI observations");
+        assert_eq!(decision.task_id, "成果填报");
+        assert_eq!(decision.support, 3);
+        assert!(decision.confidence <= 0.90);
     }
 
     #[test]

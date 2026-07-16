@@ -3,12 +3,12 @@ use crate::models::{Project, RawActivityEvent, SessionPatch, Task, WorkSession};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
-struct Assignment {
-    project_id: String,
-    task_id: Option<String>,
-    category: String,
-    confidence: f32,
-    specificity: i32,
+pub(crate) struct Assignment {
+    pub(crate) project_id: String,
+    pub(crate) task_id: Option<String>,
+    pub(crate) category: String,
+    pub(crate) confidence: f32,
+    pub(crate) specificity: i32,
 }
 
 pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkSession>> {
@@ -180,7 +180,7 @@ fn strongest_assignment(left: Option<Assignment>, right: Option<Assignment>) -> 
     }
 }
 
-fn resolve_project_task(
+pub(crate) fn resolve_project_task(
     db: &AppDb,
     event: &RawActivityEvent,
     category: &str,
@@ -195,6 +195,32 @@ fn resolve_project_task(
         .or(event.window_title.as_deref())
         .map(normalize);
     let workspace = event.workspace.as_deref().and_then(path_label);
+
+    if let Some((task, project, task_signal, project_signal)) = best_global_task(
+        &tasks,
+        &projects,
+        category,
+        &hay,
+        page.as_deref(),
+        workspace.as_deref(),
+    ) {
+        let confidence = if task_signal >= 200 {
+            0.95
+        } else if task_signal >= 140 {
+            0.92
+        } else if task_signal >= 80 {
+            0.89
+        } else {
+            0.85
+        };
+        return Ok(Some(Assignment {
+            project_id: project.id.clone(),
+            task_id: Some(task.id.clone()),
+            category: project.category.clone(),
+            confidence,
+            specificity: 120 + task_signal + project_signal.clamp(0, 100),
+        }));
+    }
 
     let mut best: Option<(&Project, i32)> = None;
     for project in &projects {
@@ -356,6 +382,118 @@ fn best_task<'a>(
     }
 }
 
+fn best_global_task<'a>(
+    tasks: &'a [Task],
+    projects: &'a [Project],
+    category: &str,
+    hay: &str,
+    page: Option<&str>,
+    workspace: Option<&str>,
+) -> Option<(&'a Task, &'a Project, i32, i32)> {
+    let mut candidates = tasks
+        .iter()
+        .filter(|task| task.status == "active" && !is_placeholder_task_title(&task.title))
+        .filter_map(|task| {
+            let project = projects
+                .iter()
+                .find(|project| project.id == task.project_id)?;
+            let project_signal = project_score(project, category, hay, page, workspace);
+            if is_generic_task_title(&task.title) && project_signal < 60 {
+                return None;
+            }
+            let task_signal = task_signal(task, hay, page);
+            if task_signal < 40 {
+                return None;
+            }
+            let rank = task_signal * 10 + project_signal.clamp(-100, 300);
+            Some((task, project, task_signal, project_signal, rank))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.4.cmp(&left.4));
+    let best = *candidates.first()?;
+    if let Some(second) = candidates.get(1) {
+        let same_direct_signal = second.2 >= best.2 - 10;
+        let weak_parent_margin = best.3 < second.3 + 30;
+        if same_direct_signal && weak_parent_margin {
+            return None;
+        }
+    }
+    Some((best.0, best.1, best.2, best.3))
+}
+
+fn task_signal(task: &Task, hay: &str, page: Option<&str>) -> i32 {
+    let title = normalize(&task.title);
+    if title.is_empty() {
+        return 0;
+    }
+    if page == Some(title.as_str()) {
+        return 220;
+    }
+    if page.is_some_and(|page| page.contains(&title) || title.contains(page)) {
+        return 150;
+    }
+    tokens(&task.title)
+        .into_iter()
+        .filter(|token| !is_generic_token(token))
+        .map(|token| {
+            if page.is_some_and(|page| page.contains(&token)) {
+                if token.chars().count() >= 6 {
+                    32
+                } else {
+                    20
+                }
+            } else if hay.contains(&token) {
+                if token.chars().count() >= 6 {
+                    20
+                } else {
+                    10
+                }
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn is_placeholder_task_title(value: &str) -> bool {
+    matches!(
+        normalize(value).replace([' ', '_', '-'], "").as_str(),
+        "" | "other"
+            | "others"
+            | "none"
+            | "nothing"
+            | "unknown"
+            | "unassigned"
+            | "其他"
+            | "未指定"
+            | "暂不指定"
+            | "未归类"
+            | "未归类任务"
+            | "未归类活动整理"
+            | "待分类"
+            | "待复核"
+    )
+}
+
+fn is_generic_task_title(value: &str) -> bool {
+    matches!(
+        normalize(value).replace([' ', '_', '-'], "").as_str(),
+        "会议"
+            | "沟通"
+            | "聊天"
+            | "开发"
+            | "测试"
+            | "开发与测试"
+            | "开发与调试"
+            | "学习"
+            | "科研"
+            | "写作"
+            | "阅读"
+            | "资料阅读"
+            | "日常事务"
+    )
+}
+
 fn should_create_workspace_project(event: &RawActivityEvent, workspace: Option<&str>) -> bool {
     let Some(workspace) = workspace else {
         return false;
@@ -422,7 +560,10 @@ fn default_task_title<'a>(category: &str, event: &'a RawActivityEvent) -> &'a st
     }
 }
 
-fn classify_category(event: &RawActivityEvent, idle_threshold_seconds: u32) -> (&'static str, f32) {
+pub(crate) fn classify_category(
+    event: &RawActivityEvent,
+    idle_threshold_seconds: u32,
+) -> (&'static str, f32) {
     if event.input_stats.idle_seconds >= idle_threshold_seconds as u64 {
         return ("离开", 0.99);
     }
@@ -1041,5 +1182,122 @@ mod tests {
             project_score(&project("HDU"), "开发", &hay, Some(&page), Some("HDU"));
         assert!(page_score > workspace_score);
         assert!(page_score >= 220);
+    }
+
+    #[test]
+    fn an_exact_task_title_can_resolve_its_parent_project() {
+        let projects = vec![Project {
+            id: "games".into(),
+            name: "游戏".into(),
+            category: "娱乐".into(),
+            source: "manual".into(),
+            color: "#000000".into(),
+            description: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        let tasks = vec![Task {
+            id: "steam".into(),
+            project_id: "games".into(),
+            title: "steam".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+
+        let resolved = best_global_task(
+            &tasks,
+            &projects,
+            "娱乐",
+            "steamwebhelper steam",
+            Some("steam"),
+            None,
+        )
+        .expect("exact task title");
+        assert_eq!(resolved.0.id, "steam");
+        assert_eq!(resolved.1.id, "games");
+        assert!(resolved.2 >= 200);
+    }
+
+    #[test]
+    fn an_ambiguous_task_title_does_not_guess_a_project() {
+        let project = |id: &str, category: &str| Project {
+            id: id.into(),
+            name: id.into(),
+            category: category.into(),
+            source: "manual".into(),
+            color: "#000000".into(),
+            description: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let task = |id: &str, project_id: &str| Task {
+            id: id.into(),
+            project_id: project_id.into(),
+            title: "会议".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let projects = vec![project("IOT", "科研"), project("校内实习", "学习")];
+        let tasks = vec![
+            task("iot-meeting", "IOT"),
+            task("intern-meeting", "校内实习"),
+        ];
+
+        assert!(best_global_task(
+            &tasks,
+            &projects,
+            "沟通",
+            "腾讯会议",
+            Some("腾讯会议"),
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_parent_project_signal_disambiguates_same_named_tasks() {
+        let project = |id: &str, category: &str| Project {
+            id: id.into(),
+            name: id.into(),
+            category: category.into(),
+            source: "manual".into(),
+            color: "#000000".into(),
+            description: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let task = |id: &str, project_id: &str| Task {
+            id: id.into(),
+            project_id: project_id.into(),
+            title: "会议".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let projects = vec![project("IOT", "科研"), project("校内实习", "学习")];
+        let tasks = vec![
+            task("iot-meeting", "IOT"),
+            task("intern-meeting", "校内实习"),
+        ];
+
+        let resolved = best_global_task(
+            &tasks,
+            &projects,
+            "科研",
+            &normalize("IOT 项目会议"),
+            Some(&normalize("IOT 项目会议")),
+            None,
+        )
+        .expect("project disambiguates task");
+        assert_eq!(resolved.0.id, "iot-meeting");
+        assert_eq!(resolved.1.id, "IOT");
     }
 }

@@ -28,6 +28,7 @@ pub struct AiAttributionResult {
     pub session_id: String,
     pub project_id: Option<String>,
     pub task_id: Option<String>,
+    #[serde(default)]
     pub category: String,
     pub summary: String,
     pub confidence: f32,
@@ -391,10 +392,10 @@ fn hide_console(_command: &mut Command) {}
 pub(crate) fn review_instructions() -> &'static str {
     "你是单人电脑时间账本的层级归类器。不要调用工具、读取文件或联网，只分析输入 JSON。\
 按 reviewItems 原顺序，为每个 targetSession.sessionId 返回且只返回一个结果；sessionId 是不透明字符串，必须逐字复制。\
-当前 category/project/task/confidence 只是旧系统建议，不是事实。只能选择 catalog 中已有值；每个结果都必须选择一个 status=active 的具体 taskId，禁止只返回分类或项目，也禁止选择 others、nothing、未归类、未指定、其他等兜底任务。taskId 必须属于 projectId，projectId 必须属于 category。\
+当前 category/project/task/confidence 只是旧系统建议，不是事实。层级归类时只决定 taskId；每个结果都必须从 catalog.taskChoices 选择一个 status=active 的具体 taskId。后端会根据该任务唯一反推项目和分类，不要自行决定或输出 projectId/category。禁止只归到分类或项目，也禁止选择 others、nothing、未归类、未指定、其他等兜底任务。\
 决策优先级：① personalMemory 中与当前页面、对话标题、工作区、文件或域名高度相似且由用户确认的例子；② 当前页面/文档/工作区等直接线索；\
 ③ timelineContext 中紧邻且已确认的同一事务连续性；④ 应用名只作弱证据。Explorer、浏览器、QQ、微信、WPS、截图工具和终端可能只是同一任务的工具切换。\
-taskId、projectId、category 都必须来自 catalog，taskId 不得为 null，也禁止创造名称。证据不足时仍选择最合理的已有具体任务，但 confidence 不得高于 0.65，并在 evidence 中说明不确定依据。冲突记忆不强行套用。\
+taskId 不得为 null，也禁止创造名称。先比较完整的“分类 / 项目 / 任务”路径，再提交最末级任务 ID。证据不足时仍选择最合理的已有具体任务，但 confidence 不得高于 0.65，并在 evidence 中说明不确定依据。冲突记忆不强行套用。\
 confidence 校准：精确个人记忆且无冲突 0.92-0.98；两个独立强线索 0.86-0.93；主要靠连续上下文 0.72-0.85；猜测不高于 0.65。\
 summary 用不超过 30 个汉字描述实际事务；evidence 最多 3 项，只保留决定性证据。只输出符合 JSON Schema 的 JSON。"
 }
@@ -457,14 +458,20 @@ fn review_payload(input: &AiReviewInput<'_>) -> Value {
                 "name": item.name,
                 "category": item.category,
             })).collect::<Vec<_>>(),
-            "tasks": input.tasks.iter()
+            "taskChoices": input.tasks.iter()
                 .filter(|task| is_concrete_review_task(task))
-                .map(|item| json!({
-                    "id": item.id,
-                    "projectId": item.project_id,
-                    "title": item.title,
-                    "status": item.status,
-                })).collect::<Vec<_>>(),
+                .filter_map(|task| {
+                    let project = input.projects.iter().find(|project| project.id == task.project_id)?;
+                    Some(json!({
+                        "taskId": task.id,
+                        "taskTitle": task.title,
+                        "projectId": project.id,
+                        "projectName": project.name,
+                        "category": project.category,
+                        "path": format!("{} / {} / {}", project.category, project.name, task.title),
+                        "status": task.status,
+                    }))
+                }).collect::<Vec<_>>(),
         }
     })
 }
@@ -597,9 +604,7 @@ fn review_schema(session_ids: &[String], task_ids: &[String]) -> Value {
                     "type": "object",
                     "properties": {
                         "sessionId": {"type": "string", "enum": session_ids},
-                        "projectId": {"type": ["string", "null"]},
                         "taskId": {"type": "string", "enum": task_ids},
-                        "category": {"type": "string"},
                         "summary": {"type": "string"},
                         "confidence": {"type": "number"},
                         "evidence": {
@@ -617,7 +622,7 @@ fn review_schema(session_ids: &[String], task_ids: &[String]) -> Value {
                             }
                         }
                     },
-                    "required": ["sessionId", "projectId", "taskId", "category", "summary", "confidence", "evidence"],
+                    "required": ["sessionId", "taskId", "summary", "confidence", "evidence"],
                     "additionalProperties": false
                 }
             }
@@ -780,11 +785,11 @@ pub(crate) fn concrete_review_task_ids(tasks: &[Task]) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-fn is_concrete_review_task(task: &Task) -> bool {
+pub(crate) fn is_concrete_review_task(task: &Task) -> bool {
     task.status == "active" && !is_placeholder_task_title(&task.title)
 }
 
-fn is_placeholder_task_title(title: &str) -> bool {
+pub(crate) fn is_placeholder_task_title(title: &str) -> bool {
     let normalized = title.trim().to_lowercase().replace([' ', '_', '-'], "");
     matches!(
         normalized.as_str(),
@@ -797,10 +802,18 @@ fn is_placeholder_task_title(title: &str) -> bool {
             | "其他"
             | "未指定"
             | "暂不指定"
+            | "未分配"
+            | "未归属"
             | "未归类"
+            | "未分类"
+            | "无任务"
+            | "默认任务"
+            | "未归属任务"
             | "未归类任务"
             | "未归类活动整理"
+            | "其它"
             | "待分类"
+            | "待归类"
             | "待复核"
     )
 }
@@ -1165,8 +1178,15 @@ mod tests {
             1
         );
         assert_eq!(payload["catalog"]["projects"].as_array().unwrap().len(), 1);
-        assert_eq!(payload["catalog"]["tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(payload["catalog"]["tasks"][0]["id"], "task");
+        assert_eq!(
+            payload["catalog"]["taskChoices"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(payload["catalog"]["taskChoices"][0]["taskId"], "task");
+        assert_eq!(
+            payload["catalog"]["taskChoices"][0]["path"],
+            "保研 / 推免 / 成果填报"
+        );
         assert_eq!(payload["reviewItems"][0]["events"][0]["page"], "成果填报群");
         assert_eq!(payload["personalMemory"].as_array().unwrap().len(), 1);
         assert_eq!(payload["personalMemory"][0]["targetSessionId"], "target");
@@ -1190,6 +1210,12 @@ mod tests {
             schema["properties"]["results"]["items"]["properties"]["taskId"]["enum"],
             json!(["task-a", "task-b"])
         );
+        assert!(schema["properties"]["results"]["items"]["properties"]
+            .get("projectId")
+            .is_none());
+        assert!(schema["properties"]["results"]["items"]["properties"]
+            .get("category")
+            .is_none());
     }
 
     #[test]
@@ -1471,6 +1497,66 @@ mod tests {
         validate_result(&mut result, &input).expect("repair hierarchy from task");
         assert_eq!(result.project_id.as_deref(), Some("iot-project"));
         assert_eq!(result.category, "学习");
+    }
+
+    #[test]
+    fn task_only_ai_output_derives_the_complete_hierarchy() {
+        let target = WorkSession {
+            id: "target".into(),
+            started_at: "2026-07-14T10:00:00Z".into(),
+            ended_at: "2026-07-14T10:02:00Z".into(),
+            project_id: None,
+            project_name: None,
+            task_id: None,
+            task_title: None,
+            category: "杂务".into(),
+            summary: "WPS".into(),
+            confidence: 0.55,
+            evidence: vec![],
+            user_confirmed: false,
+            source: "context-complete".into(),
+        };
+        let categories = vec![CategoryOption {
+            name: "保研".into(),
+            color: "#fff".into(),
+            is_builtin: false,
+        }];
+        let projects = vec![Project {
+            id: "project".into(),
+            name: "推免".into(),
+            category: "保研".into(),
+            source: "manual".into(),
+            color: "#fff".into(),
+            description: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let tasks = vec![Task {
+            id: "task".into(),
+            project_id: "project".into(),
+            title: "成果填报".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let targets = vec![target];
+        let input = sample_input(&targets, &[], &[], &categories, &projects, &tasks);
+        let content = r#"{
+          "results": [{
+            "sessionId": "target",
+            "taskId": "task",
+            "summary": "填写推免成果",
+            "confidence": 0.93,
+            "evidence": []
+          }]
+        }"#;
+
+        let batch = parse_and_validate(content, &input).expect("task-only result");
+        assert_eq!(batch.results[0].task_id.as_deref(), Some("task"));
+        assert_eq!(batch.results[0].project_id.as_deref(), Some("project"));
+        assert_eq!(batch.results[0].category, "保研");
     }
 
     #[tokio::test]
