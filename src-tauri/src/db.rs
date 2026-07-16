@@ -17,13 +17,13 @@ const IDLE_BOUNDARY_MIGRATION_KEY: &str = "migration_idle_boundary_v1";
 const PERSONAL_MEMORY_MIGRATION_KEY: &str = "migration_personal_memory_v1";
 const PERSONAL_MEMORY_CONSENSUS_MIGRATION_KEY: &str = "migration_personal_memory_consensus_v2";
 const PERSONAL_MEMORY_BATCH_MIGRATION_KEY: &str = "migration_personal_memory_batch_v3";
+const PERSONAL_MEMORY_COHERENCE_MIGRATION_KEY: &str = "migration_personal_memory_quality_v5";
 const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repair_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
-const AI_MEMORY_MIN_CONFIDENCE: f32 = 0.92;
 const LAST_CORRECTION_UNDO_FILE: &str = "last-correction-undo.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +180,7 @@ impl AppDb {
         db.migrate_process_file_memories()?;
         db.migrate_personal_memory_consensus()?;
         db.migrate_personal_memory_batches()?;
+        db.migrate_personal_memory_coherence()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
@@ -3239,15 +3240,24 @@ impl AppDb {
         started_at: &str,
         ended_at: &str,
     ) -> Result<Vec<RawActivityEvent>> {
+        self.list_raw_events_between_with_limit(started_at, ended_at, 500)
+    }
+
+    fn list_raw_events_between_with_limit(
+        &self,
+        started_at: &str,
+        ended_at: &str,
+        limit: i64,
+    ) -> Result<Vec<RawActivityEvent>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(r#"
             SELECT id,source,timestamp,app,window_title,url,file_path,workspace,input_stats_json,metadata_json
             FROM raw_events
             WHERE timestamp >= ?1 AND timestamp <= ?2
             ORDER BY timestamp ASC
-            LIMIT 500
+            LIMIT ?3
         "#)?;
-        let rows = stmt.query_map(params![started_at, ended_at], |r| {
+        let rows = stmt.query_map(params![started_at, ended_at, limit], |r| {
             let input_stats_json: String = r.get(8)?;
             let metadata_json: String = r.get(9)?;
             Ok(RawActivityEvent {
@@ -3664,6 +3674,28 @@ impl AppDb {
         Ok(())
     }
 
+    fn migrate_personal_memory_coherence(&self) -> Result<()> {
+        let already_migrated = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PERSONAL_MEMORY_COHERENCE_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        self.rebuild_personal_memory_from_confirmed()?;
+        self.conn.lock().execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PERSONAL_MEMORY_COHERENCE_MIGRATION_KEY, now()],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn rebuild_personal_memory_from_confirmed(&self) -> Result<u32> {
         self.conn
             .lock()
@@ -3711,6 +3743,16 @@ impl AppDb {
             values
         };
 
+        let all_events = sessions
+            .iter()
+            .map(|session| (session.started_at.as_str(), session.ended_at.as_str()))
+            .reduce(|range, value| (range.0.min(value.0), range.1.max(value.1)))
+            .map(|(started_at, ended_at)| {
+                self.list_raw_events_between_with_limit(started_at, ended_at, i64::MAX)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         let mut candidates = Vec::new();
         for session in sessions {
             self.delete_personal_memory(&session.id)?;
@@ -3728,8 +3770,15 @@ impl AppDb {
             if session.project_name.is_none() || session.task_title.is_none() {
                 continue;
             }
-            let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
-            let features = crate::memory::features_from_session(session, &events);
+            let first_event = all_events
+                .partition_point(|event| event.timestamp.as_str() < session.started_at.as_str());
+            let after_last_event = all_events
+                .partition_point(|event| event.timestamp.as_str() <= session.ended_at.as_str());
+            let events = &all_events[first_event..after_last_event];
+            if crate::memory::has_ambiguous_session_context(session, events) {
+                continue;
+            }
+            let features = crate::memory::features_from_session(session, events);
             if !crate::memory::is_discriminative(&features) {
                 continue;
             }
@@ -3758,12 +3807,41 @@ impl AppDb {
 
         let mut group_counts = HashMap::<String, usize>::new();
         let mut feature_counts = HashMap::<(String, String), usize>::new();
+        let mut latest_feature_assignments =
+            HashMap::<String, (String, HashSet<String>)>::new();
         for candidate in &candidates {
             if candidate.session.user_confirmed {
                 *group_counts.entry(candidate.group_key.clone()).or_default() += 1;
                 *feature_counts
                     .entry((candidate.group_key.clone(), candidate.feature_key.clone()))
                     .or_default() += 1;
+                let assignment = format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    candidate.session.category,
+                    candidate.session.project_id.as_deref().unwrap_or_default(),
+                    candidate.session.task_id.as_deref().unwrap_or_default()
+                );
+                match latest_feature_assignments.get_mut(&candidate.feature_key) {
+                    Some((latest_at, assignments))
+                        if candidate.confirmed_at.as_str() > latest_at.as_str() =>
+                    {
+                        *latest_at = candidate.confirmed_at.clone();
+                        assignments.clear();
+                        assignments.insert(assignment);
+                    }
+                    Some((latest_at, assignments))
+                        if candidate.confirmed_at.as_str() == latest_at.as_str() =>
+                    {
+                        assignments.insert(assignment);
+                    }
+                    Some(_) => {}
+                    None => {
+                        latest_feature_assignments.insert(
+                            candidate.feature_key.clone(),
+                            (candidate.confirmed_at.clone(), HashSet::from([assignment])),
+                        );
+                    }
+                }
             }
         }
 
@@ -3787,10 +3865,23 @@ impl AppDb {
                     .unwrap_or_default(),
                 candidate.session.task_title.as_deref().unwrap_or_default(),
             );
-            let keep = !candidate.session.user_confirmed
+            let assignment = format!(
+                "{}\u{1f}{}\u{1f}{}",
+                candidate.session.category,
+                candidate.session.project_id.as_deref().unwrap_or_default(),
+                candidate.session.task_id.as_deref().unwrap_or_default()
+            );
+            let is_current_intent = !candidate.session.user_confirmed
+                || latest_feature_assignments
+                    .get(&candidate.feature_key)
+                    .is_some_and(|(_, assignments)| {
+                        assignments.len() == 1 && assignments.contains(&assignment)
+                    });
+            let keep = is_current_intent
+                && (!candidate.session.user_confirmed
                 || manual_group_size <= 1
                 || repeated_context
-                || assignment_anchored;
+                || assignment_anchored);
             if keep {
                 stored += u32::from(self.store_personal_memory(
                     candidate.session,
@@ -3819,6 +3910,10 @@ impl AppDb {
             return Ok(false);
         }
         let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
+        if crate::memory::has_ambiguous_session_context(session, &events) {
+            self.delete_personal_memory(&session.id)?;
+            return Ok(false);
+        }
         let features = crate::memory::features_from_session(session, &events);
         if !crate::memory::is_discriminative(&features) {
             self.delete_personal_memory(&session.id)?;
@@ -4855,8 +4950,7 @@ fn is_auto_session_source(source: &str) -> bool {
 fn is_idle_session(session: &WorkSession, settings: &AppSettings) -> bool {
     session.source == "collector-idle"
         || session.summary.trim() == "离开/空闲"
-        || (session.task_id.is_none()
-            && session.category == settings.idle_category
+        || (session.category == settings.idle_category
             && session.project_name.as_deref() == Some(settings.idle_project_name.as_str()))
 }
 
@@ -4881,17 +4975,10 @@ fn ai_prompt_idle_session_ids(prompt: &str, settings: &AppSettings) -> HashSet<S
                 .get("summary")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|value| value.trim() == "离开/空闲");
-            let source_is_idle = target
-                .get("source")
-                .and_then(serde_json::Value::as_str)
-                == Some("collector-idle");
-            let configured_idle_target = target
-                .get("taskId")
-                .is_none_or(serde_json::Value::is_null)
-                && target
-                    .get("category")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(settings.idle_category.as_str())
+            let source_is_idle =
+                target.get("source").and_then(serde_json::Value::as_str) == Some("collector-idle");
+            let configured_idle_target = target.get("category").and_then(serde_json::Value::as_str)
+                == Some(settings.idle_category.as_str())
                 && target
                     .get("projectName")
                     .and_then(serde_json::Value::as_str)
@@ -4908,8 +4995,8 @@ fn ai_prompt_idle_session_ids(prompt: &str, settings: &AppSettings) -> HashSet<S
 }
 
 fn is_reliable_memory_session(session: &WorkSession) -> bool {
-    session.user_confirmed
-        || (session.source == "ai-review" && session.confidence >= AI_MEMORY_MIN_CONFIDENCE)
+    !matches!(session.source.as_str(), "manual-entry" | "manual-merge")
+        && session.user_confirmed
 }
 
 fn is_task_overlay_session(session: &WorkSession) -> bool {
@@ -5295,7 +5382,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_review_updates_the_target_in_place_without_creating_an_overlap() {
+    fn ai_review_updates_in_place_but_never_trains_itself_as_personal_memory() {
         let data_dir =
             std::env::temp_dir().join(format!("screenuse-ai-in-place-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
@@ -5349,7 +5436,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("count AI memories"),
-            1
+            0
         );
         let mut follow_up = context_event(
             "ai-memory-target",
@@ -5385,11 +5472,11 @@ mod tests {
         );
         second_repeat.metadata["activePageTitle"] =
             serde_json::Value::String("成果填报群".into());
-        let learned = classification::ingest_event(&db, &second_repeat)
-            .expect("ingest corroborated AI context")
-            .expect("corroborated AI session");
-        assert_eq!(learned.task_id.as_deref(), Some(task.id.as_str()));
-        assert!(learned
+        let still_unresolved = classification::ingest_event(&db, &second_repeat)
+            .expect("ingest repeated AI context")
+            .expect("repeated AI session");
+        assert!(still_unresolved.task_id.is_none());
+        assert!(!still_unresolved
             .evidence
             .iter()
             .any(|item| item.kind == "personal-memory"));
@@ -8105,5 +8192,151 @@ mod tests {
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn synthetic_manual_ranges_never_become_context_memories() {
+        let mut session = WorkSession {
+            id: "synthetic".into(),
+            started_at: "2026-07-16T10:00:00Z".into(),
+            ended_at: "2026-07-16T10:10:00Z".into(),
+            project_id: Some("project".into()),
+            project_name: Some("项目".into()),
+            task_id: Some("task".into()),
+            task_title: Some("任务".into()),
+            category: "学习".into(),
+            summary: "手动补录".into(),
+            confidence: 1.0,
+            evidence: Vec::new(),
+            user_confirmed: true,
+            source: "manual-entry".into(),
+        };
+        assert!(!is_reliable_memory_session(&session));
+        session.source = "manual-merge".into();
+        assert!(!is_reliable_memory_session(&session));
+        session.source = "manual-correction".into();
+        assert!(is_reliable_memory_session(&session));
+    }
+
+    #[test]
+    fn configured_idle_target_is_idle_even_with_a_concrete_task() {
+        let settings = AppSettings::default().normalized();
+        let session = WorkSession {
+            id: "idle".into(),
+            started_at: "2026-07-16T10:00:00Z".into(),
+            ended_at: "2026-07-16T10:03:00Z".into(),
+            project_id: Some("idle-project".into()),
+            project_name: Some(settings.idle_project_name.clone()),
+            task_id: Some("nothing".into()),
+            task_title: Some("nothing".into()),
+            category: settings.idle_category.clone(),
+            summary: "会议中未操作".into(),
+            confidence: 0.95,
+            evidence: Vec::new(),
+            user_confirmed: false,
+            source: "ai-review".into(),
+        };
+        assert!(is_idle_session(&session, &settings));
+    }
+
+    #[test]
+    #[ignore = "requires SCREENUSE_REPLAY_DATA_DIR pointing to a copied real ledger"]
+    fn replay_personal_memory_against_real_corrections() {
+        let data_dir = std::env::var("SCREENUSE_REPLAY_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("set SCREENUSE_REPLAY_DATA_DIR to a copied ledger directory");
+        let db = AppDb::open_in(data_dir).expect("open replay database");
+        db.rebuild_personal_memory_from_confirmed()
+            .expect("rebuild coherent memories");
+        let records = db.load_personal_memories().expect("load memories");
+        let targets = records
+            .iter()
+            .filter(|record| record.user_confirmed)
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty(), "replay ledger has no manual corrections");
+
+        let evaluate = |chronological: bool| {
+            let mut predicted = 0_usize;
+            let mut correct = 0_usize;
+            let mut errors = Vec::new();
+            let mut abstentions = Vec::new();
+            for target in &targets {
+                let pool = records
+                    .iter()
+                    .filter(|candidate| candidate.session_id != target.session_id)
+                    .filter(|candidate| {
+                        !chronological || candidate.confirmed_at < target.confirmed_at
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let Some(decision) = crate::memory::choose_assignment(&target.features, &pool)
+                else {
+                    if abstentions.len() < 20 {
+                        abstentions.push(format!(
+                            "{} | {:?} (expected {}/{}/{})",
+                            target.session_id,
+                            target.features,
+                            target.category,
+                            target.project_id,
+                            target.task_id
+                        ));
+                    }
+                    continue;
+                };
+                predicted += 1;
+                if decision.category == target.category
+                    && decision.project_id == target.project_id
+                    && decision.task_id == target.task_id
+                {
+                    correct += 1;
+                } else if errors.len() < 20 {
+                    errors.push(format!(
+                        "{} | {:?} -> {}/{}/{} (expected {}/{}/{})",
+                        target.session_id,
+                        target.features,
+                        decision.category,
+                        decision.project_id,
+                        decision.task_id,
+                        target.category,
+                        target.project_id,
+                        target.task_id
+                    ));
+                }
+            }
+            let coverage = predicted as f64 / targets.len() as f64;
+            let precision = if predicted == 0 {
+                0.0
+            } else {
+                correct as f64 / predicted as f64
+            };
+            let overall = correct as f64 / targets.len() as f64;
+            (
+                predicted,
+                correct,
+                coverage,
+                precision,
+                overall,
+                errors,
+                abstentions,
+            )
+        };
+
+        for (label, chronological) in [("leave-one-out", false), ("chronological", true)] {
+            let (predicted, correct, coverage, precision, overall, errors, abstentions) =
+                evaluate(chronological);
+            eprintln!(
+                "{label}: targets={} predicted={predicted} correct={correct} coverage={:.2}% precision={:.2}% overall={:.2}%",
+                targets.len(),
+                coverage * 100.0,
+                precision * 100.0,
+                overall * 100.0
+            );
+            for error in errors {
+                eprintln!("  {error}");
+            }
+            for abstention in abstentions {
+                eprintln!("  abstain: {abstention}");
+            }
+        }
     }
 }

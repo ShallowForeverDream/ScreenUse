@@ -148,7 +148,7 @@ pub async fn analyze_with_codex_account(
         .iter()
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-    let task_ids = active_task_ids(input.tasks)?;
+    let task_ids = concrete_review_task_ids(input.tasks)?;
     let response = request_with_codex_account(
         settings,
         system_prompt,
@@ -391,7 +391,7 @@ fn hide_console(_command: &mut Command) {}
 pub(crate) fn review_instructions() -> &'static str {
     "你是单人电脑时间账本的层级归类器。不要调用工具、读取文件或联网，只分析输入 JSON。\
 按 reviewItems 原顺序，为每个 targetSession.sessionId 返回且只返回一个结果；sessionId 是不透明字符串，必须逐字复制。\
-当前 category/project/task/confidence 只是旧系统建议，不是事实。只能选择 catalog 中已有值；每个结果都必须选择一个 status=active 的具体 taskId，禁止只返回分类或项目。taskId 必须属于 projectId，projectId 必须属于 category。\
+当前 category/project/task/confidence 只是旧系统建议，不是事实。只能选择 catalog 中已有值；每个结果都必须选择一个 status=active 的具体 taskId，禁止只返回分类或项目，也禁止选择 others、nothing、未归类、未指定、其他等兜底任务。taskId 必须属于 projectId，projectId 必须属于 category。\
 决策优先级：① personalMemory 中与当前页面、对话标题、工作区、文件或域名高度相似且由用户确认的例子；② 当前页面/文档/工作区等直接线索；\
 ③ timelineContext 中紧邻且已确认的同一事务连续性；④ 应用名只作弱证据。Explorer、浏览器、QQ、微信、WPS、截图工具和终端可能只是同一任务的工具切换。\
 taskId、projectId、category 都必须来自 catalog，taskId 不得为 null，也禁止创造名称。证据不足时仍选择最合理的已有具体任务，但 confidence 不得高于 0.65，并在 evidence 中说明不确定依据。冲突记忆不强行套用。\
@@ -457,12 +457,14 @@ fn review_payload(input: &AiReviewInput<'_>) -> Value {
                 "name": item.name,
                 "category": item.category,
             })).collect::<Vec<_>>(),
-            "tasks": input.tasks.iter().map(|item| json!({
-                "id": item.id,
-                "projectId": item.project_id,
-                "title": item.title,
-                "status": item.status,
-            })).collect::<Vec<_>>(),
+            "tasks": input.tasks.iter()
+                .filter(|task| is_concrete_review_task(task))
+                .map(|item| json!({
+                    "id": item.id,
+                    "projectId": item.project_id,
+                    "title": item.title,
+                    "status": item.status,
+                })).collect::<Vec<_>>(),
         }
     })
 }
@@ -731,8 +733,10 @@ fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) 
     let task = input
         .tasks
         .iter()
-        .find(|task| task.id == task_id && task.status == "active")
-        .ok_or_else(|| anyhow!("AI returned unknown or inactive taskId: {task_id}"))?;
+        .find(|task| task.id == task_id && is_concrete_review_task(task))
+        .ok_or_else(|| {
+            anyhow!("AI returned an unknown, inactive, or placeholder taskId: {task_id}")
+        })?;
     let project = input
         .projects
         .iter()
@@ -762,18 +766,43 @@ fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) 
     Ok(())
 }
 
-fn active_task_ids(tasks: &[Task]) -> Result<Vec<String>> {
+pub(crate) fn concrete_review_task_ids(tasks: &[Task]) -> Result<Vec<String>> {
     let ids = tasks
         .iter()
-        .filter(|task| task.status == "active")
+        .filter(|task| is_concrete_review_task(task))
         .map(|task| task.id.clone())
         .collect::<Vec<_>>();
     if ids.is_empty() {
         return Err(anyhow!(
-            "AI review requires at least one active task in the catalog"
+            "AI review requires at least one active, concrete task in the catalog"
         ));
     }
     Ok(ids)
+}
+
+fn is_concrete_review_task(task: &Task) -> bool {
+    task.status == "active" && !is_placeholder_task_title(&task.title)
+}
+
+fn is_placeholder_task_title(title: &str) -> bool {
+    let normalized = title.trim().to_lowercase().replace([' ', '_', '-'], "");
+    matches!(
+        normalized.as_str(),
+        "" | "other"
+            | "others"
+            | "none"
+            | "nothing"
+            | "unknown"
+            | "unassigned"
+            | "其他"
+            | "未指定"
+            | "暂不指定"
+            | "未归类"
+            | "未归类任务"
+            | "未归类活动整理"
+            | "待分类"
+            | "待复核"
+    )
 }
 
 fn compatible_missing_task<'a>(
@@ -789,8 +818,8 @@ fn compatible_missing_task<'a>(
     if let Some(task_id) = target.task_id.as_deref() {
         if let Some(task) = input.tasks.iter().find(|task| {
             task.id == task_id
-                && task.status == "active"
-                && project_id.is_none_or(|project_id| task.project_id == project_id)
+                && is_concrete_review_task(task)
+                && project_id.map_or(true, |project_id| task.project_id == project_id)
         }) {
             return Some(task);
         }
@@ -798,14 +827,14 @@ fn compatible_missing_task<'a>(
 
     let mut remembered = input.memories.iter().filter(|memory| {
         memory.target_session_id == result.session_id
-            && project_id.is_none_or(|project_id| memory.project_id == project_id)
+            && project_id.map_or(true, |project_id| memory.project_id == project_id)
     });
     if let Some(memory) = remembered.next() {
         if remembered.next().is_none() || memory.similarity >= 0.9 {
             if let Some(task) = input.tasks.iter().find(|task| {
                 task.id == memory.task_id
-                    && task.status == "active"
-                    && project_id.is_none_or(|project_id| task.project_id == project_id)
+                    && is_concrete_review_task(task)
+                    && project_id.map_or(true, |project_id| task.project_id == project_id)
             }) {
                 return Some(task);
             }
@@ -816,7 +845,7 @@ fn compatible_missing_task<'a>(
     let mut tasks = input
         .tasks
         .iter()
-        .filter(|task| task.status == "active" && task.project_id == project_id);
+        .filter(|task| is_concrete_review_task(task) && task.project_id == project_id);
     let only = tasks.next()?;
     tasks.next().is_none().then_some(only)
 }
@@ -1029,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_contains_neighbor_sessions_and_the_complete_catalog() {
+    fn payload_contains_neighbor_sessions_and_only_concrete_tasks() {
         let target = WorkSession {
             id: "target".into(),
             started_at: "2026-07-14T10:00:00Z".into(),
@@ -1085,11 +1114,14 @@ mod tests {
             input_stats: InputStats::default(),
             metadata: json!({"activePageTitle": "成果填报群"}),
         };
+        let mut placeholder_task = task.clone();
+        placeholder_task.id = "placeholder".into();
+        placeholder_task.title = "others".into();
         let targets = vec![target];
         let contexts = vec![context];
         let events = vec![event];
         let projects = vec![project];
-        let tasks = vec![task];
+        let tasks = vec![task, placeholder_task];
         let memories = vec![RetrievedMemoryExample {
             target_session_id: "target".into(),
             observed: ContextFeatures {
@@ -1134,6 +1166,7 @@ mod tests {
         );
         assert_eq!(payload["catalog"]["projects"].as_array().unwrap().len(), 1);
         assert_eq!(payload["catalog"]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["catalog"]["tasks"][0]["id"], "task");
         assert_eq!(payload["reviewItems"][0]["events"][0]["page"], "成果填报群");
         assert_eq!(payload["personalMemory"].as_array().unwrap().len(), 1);
         assert_eq!(payload["personalMemory"][0]["targetSessionId"], "target");
@@ -1156,6 +1189,32 @@ mod tests {
         assert_eq!(
             schema["properties"]["results"]["items"]["properties"]["taskId"]["enum"],
             json!(["task-a", "task-b"])
+        );
+    }
+
+    #[test]
+    fn concrete_review_tasks_exclude_catch_all_placeholders() {
+        let task = |id: &str, title: &str, status: &str| Task {
+            id: id.into(),
+            project_id: "project".into(),
+            title: title.into(),
+            status: status.into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        };
+        let tasks = vec![
+            task("specific", "成果填报", "active"),
+            task("others", "others", "active"),
+            task("nothing", "nothing", "active"),
+            task("unassigned", "未归类活动整理", "active"),
+            task("inactive", "历史任务", "archived"),
+        ];
+
+        assert_eq!(
+            concrete_review_task_ids(&tasks).expect("one concrete task"),
+            vec!["specific"]
         );
     }
 

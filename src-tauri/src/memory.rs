@@ -117,69 +117,109 @@ pub fn features_from_session(
     session: &WorkSession,
     events: &[RawActivityEvent],
 ) -> ContextFeatures {
-    let latest = events.last();
-    let page = events
+    // A compacted work session can cover several raw foreground events.  Do not
+    // combine the page from one application with the workspace/file of another:
+    // that creates impossible memories such as `screenuse + IOT week1 + HDU`.
+    // The session's original app evidence is the anchor; only raw events from
+    // that application may contribute additional fields.
+    let evidence_app = first_evidence_value(&session.evidence, "app");
+    let primary_app = primary_session_app(session, events);
+    let coherent_events = events
         .iter()
-        .rev()
-        .find_map(|event| {
-            event
-                .metadata
-                .get("activePageTitle")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    event
-                        .metadata
-                        .get("chatgptConversationTitle")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .filter(|value| !value.trim().is_empty())
+        .filter(|event| {
+            primary_app.is_empty()
+                || event
+                    .app
+                    .as_deref()
+                    .is_some_and(|app| canonical_app(app) == primary_app)
         })
-        .or_else(|| evidence_value(&session.evidence, "page"))
-        .unwrap_or_default();
-    let window = latest
-        .and_then(|event| event.window_title.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| evidence_value(&session.evidence, "window"))
-        .unwrap_or_default();
-    let app = latest
-        .and_then(|event| event.app.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| evidence_value(&session.evidence, "app"))
-        .unwrap_or_default();
-    let url = events
+        .collect::<Vec<_>>();
+    if let Some(event) = coherent_events
         .iter()
-        .rev()
-        .find_map(|event| {
-            event
-                .url
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| evidence_value(&session.evidence, "url"))
-        .unwrap_or_default();
-    let workspace = events
+        .enumerate()
+        .max_by_key(|(index, event)| (assignment_event_score(session, event), *index))
+        .map(|(_, event)| *event)
+    {
+        return features_from_event(event);
+    }
+    build_features(
+        evidence_app.unwrap_or_default(),
+        first_evidence_value(&session.evidence, "page").unwrap_or_default(),
+        first_evidence_value(&session.evidence, "window").unwrap_or_default(),
+        first_evidence_value(&session.evidence, "url").unwrap_or_default(),
+        first_evidence_value(&session.evidence, "workspace").unwrap_or_default(),
+        first_evidence_value(&session.evidence, "file").unwrap_or_default(),
+    )
+}
+
+pub fn has_ambiguous_session_context(
+    session: &WorkSession,
+    events: &[RawActivityEvent],
+) -> bool {
+    let primary_app = primary_session_app(session, events);
+    let contexts = events
         .iter()
-        .rev()
-        .find_map(|event| {
-            event
-                .workspace
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
+        .filter(|event| {
+            primary_app.is_empty()
+                || event
+                    .app
+                    .as_deref()
+                    .is_some_and(|app| canonical_app(app) == primary_app)
         })
-        .or_else(|| evidence_value(&session.evidence, "workspace"))
-        .unwrap_or_default();
-    let file = events
+        .map(features_from_event)
+        .filter_map(|features| {
+            if !features.page.is_empty() {
+                Some(features.page)
+            } else if !features.window.is_empty() && !is_generic(&features.window) {
+                Some(features.window)
+            } else {
+                None
+            }
+        })
+        .collect::<HashSet<_>>();
+    contexts.len() > 1
+}
+
+fn primary_session_app(session: &WorkSession, events: &[RawActivityEvent]) -> String {
+    first_evidence_value(&session.evidence, "app")
+        .map(canonical_app)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            events.iter().rev().find_map(|event| {
+                event
+                    .app
+                    .as_deref()
+                    .map(canonical_app)
+                    .filter(|value| !value.is_empty())
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn assignment_event_score(session: &WorkSession, event: &RawActivityEvent) -> u8 {
+    let features = features_from_event(event);
+    let task_match = session.task_title.as_deref().is_some_and(|task| {
+        !task.trim().is_empty() && relates_to_assignment(&features, "", task)
+    });
+    let project_match = session.project_name.as_deref().is_some_and(|project| {
+        !project.trim().is_empty() && relates_to_assignment(&features, project, "")
+    });
+    u8::from(task_match) * 2 + u8::from(project_match)
+}
+
+fn canonical_app(value: &str) -> String {
+    let normalized = normalize(value.trim());
+    normalized
+        .strip_suffix(".exe")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn first_evidence_value<'a>(evidence: &'a [EvidenceItem], kind: &str) -> Option<&'a str> {
+    evidence
         .iter()
-        .rev()
-        .find_map(|event| {
-            event
-                .file_path
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| evidence_value(&session.evidence, "file"))
-        .unwrap_or_default();
-    build_features(app, page, window, url, workspace, file)
+        .find(|item| item.kind == kind && !item.value.trim().is_empty())
+        .map(|item| item.value.as_str())
 }
 
 pub fn features_from_session_evidence(session: &WorkSession) -> ContextFeatures {
@@ -530,7 +570,7 @@ fn build_features(
     workspace: &str,
     file: &str,
 ) -> ContextFeatures {
-    let app = normalize(app.trim_end_matches(".exe"));
+    let app = canonical_app(app);
     let page = canonical_context(page);
     let window = canonical_context(window);
     let domain = domain_from_url(url);
@@ -551,15 +591,6 @@ fn build_features(
         file,
         tokens,
     }
-}
-
-fn evidence_value<'a>(evidence: &'a [EvidenceItem], kind: &str) -> Option<&'a str> {
-    evidence
-        .iter()
-        .filter(|item| item.kind == kind)
-        .max_by(|left, right| left.weight.total_cmp(&right.weight))
-        .map(|item| item.value.as_str())
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn similarity(query: &ContextFeatures, memory: &ContextFeatures) -> Similarity {
@@ -765,6 +796,100 @@ mod tests {
             confirmed_at: "2026-07-15T10:00:00Z".into(),
             user_confirmed: true,
         }
+    }
+
+    fn observed_session(app: &str, page: &str) -> WorkSession {
+        WorkSession {
+            id: "session".into(),
+            started_at: "2026-07-15T10:00:00Z".into(),
+            ended_at: "2026-07-15T10:01:00Z".into(),
+            project_id: Some("project".into()),
+            project_name: Some("项目".into()),
+            task_id: Some("task".into()),
+            task_title: Some("任务".into()),
+            category: "开发".into(),
+            summary: page.into(),
+            confidence: 1.0,
+            evidence: vec![
+                EvidenceItem {
+                    kind: "page".into(),
+                    label: "当前页面".into(),
+                    value: page.into(),
+                    weight: 0.82,
+                },
+                EvidenceItem {
+                    kind: "app".into(),
+                    label: "应用".into(),
+                    value: app.into(),
+                    weight: 0.5,
+                },
+            ],
+            user_confirmed: true,
+            source: "manual-correction".into(),
+        }
+    }
+
+    #[test]
+    fn session_memory_never_mixes_context_from_different_apps() {
+        let session = observed_session("ScreenUse.exe", "ScreenUse");
+        let mut chatgpt = event("ChatGPT.exe", "IOT week1");
+        chatgpt.workspace = Some("D:/MY_PROJECT/HDU".into());
+        let screenuse = event("ScreenUse.exe", "ScreenUse");
+
+        let features = features_from_session(&session, &[chatgpt, screenuse]);
+
+        assert_eq!(features.app, "screenuse");
+        assert_ne!(features.page, "iot week1");
+        assert!(features.workspace.is_empty());
+    }
+
+    #[test]
+    fn qq_memory_keeps_qq_page_without_leaking_chatgpt_workspace() {
+        let session = observed_session("QQ.exe", "保研成果填报群");
+        let mut chatgpt = event("ChatGPT.exe", "ScreenUse开发");
+        chatgpt.workspace = Some("D:/MY_PROJECT/ScreenUse".into());
+        let qq = event("QQ.exe", "保研成果填报群");
+
+        let features = features_from_session(&session, &[chatgpt, qq]);
+
+        assert_eq!(features.app, "qq");
+        assert_eq!(features.page, "保研成果填报群");
+        assert!(features.workspace.is_empty());
+    }
+
+    #[test]
+    fn coherent_chatgpt_event_preserves_conversation_and_workspace() {
+        let mut session = observed_session("ChatGPT.exe", "");
+        session.evidence.retain(|item| item.kind == "app");
+        let mut chatgpt = event("ChatGPT.exe", "codex_work_bridge");
+        chatgpt.workspace = Some("D:/MY_PROJECT/HDU".into());
+
+        let features = features_from_session(&session, &[chatgpt]);
+
+        assert_eq!(features.app, "chatgpt");
+        assert_eq!(features.page, "codex work bridge");
+        assert!(features.workspace.ends_with("my project/hdu"));
+    }
+
+    #[test]
+    fn multi_page_session_is_not_safe_as_one_permanent_memory() {
+        let session = observed_session("ChatGPT.exe", "连接微信QQ聊天记录");
+        let first = event("ChatGPT.exe", "连接微信QQ聊天记录");
+        let second = event("ChatGPT.exe", "IOT week1");
+        assert!(has_ambiguous_session_context(&session, &[first, second]));
+    }
+
+    #[test]
+    fn assignment_related_event_wins_inside_a_compacted_session() {
+        let mut session = observed_session("ChatGPT.exe", "IOT week1");
+        session.project_name = Some("IOT".into());
+        session.task_title = Some("CVE-2026-44277 复现".into());
+        let first = event("ChatGPT.exe", "IOT week1");
+        let second = event("ChatGPT.exe", "CVE-2026-44277 复现记录");
+
+        let features = features_from_session(&session, &[first, second]);
+
+        assert_eq!(features.page, "cve-2026-44277 复现记录");
     }
 
     #[test]

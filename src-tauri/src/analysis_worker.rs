@@ -21,6 +21,7 @@ const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD: f32 = 0.8;
 const MAX_REVIEW_BATCH: usize = 8;
 const CONTEXT_WINDOW_MINUTES: i64 = 30;
 const MAX_CONTEXT_SESSIONS_PER_TARGET: usize = 24;
+const AUTO_REVIEW_SETTLE_SECONDS: i64 = 20;
 
 static AI_RUN_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
@@ -29,7 +30,7 @@ pub fn start_analysis_worker(db: Arc<AppDb>) {
         loop {
             let settings = db.get_settings().unwrap_or_default().normalized();
             if settings.ai_mode == "auto" {
-                if let Err(error) = enqueue_recent_uncertain(&db) {
+                if let Err(error) = enqueue_settled_recent_uncertain(&db) {
                     eprintln!("ScreenUse optional AI enqueue error: {error}");
                 }
                 if let Err(error) = run_once(db.clone()).await {
@@ -44,6 +45,14 @@ pub fn start_analysis_worker(db: Arc<AppDb>) {
 }
 
 pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
+    enqueue_recent_uncertain_inner(db, false)
+}
+
+fn enqueue_settled_recent_uncertain(db: &AppDb) -> Result<bool> {
+    enqueue_recent_uncertain_inner(db, true)
+}
+
+fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bool> {
     let settings = db.get_settings()?.normalized();
     if settings.ai_mode == "off" {
         return Err(anyhow!("AI 已关闭；本地规则会继续自动归类"));
@@ -56,7 +65,13 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
     let candidates = db
         .list_sessions(2000)?
         .into_iter()
-        .filter(|session| is_review_candidate(session, &settings, &queued))
+        .filter(|session| {
+            if require_settle {
+                is_review_candidate(session, &settings, &queued)
+            } else {
+                is_review_target(session, &settings) && !queued.contains(&session.id)
+            }
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(false);
@@ -347,15 +362,8 @@ async fn maybe_ai(
             .iter()
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
-        let task_ids = input
-            .tasks
-            .iter()
-            .filter(|task| task.status == "active")
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
-        if task_ids.is_empty() {
-            return Err(anyhow!("AI 复核至少需要一个可用的具体任务"));
-        }
+        let task_ids = crate::ai::concrete_review_task_ids(input.tasks)
+            .context("AI 复核至少需要一个可用的具体任务")?;
         return request_with_codex_account(
             settings,
             system_prompt,
@@ -516,14 +524,21 @@ fn is_review_candidate(
     settings: &AppSettings,
     queued: &HashSet<String>,
 ) -> bool {
-    is_review_target(session, settings) && !queued.contains(&session.id)
+    is_review_target(session, settings)
+        && !queued.contains(&session.id)
+        && review_target_has_settled(session, Utc::now())
+}
+
+fn review_target_has_settled(session: &WorkSession, now: DateTime<Utc>) -> bool {
+    parse_time(&session.ended_at).is_ok_and(|ended_at| {
+        now.signed_duration_since(ended_at).num_seconds() >= AUTO_REVIEW_SETTLE_SECONDS
+    })
 }
 
 fn is_review_target(session: &WorkSession, settings: &AppSettings) -> bool {
     let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
-    let has_reviewable_context = crate::memory::is_discriminative(
-        &crate::memory::features_from_session_evidence(session),
-    );
+    let has_reviewable_context =
+        crate::memory::is_discriminative(&crate::memory::features_from_session_evidence(session));
     !session.user_confirmed
         && !is_idle_session(session, settings)
         && session.source != "ai-review"
@@ -539,8 +554,7 @@ fn is_idle_session(session: &WorkSession, settings: &AppSettings) -> bool {
     session.source == "collector-idle"
         || session.summary.trim() == "离开/空闲"
         || session.category == "离开"
-        || (session.task_id.is_none()
-            && session.category == settings.idle_category
+        || (session.category == settings.idle_category
             && session.project_name.as_deref() == Some(settings.idle_project_name.as_str()))
 }
 
@@ -564,11 +578,12 @@ mod tests {
     use super::*;
 
     fn session(duration_seconds: i64) -> WorkSession {
-        let start = Utc::now();
+        let end = Utc::now() - ChronoDuration::seconds(AUTO_REVIEW_SETTLE_SECONDS + 5);
+        let start = end - ChronoDuration::seconds(duration_seconds);
         WorkSession {
             id: "candidate".into(),
             started_at: format_time(start),
-            ended_at: format_time(start + ChronoDuration::seconds(duration_seconds)),
+            ended_at: format_time(end),
             project_id: None,
             project_name: None,
             task_id: None,
@@ -707,8 +722,21 @@ mod tests {
         value.summary = "离开/空闲".into();
         value.project_name = Some(settings.idle_project_name.clone());
         value.project_id = Some("idle-project".into());
-        value.task_id = None;
+        value.task_id = Some("nothing".into());
         assert!(!is_review_candidate(&value, &settings, &queued));
+    }
+
+    #[test]
+    fn automatic_review_waits_until_the_session_has_settled() {
+        let queued = HashSet::new();
+        let settings = review_settings(0, "fallback");
+        let mut value = session(60);
+        value.ended_at = format_time(Utc::now());
+        assert!(!is_review_candidate(&value, &settings, &queued));
+
+        value.ended_at =
+            format_time(Utc::now() - ChronoDuration::seconds(AUTO_REVIEW_SETTLE_SECONDS + 1));
+        assert!(is_review_candidate(&value, &settings, &queued));
     }
 
     #[tokio::test]
