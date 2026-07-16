@@ -134,6 +134,35 @@ pub(crate) fn surrounding_task_assignment(
     }))
 }
 
+pub(crate) fn next_task_assignment_for_helper(
+    db: &AppDb,
+    session: &WorkSession,
+) -> Result<Option<Assignment>> {
+    let Some(context) = db.next_task_context(&session.id, &session.ended_at)? else {
+        return Ok(None);
+    };
+    if !reliable_task_context(&context) {
+        return Ok(None);
+    }
+    let (Some(project_id), Some(task_id)) =
+        (context.project_id.clone(), context.task_id.clone())
+    else {
+        return Ok(None);
+    };
+    let target_end = chrono::DateTime::parse_from_rfc3339(&session.ended_at)?;
+    let next_start = chrono::DateTime::parse_from_rfc3339(&context.boundary_at)?;
+    if (next_start - target_end).num_seconds().max(0) > 5 {
+        return Ok(None);
+    }
+    Ok(Some(Assignment {
+        project_id,
+        task_id: Some(task_id),
+        category: context.category,
+        confidence: if context.user_confirmed { 0.97 } else { 0.94 },
+        specificity: 115,
+    }))
+}
+
 fn recent_task_assignment_with_policy(
     db: &AppDb,
     session: &WorkSession,

@@ -3375,9 +3375,17 @@ impl AppDb {
         } else {
             None
         };
+        let forward_continuity = if !has_overlay_continuity
+            && crate::memory::prefers_next_task_continuity(&features)
+        {
+            classification::next_task_assignment_for_helper(self, &session)?
+        } else {
+            None
+        };
         if !crate::memory::is_discriminative(&features)
             && !has_overlay_continuity
             && surrounding_continuity.is_none()
+            && forward_continuity.is_none()
         {
             return Ok(None);
         }
@@ -3441,10 +3449,18 @@ impl AppDb {
             None
         };
         let has_sandwich_continuity = sandwich_continuity.is_some();
+        let helper_continuity = if decision.task_id.is_none() {
+            forward_continuity
+        } else {
+            None
+        };
+        let has_helper_continuity = helper_continuity.is_some();
         let continuity = if has_overlay_continuity {
             overlay_continuity
         } else if has_sandwich_continuity {
             sandwich_continuity
+        } else if has_helper_continuity {
+            helper_continuity
         } else if ambiguous_context {
             None
         } else {
@@ -3453,6 +3469,7 @@ impl AppDb {
         if let Some(recent) = continuity {
             if has_overlay_continuity
                 || has_sandwich_continuity
+                || has_helper_continuity
                 || classification::assignment_replaces(
                     decision.project_id.as_deref(),
                     decision.task_id.as_deref(),
@@ -3470,6 +3487,8 @@ impl AppDb {
                         "截图延续".into()
                     } else if has_sandwich_continuity {
                         "前后事务一致".into()
+                    } else if has_helper_continuity {
+                        "后续认证事务".into()
                     } else {
                         "连续事务".into()
                     },
@@ -3477,6 +3496,8 @@ impl AppDb {
                         "截图工具归入紧邻的上一具体任务".into()
                     } else if has_sandwich_continuity {
                         "前后紧邻时间段属于同一具体任务".into()
+                    } else if has_helper_continuity {
+                        "认证或登录中转页归入紧邻的后续具体任务".into()
                     } else {
                         "当前页面与上一具体任务一致".into()
                     },
@@ -7914,6 +7935,125 @@ mod tests {
         assert!(db
             .refresh_session_from_local_attribution("conflict-target")
             .expect("review conflicting sandwich")
+            .is_none());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn local_review_assigns_browser_authentication_to_the_immediate_next_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-forward-auth-continuity-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let previous_project = db
+            .create_project("之前的项目", "开发")
+            .expect("create previous project");
+        let previous_task = db
+            .create_task(&previous_project.id, "之前的任务")
+            .expect("create previous task");
+        db.create_category("保研").expect("create next category");
+        let next_project = db
+            .create_project("推免", "保研")
+            .expect("create next project");
+        let next_task = db
+            .create_task(&next_project.id, "成果填报")
+            .expect("create next task");
+        let base = Utc::now() + Duration::hours(9);
+        let evidence = |app: &str, page: &str| {
+            serde_json::to_string(&vec![
+                EvidenceItem {
+                    kind: "app".into(),
+                    label: "应用".into(),
+                    value: app.into(),
+                    weight: 0.5,
+                },
+                EvidenceItem {
+                    kind: "page".into(),
+                    label: "当前页面".into(),
+                    value: page.into(),
+                    weight: 0.9,
+                },
+            ])
+            .expect("serialize evidence")
+        };
+        let insert_assigned = |id: &str,
+                               start: DateTime<Utc>,
+                               end: DateTime<Utc>,
+                               project_id: &str,
+                               task_id: &str,
+                               category: &str| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,'已确认事务',0.98,?7,1,'manual-correction',?8)",
+                    params![id, fmt(start), fmt(end), project_id, task_id, category, evidence("code.exe", "已确认事务"), now()],
+                )
+                .expect("insert assigned session");
+        };
+        let insert_auth = |id: &str, start: DateTime<Utc>, end: DateTime<Utc>| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,NULL,NULL,'杂务','统一身份认证中心',0.56,?4,0,'context-complete',?5)",
+                    params![id, fmt(start), fmt(end), evidence("chrome.exe", "湖北大学统一身份认证中心"), now()],
+                )
+                .expect("insert authentication helper");
+        };
+
+        insert_assigned(
+            "auth-before",
+            base,
+            base + Duration::seconds(20),
+            &previous_project.id,
+            &previous_task.id,
+            "开发",
+        );
+        insert_auth(
+            "auth-target",
+            base + Duration::seconds(20),
+            base + Duration::seconds(30),
+        );
+        insert_assigned(
+            "auth-after",
+            base + Duration::seconds(30),
+            base + Duration::seconds(60),
+            &next_project.id,
+            &next_task.id,
+            "保研",
+        );
+
+        let assigned = db
+            .refresh_session_from_local_attribution("auth-target")
+            .expect("review authentication helper")
+            .expect("immediate next task should assign authentication helper");
+        assert_eq!(assigned.project_id.as_deref(), Some(next_project.id.as_str()));
+        assert_eq!(assigned.task_id.as_deref(), Some(next_task.id.as_str()));
+        assert_eq!(assigned.category, "保研");
+        assert!(assigned
+            .evidence
+            .iter()
+            .any(|item| item.label == "后续认证事务"));
+
+        let delayed_base = base + Duration::minutes(10);
+        insert_auth(
+            "delayed-auth-target",
+            delayed_base,
+            delayed_base + Duration::seconds(10),
+        );
+        insert_assigned(
+            "delayed-auth-after",
+            delayed_base + Duration::seconds(16),
+            delayed_base + Duration::seconds(40),
+            &next_project.id,
+            &next_task.id,
+            "保研",
+        );
+        assert!(db
+            .refresh_session_from_local_attribution("delayed-auth-target")
+            .expect("review delayed authentication helper")
             .is_none());
 
         drop(db);

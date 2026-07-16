@@ -440,6 +440,25 @@ pub(crate) fn supports_surrounding_continuity(features: &ContextFeatures) -> boo
     .any(|marker| label.contains(marker))
 }
 
+pub(crate) fn prefers_next_task_continuity(features: &ContextFeatures) -> bool {
+    if !matches!(
+        features.app.as_str(),
+        "chrome" | "msedge" | "firefox" | "brave" | "tabbit browser"
+    ) {
+        return false;
+    }
+    let label = format!("{} {}", features.page, features.window);
+    [
+        "认证",
+        "验证你的身份",
+        "verify your identity",
+        "oauth",
+        "sso",
+    ]
+    .iter()
+    .any(|marker| label.contains(marker))
+}
+
 fn choose_similarity_assignment(
     query: &ContextFeatures,
     records: &[MemoryRecord],
@@ -1863,6 +1882,30 @@ mod tests {
         assert!(!supports_surrounding_continuity(&features_from_event(&event(
             "WeMeetApp.exe",
             "加入会议",
+        ))));
+    }
+
+    #[test]
+    fn forward_continuity_is_limited_to_browser_authentication_helpers() {
+        assert!(prefers_next_task_continuity(&features_from_event(&event(
+            "Chrome.exe",
+            "湖北大学统一身份认证中心",
+        ))));
+        assert!(prefers_next_task_continuity(&features_from_event(&event(
+            "Tabbit Browser.exe",
+            "Fortinet SSO",
+        ))));
+        assert!(!prefers_next_task_continuity(&features_from_event(&event(
+            "ChatGPT.exe",
+            "修复终端长行截断",
+        ))));
+        assert!(!prefers_next_task_continuity(&features_from_event(&event(
+            "WeMeetApp.exe",
+            "加入会议",
+        ))));
+        assert!(!prefers_next_task_continuity(&features_from_event(&event(
+            "steamwebhelper.exe",
+            "登录 Steam",
         ))));
     }
 
