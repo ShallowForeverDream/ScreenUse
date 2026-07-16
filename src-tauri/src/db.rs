@@ -3129,7 +3129,9 @@ impl AppDb {
         &self,
         id: &str,
     ) -> Result<Option<WorkSession>> {
-        let session = self.get_session(id)?.context("session not found")?;
+        let Some(session) = self.get_session(id)? else {
+            return Ok(None);
+        };
         let settings = self.get_settings()?.normalized();
         if session.user_confirmed
             || session.source == "ai-review"

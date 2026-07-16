@@ -74,6 +74,10 @@ fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bo
         })
         .collect::<Vec<_>>();
     sort_review_candidates(&mut candidates);
+    // A correction or an earlier AI consensus may have taught the local model
+    // after these sessions were first collected. Recheck before creating jobs
+    // so the queue contains only genuine AI fallbacks, not stale uncertainty.
+    refresh_targets_locally(db, &mut candidates)?;
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -282,8 +286,8 @@ fn refresh_targets_locally(db: &AppDb, targets: &mut Vec<WorkSession>) -> Result
             .is_some()
         {
             resolved += 1;
-        } else {
-            unresolved.push(target);
+        } else if let Some(current) = db.get_session(&target.id)? {
+            unresolved.push(current);
         }
     }
     *targets = unresolved;
@@ -788,6 +792,126 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["oldest", "middle", "newest"]
         );
+    }
+
+    #[test]
+    fn enqueue_rechecks_new_local_learning_before_creating_ai_jobs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-enqueue-preflight-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        for seed in db.list_sessions(100).expect("load seed sessions") {
+            db.update_session(
+                &seed.id,
+                crate::models::SessionPatch {
+                    summary: None,
+                    project_id: None,
+                    task_id: None,
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: None,
+                    confidence: None,
+                    user_confirmed: Some(true),
+                },
+            )
+            .expect("exclude seed session from AI queue");
+        }
+        let base = Utc::now() + ChronoDuration::hours(1);
+        let event = |id: &str, app: &str, timestamp: DateTime<Utc>| RawActivityEvent {
+            id: id.into(),
+            source: "windows-foreground".into(),
+            timestamp: format_time(timestamp),
+            app: Some(app.into()),
+            window_title: Some("个人上下文甲乙丙".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: crate::models::InputStats::default(),
+            metadata: serde_json::json!({
+                "contextStart": true,
+                "activePageTitle": "个人上下文甲乙丙"
+            }),
+        };
+        let candidate = classification::ingest_event(
+            &db,
+            &event("enqueue-candidate", "chrome.exe", base),
+        )
+        .expect("ingest candidate")
+        .expect("candidate session");
+
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let memory_source = classification::ingest_event(
+            &db,
+            &event(
+                "enqueue-memory",
+                "QQ.exe",
+                base + ChronoDuration::hours(1),
+            ),
+        )
+        .expect("ingest memory source")
+        .expect("memory source session");
+        db.apply_session_correction(
+            &[memory_source.id],
+            crate::models::SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("teach local memory");
+        db.update_session(
+            &candidate.id,
+            crate::models::SessionPatch {
+                summary: None,
+                project_id: None,
+                task_id: None,
+                clear_project: Some(true),
+                clear_task: Some(true),
+                category: Some("杂务".into()),
+                confidence: Some(0.55),
+                user_confirmed: Some(false),
+            },
+        )
+        .expect("simulate stale unresolved session");
+        assert!(db
+            .get_session(&candidate.id)
+            .expect("reload candidate")
+            .expect("candidate exists")
+            .task_id
+            .is_none());
+
+        let mut settings = db.get_settings().expect("load settings");
+        settings.ai_mode = "auto".into();
+        settings.ai_model = "gpt-5.6-luna".into();
+        settings.min_ai_session_minutes = 0;
+        db.save_settings(&settings).expect("enable AI review");
+
+        assert!(!enqueue_recent_uncertain(&db).expect("preflight queue"));
+        assert!(db.list_analysis_jobs(10).expect("list jobs").is_empty());
+        let resolved = db
+            .get_session(&candidate.id)
+            .expect("reload resolved candidate")
+            .expect("resolved candidate exists");
+        assert_eq!(resolved.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(resolved.task_id.as_deref(), Some(task.id.as_str()));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
