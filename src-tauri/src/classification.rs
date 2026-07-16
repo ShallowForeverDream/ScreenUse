@@ -249,6 +249,15 @@ pub(crate) fn resolve_project_task(
         None => return Ok(None),
     };
 
+    let direct_task_id = (!auto_created)
+        .then(|| best_task(&tasks, &project_id, &hay, page.as_deref()))
+        .flatten()
+        .map(|task| task.id.clone());
+    let dominant_task = if auto_created || direct_task_id.is_some() {
+        None
+    } else {
+        db.dominant_confirmed_task_for_project(&project_id)?
+    };
     let task_id = if auto_created {
         Some(db.upsert_task_by_title(
             &project_id,
@@ -256,10 +265,14 @@ pub(crate) fn resolve_project_task(
             "workspace-auto",
         )?)
     } else {
-        best_task(&tasks, &project_id, &hay, page.as_deref()).map(|task| task.id.clone())
+        direct_task_id.or_else(|| {
+            dominant_task
+                .as_ref()
+                .map(|(task_id, _, _)| task_id.clone())
+        })
     };
 
-    let confidence = if project_score >= 220 {
+    let project_confidence: f32 = if project_score >= 220 {
         0.94
     } else if project_score >= 90 {
         0.86
@@ -268,6 +281,19 @@ pub(crate) fn resolve_project_task(
     } else {
         0.70
     };
+    // A project with one overwhelmingly repeated confirmed task can safely fill
+    // the final hierarchy level, but only a strong project signal may skip AI.
+    // Weak project matches keep the concrete suggestion below the 0.84 gate.
+    let confidence = dominant_task
+        .as_ref()
+        .map(|(_, memory_confidence, _)| {
+            if project_score >= 60 {
+                project_confidence.max(*memory_confidence)
+            } else {
+                project_confidence.max(0.80)
+            }
+        })
+        .unwrap_or(project_confidence);
     let assigned_category = projects
         .iter()
         .find(|project| project.id == project_id)
@@ -278,7 +304,7 @@ pub(crate) fn resolve_project_task(
         task_id,
         category: assigned_category,
         confidence,
-        specificity: project_score,
+        specificity: project_score + i32::from(dominant_task.is_some()) * 20,
     }))
 }
 

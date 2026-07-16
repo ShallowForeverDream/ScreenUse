@@ -182,13 +182,14 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
     let settings = db.get_settings()?.normalized();
     let mut targets = load_job_targets(db, &job)?;
     targets.retain(|session| is_review_target(session, &settings));
+    let locally_resolved = refresh_targets_locally(db, &mut targets)?;
     if targets.is_empty() {
-        db.mark_analysis_job_status(
-            &job.id,
-            "skipped",
-            None,
-            Some("目标时间段已被人工修正，未调用 AI".into()),
-        )?;
+        let reason = if locally_resolved > 0 {
+            format!("本地学习已补全 {locally_resolved} 个具体任务，未调用 AI")
+        } else {
+            "目标时间段已被人工修正，未调用 AI".into()
+        };
+        db.mark_analysis_job_status(&job.id, "skipped", None, Some(reason))?;
         return Ok(());
     }
     targets.sort_by(|left, right| left.started_at.cmp(&right.started_at));
@@ -261,6 +262,23 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn refresh_targets_locally(db: &AppDb, targets: &mut Vec<WorkSession>) -> Result<u32> {
+    let mut unresolved = Vec::with_capacity(targets.len());
+    let mut resolved = 0_u32;
+    for target in targets.drain(..) {
+        if db
+            .refresh_session_from_local_attribution(&target.id)?
+            .is_some()
+        {
+            resolved += 1;
+        } else {
+            unresolved.push(target);
+        }
+    }
+    *targets = unresolved;
+    Ok(resolved)
 }
 
 fn load_context_sessions(db: &AppDb, targets: &[WorkSession]) -> Result<Vec<WorkSession>> {

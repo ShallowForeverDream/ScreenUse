@@ -24,6 +24,8 @@ const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repair_v1";
 const AI_CONCRETE_TASK_REPAIR_MIGRATION_KEY: &str = "migration_ai_concrete_task_repair_v7";
+const AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY: &str =
+    "migration_ai_concrete_hierarchy_repair_v8";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
@@ -191,6 +193,7 @@ impl AppDb {
         let idle_project_id = db.configure_idle_target(&settings)?;
         db.repair_ai_reviewed_idle_sessions(&settings, &idle_project_id)?;
         db.migrate_incomplete_ai_review_tasks()?;
+        db.migrate_incomplete_ai_review_hierarchy(&settings)?;
         db.repair_session_timeline()?;
         db.compact_sessions()?;
         Ok(db)
@@ -248,6 +251,98 @@ impl AppDb {
         tx.execute(
             "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
             params![AI_CONCRETE_TASK_REPAIR_MIGRATION_KEY, now()],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    fn migrate_incomplete_ai_review_hierarchy(&self, settings: &AppSettings) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        if conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
+        let candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT ws.id,ws.summary,ws.category,ws.project_id,ws.task_id,
+                        p.name,p.category,t.project_id,t.title,t.status
+                 FROM work_sessions ws
+                 LEFT JOIN projects p ON p.id=ws.project_id
+                 LEFT JOIN tasks t ON t.id=ws.task_id
+                 WHERE ws.source='ai-review' AND ws.user_confirmed=0",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?;
+            collect_rows(rows)?
+        };
+        let mut changed = 0_u32;
+        for (
+            session_id,
+            summary,
+            category,
+            project_id,
+            task_id,
+            project_name,
+            project_category,
+            task_project_id,
+            task_title,
+            task_status,
+        ) in candidates
+        {
+            let is_idle = summary.trim() == "离开/空闲"
+                || (category == settings.idle_category
+                    && project_name.as_deref() == Some(settings.idle_project_name.as_str()));
+            if is_idle {
+                continue;
+            }
+            let hierarchy_is_concrete = project_id.is_some()
+                && task_id.is_some()
+                && project_name.is_some()
+                && project_category.as_deref() == Some(category.as_str())
+                && task_project_id == project_id
+                && task_status.as_deref() == Some("active")
+                && task_title
+                    .as_deref()
+                    .is_some_and(|title| !crate::ai::is_placeholder_task_title(title));
+            if hierarchy_is_concrete {
+                continue;
+            }
+            changed += tx.execute(
+                "UPDATE work_sessions
+                 SET project_id=NULL,task_id=NULL,confidence=MIN(confidence,0.79),
+                     source='context-complete',updated_at=?1
+                 WHERE id=?2 AND source='ai-review' AND user_confirmed=0",
+                params![now(), session_id],
+            )? as u32;
+            tx.execute(
+                "DELETE FROM attribution_memories WHERE session_id=?1",
+                params![session_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY, now()],
         )?;
         tx.commit()?;
         Ok(changed)
@@ -3024,6 +3119,128 @@ impl AppDb {
         })
     }
 
+    pub(crate) fn refresh_session_from_local_attribution(
+        &self,
+        id: &str,
+    ) -> Result<Option<WorkSession>> {
+        let session = self.get_session(id)?.context("session not found")?;
+        let settings = self.get_settings()?.normalized();
+        if session.user_confirmed
+            || session.source == "ai-review"
+            || is_idle_session(&session, &settings)
+        {
+            return Ok(None);
+        }
+
+        let events = self.list_raw_events_between(&session.started_at, &session.ended_at)?;
+        let features = crate::memory::features_from_session(&session, &events);
+        if !crate::memory::is_discriminative(&features) {
+            return Ok(None);
+        }
+        let event = RawActivityEvent {
+            id: format!("local-recheck:{id}"),
+            source: "local-review-preflight".into(),
+            timestamp: session.started_at.clone(),
+            app: (!features.app.is_empty()).then(|| features.app.clone()),
+            window_title: (!features.window.is_empty())
+                .then(|| features.window.clone())
+                .or_else(|| (!features.page.is_empty()).then(|| features.page.clone())),
+            url: (!features.domain.is_empty()).then(|| format!("https://{}/", features.domain)),
+            file_path: (!features.file.is_empty()).then(|| features.file.clone()),
+            workspace: (!features.workspace.is_empty()).then(|| features.workspace.clone()),
+            input_stats: InputStats::default(),
+            metadata: if features.page.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"activePageTitle": features.page})
+            },
+        };
+
+        let mut decision = self.heuristic_attribution(&event, false, &settings, None)?;
+        let (category, category_confidence) =
+            classification::classify_category(&event, settings.idle_threshold_seconds);
+        if decision.confidence < 0.84 {
+            decision.category = category.into();
+            decision.confidence = decision.confidence.max(category_confidence);
+        }
+        if let Some(contextual) =
+            classification::resolve_project_task(self, &event, &decision.category)?
+        {
+            let current_is_complete = decision.project_id.is_some()
+                && decision.task_id.is_some()
+                && decision.confidence >= 0.84;
+            if !current_is_complete
+                || (contextual.specificity >= 100 && contextual.task_id.is_some())
+                || contextual.confidence > decision.confidence + 0.01
+            {
+                decision.project_id = Some(contextual.project_id);
+                decision.task_id = contextual.task_id;
+                decision.category = contextual.category;
+                decision.confidence = decision.confidence.max(contextual.confidence);
+            }
+        }
+
+        let Some(task_id) = decision.task_id.as_deref() else {
+            return Ok(None);
+        };
+        if decision.confidence < 0.84 {
+            return Ok(None);
+        }
+        let assignment = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT t.project_id,p.category,t.title,t.status
+                 FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1",
+                params![task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((project_id, category, task_title, task_status)) = assignment else {
+            return Ok(None);
+        };
+        if task_status != "active" || crate::ai::is_placeholder_task_title(&task_title) {
+            return Ok(None);
+        }
+
+        let updated = self.update_session(
+            id,
+            SessionPatch {
+                summary: None,
+                project_id: Some(project_id),
+                task_id: Some(task_id.to_string()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category),
+                confidence: Some(session.confidence.max(decision.confidence)),
+                user_confirmed: Some(false),
+            },
+        )?;
+        self.mark_session_awaiting_confirmation(id)?;
+        if let Some(evidence) = decision.evidence {
+            let mut merged = updated.evidence;
+            if !merged
+                .iter()
+                .any(|item| item.kind == evidence.kind && item.value == evidence.value)
+            {
+                merged.push(evidence);
+                merged.truncate(20);
+                self.conn.lock().execute(
+                    "UPDATE work_sessions SET evidence_json=?1,updated_at=?2 WHERE id=?3",
+                    params![serde_json::to_string(&merged)?, now(), id],
+                )?;
+            }
+        }
+        self.get_session(id)
+    }
+
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -4194,6 +4411,46 @@ impl AppDb {
             )?;
         }
         Ok(decision)
+    }
+
+    pub(crate) fn dominant_confirmed_task_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(String, f32, u32)>> {
+        let rows = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.task_id,COUNT(*)
+                 FROM attribution_memories m
+                 JOIN work_sessions ws ON ws.id=m.session_id AND ws.user_confirmed=1
+                 JOIN tasks t ON t.id=m.task_id AND t.project_id=m.project_id
+                 WHERE m.project_id=?1 AND t.status='active'
+                 GROUP BY m.task_id ORDER BY COUNT(*) DESC,m.task_id ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?;
+            collect_rows(rows)?
+        };
+        let Some((task_id, winner_count)) = rows.first() else {
+            return Ok(None);
+        };
+        let total = rows.iter().map(|(_, count)| *count).sum::<u32>();
+        let second_count = rows.get(1).map(|(_, count)| *count).unwrap_or_default();
+        if *winner_count < 3
+            || total == 0
+            || f64::from(*winner_count) / f64::from(total) < 0.90
+            || *winner_count < second_count.saturating_add(3)
+        {
+            return Ok(None);
+        }
+        let confidence =
+            if *winner_count >= 5 && f64::from(*winner_count) / f64::from(total) >= 0.98 {
+                0.93
+            } else {
+                0.88
+            };
+        Ok(Some((task_id.clone(), confidence, *winner_count)))
     }
 
     fn normalize_correction_rules(&self) -> Result<u32> {
@@ -5592,6 +5849,285 @@ mod tests {
                 .expect("count placeholder memories"),
             0
         );
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn legacy_ai_project_only_result_returns_to_queue_but_idle_is_preserved() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-ai-concrete-hierarchy-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("旧 AI 分类").expect("create category");
+        let project = db
+            .create_project("旧 AI 项目", &category.name)
+            .expect("create project");
+        let project_only = classification::ingest_event(
+            &db,
+            &chat_event("legacy-ai-project-only", "旧 AI 项目事务"),
+        )
+        .expect("ingest project-only target")
+        .expect("project-only session");
+        db.apply_ai_review(
+            &project_only.id,
+            SessionPatch {
+                summary: Some("AI 只选择了项目".into()),
+                project_id: Some(project.id),
+                task_id: None,
+                clear_project: Some(false),
+                clear_task: Some(true),
+                category: Some(category.name),
+                confidence: Some(0.95),
+                user_confirmed: Some(false),
+            },
+            Vec::new(),
+        )
+        .expect("apply incomplete AI result");
+
+        let settings = db.get_settings().expect("load settings").normalized();
+        let idle_project_id = db
+            .configure_idle_target(&settings)
+            .expect("configure idle target");
+        let idle =
+            classification::ingest_event(&db, &chat_event("legacy-ai-idle", "旧 AI 空闲判断"))
+                .expect("ingest idle target")
+                .expect("idle session");
+        db.apply_ai_review(
+            &idle.id,
+            SessionPatch {
+                summary: Some("离开/空闲".into()),
+                project_id: Some(idle_project_id.clone()),
+                task_id: None,
+                clear_project: Some(false),
+                clear_task: Some(true),
+                category: Some(settings.idle_category.clone()),
+                confidence: Some(0.99),
+                user_confirmed: Some(false),
+            },
+            Vec::new(),
+        )
+        .expect("apply idle AI result");
+        db.conn
+            .lock()
+            .execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY],
+            )
+            .expect("reset hierarchy migration marker");
+
+        assert_eq!(
+            db.migrate_incomplete_ai_review_hierarchy(&settings)
+                .expect("repair incomplete hierarchy"),
+            1
+        );
+        let repaired = db
+            .get_session(&project_only.id)
+            .expect("load repaired session")
+            .expect("repaired session exists");
+        assert!(repaired.project_id.is_none());
+        assert!(repaired.task_id.is_none());
+        assert_eq!(repaired.source, "context-complete");
+        assert!(repaired.confidence < 0.8);
+
+        let preserved_idle = db
+            .get_session(&idle.id)
+            .expect("load idle session")
+            .expect("idle session exists");
+        assert_eq!(
+            preserved_idle.project_id.as_deref(),
+            Some(idle_project_id.as_str())
+        );
+        assert!(preserved_idle.task_id.is_none());
+        assert_eq!(preserved_idle.source, "ai-review");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn queued_session_uses_new_manual_memory_before_ai_is_called() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-local-review-preflight-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(1);
+        let first = classification::ingest_event(
+            &db,
+            &context_event("preflight-memory-source", "QQ.exe", "申书豪材料群", base),
+        )
+        .expect("ingest source")
+        .expect("source session");
+        let queued = classification::ingest_event(
+            &db,
+            &context_event(
+                "preflight-memory-target",
+                "QQ.exe",
+                "申书豪材料群",
+                base + Duration::seconds(10),
+            ),
+        )
+        .expect("ingest queued target")
+        .expect("queued session");
+        assert!(first.task_id.is_none());
+        assert!(queued.task_id.is_none());
+
+        db.apply_session_correction(
+            &[first.id],
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("confirm source context");
+        assert!(db
+            .get_session(&queued.id)
+            .expect("load queued target")
+            .expect("queued target exists")
+            .task_id
+            .is_none());
+
+        let refreshed = db
+            .refresh_session_from_local_attribution(&queued.id)
+            .expect("run local preflight")
+            .expect("local memory resolves target");
+        assert_eq!(refreshed.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(refreshed.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(refreshed.source, "context-complete");
+        assert!(!refreshed.user_confirmed);
+        assert!(refreshed.confidence >= 0.84);
+        assert!(refreshed
+            .evidence
+            .iter()
+            .any(|item| item.kind == "personal-memory"));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn dominant_confirmed_project_task_fills_the_required_task_level() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-dominant-project-task-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("科研归类").expect("create category");
+        let project = db
+            .create_project("IOT", &category.name)
+            .expect("create project");
+        let dominant_task = db
+            .create_task(&project.id, "漏洞复现")
+            .expect("create dominant task");
+        let other_task = db
+            .create_task(&project.id, "论文写作")
+            .expect("create other task");
+        let base = Utc::now() + Duration::hours(2);
+
+        for index in 0..3 {
+            let session = classification::ingest_event(
+                &db,
+                &context_event(
+                    &format!("dominant-task-memory-{index}"),
+                    "WeMeetApp.exe",
+                    &format!("IOT 讨论样本 {index}"),
+                    base + Duration::seconds(index * 10),
+                ),
+            )
+            .expect("ingest memory source")
+            .expect("memory source session");
+            db.apply_session_correction(
+                &[session.id],
+                SessionPatch {
+                    summary: None,
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(dominant_task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some(category.name.clone()),
+                    confidence: Some(0.98),
+                    user_confirmed: Some(true),
+                },
+                false,
+                None,
+                None,
+            )
+            .expect("confirm memory source");
+        }
+
+        let dominant = db
+            .dominant_confirmed_task_for_project(&project.id)
+            .expect("read dominant task")
+            .expect("dominant task exists");
+        assert_eq!(dominant.0, dominant_task.id);
+        assert_eq!(dominant.2, 3);
+
+        let unresolved = context_event(
+            "dominant-task-target",
+            "WeMeetApp.exe",
+            "IOT 新议题",
+            base + Duration::minutes(1),
+        );
+        let assignment = classification::resolve_project_task(&db, &unresolved, &category.name)
+            .expect("resolve project task")
+            .expect("project assignment");
+        assert_eq!(assignment.project_id, project.id);
+        assert_eq!(
+            assignment.task_id.as_deref(),
+            Some(dominant_task.id.as_str())
+        );
+        assert!(assignment.confidence >= 0.84);
+
+        let conflicting = classification::ingest_event(
+            &db,
+            &context_event(
+                "dominant-task-conflict",
+                "wps.exe",
+                "IOT 冲突样本",
+                base + Duration::minutes(2),
+            ),
+        )
+        .expect("ingest conflict")
+        .expect("conflicting session");
+        db.apply_session_correction(
+            &[conflicting.id],
+            SessionPatch {
+                summary: None,
+                project_id: Some(project.id.clone()),
+                task_id: Some(other_task.id),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+            false,
+            None,
+            None,
+        )
+        .expect("confirm conflicting task");
+        assert!(db
+            .dominant_confirmed_task_for_project(&project.id)
+            .expect("read conflicting distribution")
+            .is_none());
+
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
@@ -8796,5 +9332,75 @@ mod tests {
                 suffix_correct as f64 / suffix.len() as f64 * 100.0
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires SCREENUSE_REPLAY_DATA_DIR pointing to a copied real ledger"]
+    fn replay_ai_queue_local_preflight() {
+        let data_dir = std::env::var("SCREENUSE_REPLAY_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("set SCREENUSE_REPLAY_DATA_DIR to a copied ledger directory");
+        let db = AppDb::open_in(data_dir).expect("open replay database");
+        db.rebuild_personal_memory_from_confirmed()
+            .expect("rebuild coherent memories");
+        let settings = db.get_settings().expect("load settings").normalized();
+        let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
+        let candidates = db
+            .list_sessions(20_000)
+            .expect("load review candidates")
+            .into_iter()
+            .filter(|session| {
+                !session.user_confirmed
+                    && !is_idle_session(session, &settings)
+                    && session.source != "ai-review"
+                    && crate::memory::is_discriminative(
+                        &crate::memory::features_from_session_evidence(session),
+                    )
+                    && (session.task_id.is_none()
+                        || session.project_id.is_none()
+                        || session.confidence < 0.8)
+                    && session_duration_seconds(session).unwrap_or_default() >= minimum_seconds
+            })
+            .collect::<Vec<_>>();
+        let mut resolved = Vec::new();
+        for session in &candidates {
+            if let Some(updated) = db
+                .refresh_session_from_local_attribution(&session.id)
+                .expect("refresh queued session")
+            {
+                resolved.push(updated);
+            }
+        }
+        let memory_hits = resolved
+            .iter()
+            .filter(|session| {
+                session
+                    .evidence
+                    .iter()
+                    .any(|item| item.kind == "personal-memory")
+            })
+            .count();
+        let rule_hits = resolved
+            .iter()
+            .filter(|session| session.evidence.iter().any(|item| item.kind == "rule"))
+            .count();
+        eprintln!(
+            "AI queue local preflight: candidates={} skipped_ai={} remaining_ai={} reduction={:.2}% memory_hits={memory_hits} rule_hits={rule_hits}",
+            candidates.len(),
+            resolved.len(),
+            candidates.len().saturating_sub(resolved.len()),
+            if candidates.is_empty() {
+                0.0
+            } else {
+                resolved.len() as f64 / candidates.len() as f64 * 100.0
+            }
+        );
+        assert!(resolved.iter().all(|session| {
+            session.task_id.is_some()
+                && session
+                    .task_title
+                    .as_deref()
+                    .is_some_and(|title| !crate::ai::is_placeholder_task_title(title))
+        }));
     }
 }
