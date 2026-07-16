@@ -3013,7 +3013,7 @@ function ProjectTodayDetailModal({
   const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
   const sortedProjectSessions = useMemo(
     () => [...sessions].sort(
-      (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+      (left, right) => new Date(right.startedAt).getTime() - new Date(left.startedAt).getTime(),
     ),
     [sessions],
   );
@@ -3237,7 +3237,7 @@ function CategoryDetailModal({
   const [query, setQuery] = useState('');
   const allSorted = useMemo(
     () => [...sessions].sort(
-      (left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+      (left, right) => new Date(right.startedAt).getTime() - new Date(left.startedAt).getTime(),
     ),
     [sessions],
   );
