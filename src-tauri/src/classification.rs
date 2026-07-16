@@ -18,7 +18,10 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     };
     // A generic app rule is not stronger than an exact page/project match. Resolve
     // the current page before accepting a complete automatic attribution.
-    if session.user_confirmed || session.source == "collector-idle" {
+    if session.user_confirmed
+        || session.source == "collector-idle"
+        || session.summary.trim() == "离开/空闲"
+    {
         return Ok(Some(session));
     }
 

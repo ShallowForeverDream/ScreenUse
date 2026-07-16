@@ -347,8 +347,23 @@ async fn maybe_ai(
             .iter()
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
-        return request_with_codex_account(settings, system_prompt, user_prompt, &session_ids)
-            .await;
+        let task_ids = input
+            .tasks
+            .iter()
+            .filter(|task| task.status == "active")
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        if task_ids.is_empty() {
+            return Err(anyhow!("AI 复核至少需要一个可用的具体任务"));
+        }
+        return request_with_codex_account(
+            settings,
+            system_prompt,
+            user_prompt,
+            &session_ids,
+            &task_ids,
+        )
+        .await;
     }
     let secret_name = settings.ai_secret_ref.as_deref().unwrap_or_default().trim();
     if secret_name.is_empty() {
@@ -386,14 +401,22 @@ fn persist_results(
         evidence.extend(result.evidence);
         evidence.extend(metadata_evidence(events_for_session(events, target)));
         deduplicate_evidence(&mut evidence);
+        let project_id = result
+            .project_id
+            .clone()
+            .context("AI review did not resolve a concrete project")?;
+        let task_id = result
+            .task_id
+            .clone()
+            .context("AI review did not resolve a concrete task")?;
         db.apply_ai_review(
             &target.id,
             SessionPatch {
                 summary: Some(result.summary),
-                project_id: result.project_id.clone(),
-                task_id: result.task_id.clone(),
-                clear_project: Some(result.project_id.is_none()),
-                clear_task: Some(result.task_id.is_none()),
+                project_id: Some(project_id),
+                task_id: Some(task_id),
+                clear_project: Some(false),
+                clear_task: Some(false),
                 category: Some(result.category),
                 confidence: Some(result.confidence),
                 user_confirmed: Some(false),
@@ -502,14 +525,23 @@ fn is_review_target(session: &WorkSession, settings: &AppSettings) -> bool {
         &crate::memory::features_from_session_evidence(session),
     );
     !session.user_confirmed
-        && session.category != "离开"
-        && !matches!(session.source.as_str(), "collector-idle" | "ai-review")
+        && !is_idle_session(session, settings)
+        && session.source != "ai-review"
         && (settings.ai_review_scope == "all"
             || (has_reviewable_context
                 && (session.task_id.is_none()
                     || session.project_id.is_none()
                     || session.confidence < DEFAULT_REVIEW_CONFIDENCE_THRESHOLD)))
         && duration_seconds(&session.started_at, &session.ended_at) >= minimum_seconds
+}
+
+fn is_idle_session(session: &WorkSession, settings: &AppSettings) -> bool {
+    session.source == "collector-idle"
+        || session.summary.trim() == "离开/空闲"
+        || session.category == "离开"
+        || (session.task_id.is_none()
+            && session.category == settings.idle_category
+            && session.project_name.as_deref() == Some(settings.idle_project_name.as_str()))
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>> {
@@ -668,6 +700,14 @@ mod tests {
         value.source = "ai-review".into();
         assert!(!is_review_candidate(&value, &settings, &queued));
         value.source = "collector-idle".into();
+        assert!(!is_review_candidate(&value, &settings, &queued));
+
+        value.source = "context-complete".into();
+        value.category = settings.idle_category.clone();
+        value.summary = "离开/空闲".into();
+        value.project_name = Some(settings.idle_project_name.clone());
+        value.project_id = Some("idle-project".into());
+        value.task_id = None;
         assert!(!is_review_candidate(&value, &settings, &queued));
     }
 

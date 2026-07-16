@@ -148,8 +148,15 @@ pub async fn analyze_with_codex_account(
         .iter()
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-    let response =
-        request_with_codex_account(settings, system_prompt, &user_prompt, &session_ids).await?;
+    let task_ids = active_task_ids(input.tasks)?;
+    let response = request_with_codex_account(
+        settings,
+        system_prompt,
+        &user_prompt,
+        &session_ids,
+        &task_ids,
+    )
+    .await?;
     parse_and_validate(&response.content, input)
 }
 
@@ -158,6 +165,7 @@ pub async fn request_with_codex_account(
     system_prompt: &str,
     user_prompt: &str,
     session_ids: &[String],
+    task_ids: &[String],
 ) -> Result<AiResponse> {
     let model = settings.ai_model.trim();
     if model.is_empty() {
@@ -170,7 +178,7 @@ pub async fn request_with_codex_account(
     let output_path = work_dir.join("result.json");
     fs::write(
         &schema_path,
-        serde_json::to_vec(&review_schema(session_ids))?,
+        serde_json::to_vec(&review_schema(session_ids, task_ids))?,
     )?;
 
     let mut command = codex_command();
@@ -383,10 +391,10 @@ fn hide_console(_command: &mut Command) {}
 pub(crate) fn review_instructions() -> &'static str {
     "你是单人电脑时间账本的层级归类器。不要调用工具、读取文件或联网，只分析输入 JSON。\
 按 reviewItems 原顺序，为每个 targetSession.sessionId 返回且只返回一个结果；sessionId 是不透明字符串，必须逐字复制。\
-当前 category/project/task/confidence 只是旧系统建议，不是事实。只能选择 catalog 中已有值；taskId 必须属于 projectId，projectId 必须属于 category。\
+当前 category/project/task/confidence 只是旧系统建议，不是事实。只能选择 catalog 中已有值；每个结果都必须选择一个 status=active 的具体 taskId，禁止只返回分类或项目。taskId 必须属于 projectId，projectId 必须属于 category。\
 决策优先级：① personalMemory 中与当前页面、对话标题、工作区、文件或域名高度相似且由用户确认的例子；② 当前页面/文档/工作区等直接线索；\
 ③ timelineContext 中紧邻且已确认的同一事务连续性；④ 应用名只作弱证据。Explorer、浏览器、QQ、微信、WPS、截图工具和终端可能只是同一任务的工具切换。\
-若 catalog 有明确匹配任务，必须落到最具体 taskId；只有所有任务都缺乏依据时才返回 null，禁止创造名称。冲突记忆不强行套用。\
+taskId、projectId、category 都必须来自 catalog，taskId 不得为 null，也禁止创造名称。证据不足时仍选择最合理的已有具体任务，但 confidence 不得高于 0.65，并在 evidence 中说明不确定依据。冲突记忆不强行套用。\
 confidence 校准：精确个人记忆且无冲突 0.92-0.98；两个独立强线索 0.86-0.93；主要靠连续上下文 0.72-0.85；猜测不高于 0.65。\
 summary 用不超过 30 个汉字描述实际事务；evidence 最多 3 项，只保留决定性证据。只输出符合 JSON Schema 的 JSON。"
 }
@@ -577,7 +585,7 @@ fn compact_event(event: &RawActivityEvent) -> Value {
     })
 }
 
-fn review_schema(session_ids: &[String]) -> Value {
+fn review_schema(session_ids: &[String], task_ids: &[String]) -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -588,7 +596,7 @@ fn review_schema(session_ids: &[String]) -> Value {
                     "properties": {
                         "sessionId": {"type": "string", "enum": session_ids},
                         "projectId": {"type": ["string", "null"]},
-                        "taskId": {"type": ["string", "null"]},
+                        "taskId": {"type": "string", "enum": task_ids},
                         "category": {"type": "string"},
                         "summary": {"type": "string"},
                         "confidence": {"type": "number"},
@@ -713,27 +721,25 @@ fn session_id_typo_distance(left: &str, right: &str) -> usize {
 }
 
 fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) -> Result<()> {
-    if let Some(task_id) = result.task_id.as_deref() {
-        let task = input
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| anyhow!("AI returned unknown taskId: {task_id}"))?;
-        let project = input
-            .projects
-            .iter()
-            .find(|project| project.id == task.project_id)
-            .ok_or_else(|| anyhow!("AI returned a task whose project is missing from catalog"))?;
-        result.project_id = Some(project.id.clone());
-        result.category = project.category.clone();
-    } else if let Some(project_id) = result.project_id.as_deref() {
-        let project = input
-            .projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .ok_or_else(|| anyhow!("AI returned unknown projectId: {project_id}"))?;
-        result.category = project.category.clone();
+    if result.task_id.is_none() {
+        result.task_id = compatible_missing_task(result, input).map(|task| task.id.clone());
     }
+    let task_id = result
+        .task_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("AI review must select a concrete taskId"))?;
+    let task = input
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id && task.status == "active")
+        .ok_or_else(|| anyhow!("AI returned unknown or inactive taskId: {task_id}"))?;
+    let project = input
+        .projects
+        .iter()
+        .find(|project| project.id == task.project_id)
+        .ok_or_else(|| anyhow!("AI returned a task whose project is missing from catalog"))?;
+    result.project_id = Some(project.id.clone());
+    result.category = project.category.clone();
     if !input
         .categories
         .iter()
@@ -754,6 +760,65 @@ fn validate_result(result: &mut AiAttributionResult, input: &AiReviewInput<'_>) 
         item.weight = item.weight.clamp(0.0, 1.0);
     }
     Ok(())
+}
+
+fn active_task_ids(tasks: &[Task]) -> Result<Vec<String>> {
+    let ids = tasks
+        .iter()
+        .filter(|task| task.status == "active")
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(anyhow!(
+            "AI review requires at least one active task in the catalog"
+        ));
+    }
+    Ok(ids)
+}
+
+fn compatible_missing_task<'a>(
+    result: &AiAttributionResult,
+    input: &'a AiReviewInput<'_>,
+) -> Option<&'a Task> {
+    let target = input
+        .targets
+        .iter()
+        .find(|session| session.id == result.session_id)?;
+    let project_id = result.project_id.as_deref();
+
+    if let Some(task_id) = target.task_id.as_deref() {
+        if let Some(task) = input.tasks.iter().find(|task| {
+            task.id == task_id
+                && task.status == "active"
+                && project_id.is_none_or(|project_id| task.project_id == project_id)
+        }) {
+            return Some(task);
+        }
+    }
+
+    let mut remembered = input.memories.iter().filter(|memory| {
+        memory.target_session_id == result.session_id
+            && project_id.is_none_or(|project_id| memory.project_id == project_id)
+    });
+    if let Some(memory) = remembered.next() {
+        if remembered.next().is_none() || memory.similarity >= 0.9 {
+            if let Some(task) = input.tasks.iter().find(|task| {
+                task.id == memory.task_id
+                    && task.status == "active"
+                    && project_id.is_none_or(|project_id| task.project_id == project_id)
+            }) {
+                return Some(task);
+            }
+        }
+    }
+
+    let project_id = project_id?;
+    let mut tasks = input
+        .tasks
+        .iter()
+        .filter(|task| task.status == "active" && task.project_id == project_id);
+    let only = tasks.next()?;
+    tasks.next().is_none().then_some(only)
 }
 
 fn strip_url_noise(value: &str) -> String {
@@ -919,11 +984,31 @@ mod tests {
             color: "#fff".into(),
             is_builtin: true,
         }];
-        let input = sample_input(&targets, &[], &[], &categories, &[], &[]);
+        let projects = vec![Project {
+            id: "project".into(),
+            name: "日常杂务".into(),
+            category: "杂务".into(),
+            source: "manual".into(),
+            color: "#fff".into(),
+            description: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let tasks = vec![Task {
+            id: "task".into(),
+            project_id: "project".into(),
+            title: "网页对话".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let input = sample_input(&targets, &[], &[], &categories, &projects, &tasks);
         let result = |session_id: &str| AiAttributionResult {
             session_id: session_id.into(),
-            project_id: None,
-            task_id: None,
+            project_id: Some("project".into()),
+            task_id: Some("task".into()),
             category: "杂务".into(),
             summary: "网页对话".into(),
             confidence: 0.8,
@@ -1058,11 +1143,139 @@ mod tests {
     #[test]
     fn codex_schema_only_accepts_ids_from_the_current_batch() {
         let ids = vec!["session-a".to_string(), "session-b".to_string()];
-        let schema = review_schema(&ids);
+        let task_ids = vec!["task-a".to_string(), "task-b".to_string()];
+        let schema = review_schema(&ids, &task_ids);
         assert_eq!(
             schema["properties"]["results"]["items"]["properties"]["sessionId"]["enum"],
             json!(["session-a", "session-b"])
         );
+        assert_eq!(
+            schema["properties"]["results"]["items"]["properties"]["taskId"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["results"]["items"]["properties"]["taskId"]["enum"],
+            json!(["task-a", "task-b"])
+        );
+    }
+
+    #[test]
+    fn repairs_missing_task_when_the_selected_project_has_one_active_task() {
+        let target = WorkSession {
+            id: "target".into(),
+            started_at: "2026-07-14T10:00:00Z".into(),
+            ended_at: "2026-07-14T10:02:00Z".into(),
+            project_id: None,
+            project_name: None,
+            task_id: None,
+            task_title: None,
+            category: "杂务".into(),
+            summary: "QQ".into(),
+            confidence: 0.55,
+            evidence: vec![],
+            user_confirmed: false,
+            source: "context-complete".into(),
+        };
+        let categories = vec![CategoryOption {
+            name: "保研".into(),
+            color: "#fff".into(),
+            is_builtin: false,
+        }];
+        let projects = vec![Project {
+            id: "project".into(),
+            name: "推免".into(),
+            category: "保研".into(),
+            source: "manual".into(),
+            color: "#fff".into(),
+            description: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let tasks = vec![Task {
+            id: "task".into(),
+            project_id: "project".into(),
+            title: "成果填报".into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let targets = vec![target];
+        let input = sample_input(&targets, &[], &[], &categories, &projects, &tasks);
+        let mut result = AiAttributionResult {
+            session_id: "target".into(),
+            project_id: Some("project".into()),
+            task_id: None,
+            category: "保研".into(),
+            summary: "填写推免成果".into(),
+            confidence: 0.75,
+            evidence: vec![],
+        };
+
+        validate_result(&mut result, &input).expect("repair the only concrete task");
+        assert_eq!(result.task_id.as_deref(), Some("task"));
+        assert_eq!(result.project_id.as_deref(), Some("project"));
+        assert_eq!(result.category, "保研");
+    }
+
+    #[test]
+    fn rejects_project_only_result_when_multiple_tasks_are_possible() {
+        let target = WorkSession {
+            id: "target".into(),
+            started_at: "2026-07-14T10:00:00Z".into(),
+            ended_at: "2026-07-14T10:02:00Z".into(),
+            project_id: None,
+            project_name: None,
+            task_id: None,
+            task_title: None,
+            category: "科研".into(),
+            summary: "会议".into(),
+            confidence: 0.55,
+            evidence: vec![],
+            user_confirmed: false,
+            source: "context-complete".into(),
+        };
+        let categories = vec![CategoryOption {
+            name: "科研".into(),
+            color: "#fff".into(),
+            is_builtin: false,
+        }];
+        let projects = vec![Project {
+            id: "iot".into(),
+            name: "IOT".into(),
+            category: "科研".into(),
+            source: "manual".into(),
+            color: "#fff".into(),
+            description: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        }];
+        let task = |id: &str, title: &str| Task {
+            id: id.into(),
+            project_id: "iot".into(),
+            title: title.into(),
+            status: "active".into(),
+            source: "manual".into(),
+            planned_due_at: None,
+            created_at: "".into(),
+            updated_at: "".into(),
+        };
+        let tasks = vec![task("meeting", "会议"), task("research", "科研开发")];
+        let targets = vec![target];
+        let input = sample_input(&targets, &[], &[], &categories, &projects, &tasks);
+        let mut result = AiAttributionResult {
+            session_id: "target".into(),
+            project_id: Some("iot".into()),
+            task_id: None,
+            category: "科研".into(),
+            summary: "参加会议".into(),
+            confidence: 0.75,
+            evidence: vec![],
+        };
+
+        let error = validate_result(&mut result, &input).expect_err("task is mandatory");
+        assert!(error.to_string().contains("concrete taskId"));
     }
 
     #[test]

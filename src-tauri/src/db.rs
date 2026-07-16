@@ -19,6 +19,7 @@ const PERSONAL_MEMORY_CONSENSUS_MIGRATION_KEY: &str = "migration_personal_memory
 const PERSONAL_MEMORY_BATCH_MIGRATION_KEY: &str = "migration_personal_memory_batch_v3";
 const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
+const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repair_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
@@ -182,7 +183,8 @@ impl AppDb {
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
-        db.configure_idle_target(&settings)?;
+        let idle_project_id = db.configure_idle_target(&settings)?;
+        db.repair_ai_reviewed_idle_sessions(&settings, &idle_project_id)?;
         db.repair_session_timeline()?;
         db.compact_sessions()?;
         Ok(db)
@@ -709,6 +711,57 @@ impl AppDb {
         )?;
         tx.commit()?;
         Ok(project_id)
+    }
+
+    fn repair_ai_reviewed_idle_sessions(
+        &self,
+        settings: &AppSettings,
+        idle_project_id: &str,
+    ) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        let already_migrated = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(0);
+        }
+
+        let candidate_prompts = {
+            let mut stmt = conn.prepare(
+                "SELECT user_prompt FROM analysis_jobs
+                 WHERE status='completed' AND user_prompt IS NOT NULL
+                   AND instr(user_prompt,'离开/空闲')>0",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            collect_rows(rows)?
+        };
+        let mut idle_session_ids = HashSet::new();
+        for prompt in candidate_prompts {
+            idle_session_ids.extend(ai_prompt_idle_session_ids(&prompt, settings));
+        }
+
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        for session_id in idle_session_ids {
+            changed += tx.execute(
+                "UPDATE work_sessions
+                 SET project_id=?1,task_id=NULL,category=?2,summary='离开/空闲',
+                     confidence=MAX(confidence,0.96),source='collector-idle',updated_at=?3
+                 WHERE id=?4 AND user_confirmed=0 AND source='ai-review'",
+                params![idle_project_id, settings.idle_category, now(), session_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY, now()],
+        )?;
+        tx.commit()?;
+        Ok(changed as u32)
     }
 
     pub fn dashboard(&self, collector_running: bool) -> Result<DashboardData> {
@@ -1954,6 +2007,11 @@ impl AppDb {
         patch: SessionPatch,
         evidence: Vec<EvidenceItem>,
     ) -> Result<WorkSession> {
+        let current = self.get_session(id)?.context("session not found")?;
+        let settings = self.get_settings()?.normalized();
+        if is_idle_session(&current, &settings) {
+            return Ok(current);
+        }
         let updated = self.update_session(id, patch)?;
         let conn = self.conn.lock();
         conn.execute(
@@ -2141,7 +2199,12 @@ impl AppDb {
     pub fn mark_session_awaiting_confirmation(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE work_sessions SET source=CASE WHEN source='collector-idle' THEN source ELSE 'context-complete' END, updated_at=?1 WHERE id=?2 AND user_confirmed=0",
+            "UPDATE work_sessions
+             SET source=CASE
+                 WHEN source='collector-idle' OR summary='离开/空闲' THEN 'collector-idle'
+                 ELSE 'context-complete'
+             END, updated_at=?1
+             WHERE id=?2 AND user_confirmed=0",
             params![now(), id],
         )?;
         Ok(())
@@ -4789,6 +4852,61 @@ fn is_auto_session_source(source: &str) -> bool {
     )
 }
 
+fn is_idle_session(session: &WorkSession, settings: &AppSettings) -> bool {
+    session.source == "collector-idle"
+        || session.summary.trim() == "离开/空闲"
+        || (session.task_id.is_none()
+            && session.category == settings.idle_category
+            && session.project_name.as_deref() == Some(settings.idle_project_name.as_str()))
+}
+
+fn ai_prompt_idle_session_ids(prompt: &str, settings: &AppSettings) -> HashSet<String> {
+    let Some(input_start) = prompt.find("输入：") else {
+        return HashSet::new();
+    };
+    let payload = prompt[input_start + "输入：".len()..]
+        .trim()
+        .trim_end_matches('。');
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return HashSet::new();
+    };
+    payload
+        .get("reviewItems")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("targetSession"))
+        .filter(|target| {
+            let summary_is_idle = target
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.trim() == "离开/空闲");
+            let source_is_idle = target
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                == Some("collector-idle");
+            let configured_idle_target = target
+                .get("taskId")
+                .is_none_or(serde_json::Value::is_null)
+                && target
+                    .get("category")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(settings.idle_category.as_str())
+                && target
+                    .get("projectName")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(settings.idle_project_name.as_str());
+            summary_is_idle || source_is_idle || configured_idle_target
+        })
+        .filter_map(|target| {
+            target
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 fn is_reliable_memory_session(session: &WorkSession) -> bool {
     session.user_confirmed
         || (session.source == "ai-review" && session.confidence >= AI_MEMORY_MIN_CONFIDENCE)
@@ -7046,6 +7164,64 @@ mod tests {
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn finalized_idle_context_keeps_its_idle_source_and_rejects_ai_overwrite() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-finalized-idle-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("工作项目", "开发")
+            .expect("create project");
+        let task = db.create_task(&project.id, "开发").expect("create task");
+        let mut event = context_event(
+            "finalized-idle",
+            "ChatGPT.exe",
+            "工作项目",
+            Utc::now() + Duration::hours(1),
+        );
+        let session = classification::ingest_event(&db, &event)
+            .expect("ingest active context")
+            .expect("active session");
+        event.input_stats.idle_seconds = 300;
+        let idle = classification::finalize_context(&db, &event, &session.id)
+            .expect("finalize idle context")
+            .expect("idle session");
+        assert_eq!(idle.source, "collector-idle");
+        assert_eq!(idle.summary, "离开/空闲");
+        assert!(idle.task_id.is_none());
+
+        let after_ai = db
+            .apply_ai_review(
+                &idle.id,
+                SessionPatch {
+                    summary: Some("错误工作归类".into()),
+                    project_id: Some(project.id),
+                    task_id: Some(task.id),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some("开发".into()),
+                    confidence: Some(0.99),
+                    user_confirmed: Some(false),
+                },
+                vec![],
+            )
+            .expect("ignore AI overwrite");
+        assert_eq!(after_ai.source, "collector-idle");
+        assert_eq!(after_ai.summary, "离开/空闲");
+        assert!(after_ai.task_id.is_none());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn ai_idle_repair_reads_only_idle_review_targets() {
+        let settings = AppSettings::default();
+        let prompt = r#"复核输入：{"reviewItems":[{"targetSession":{"sessionId":"work","summary":"工作","source":"context-complete","category":"开发","projectName":"项目","taskId":"task"}},{"targetSession":{"sessionId":"idle","summary":"离开/空闲","source":"context-complete","category":"无效","projectName":"离开","taskId":null}}],"timelineContext":[{"sessionId":"context-idle","summary":"离开/空闲"}]}"#;
+        let ids = ai_prompt_idle_session_ids(prompt, &settings);
+        assert_eq!(ids, HashSet::from(["idle".to_string()]));
     }
 
     #[test]
