@@ -22,6 +22,8 @@ const PERSONAL_MEMORY_AI_CONSENSUS_MIGRATION_KEY: &str =
     "migration_personal_memory_ai_consensus_v6";
 const PERSONAL_MEMORY_TASK_SIGNATURE_MIGRATION_KEY: &str =
     "migration_personal_memory_task_signatures_v9";
+const PERSONAL_MEMORY_LOW_TRUST_AI_MIGRATION_KEY: &str =
+    "migration_personal_memory_low_trust_ai_v10";
 const PROCESS_FILE_PATH_MIGRATION_KEY: &str = "migration_process_file_path_v1";
 const PROCESS_FILE_MEMORY_MIGRATION_KEY: &str = "migration_process_file_memory_v1";
 const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repair_v1";
@@ -190,6 +192,7 @@ impl AppDb {
         db.migrate_personal_memory_coherence()?;
         db.migrate_personal_memory_ai_consensus()?;
         db.migrate_personal_memory_task_signatures()?;
+        db.migrate_personal_memory_low_trust_ai()?;
         db.normalize_correction_rules()?;
         db.backfill_idle_boundaries()?;
         let settings = db.get_settings()?.normalized();
@@ -4019,6 +4022,28 @@ impl AppDb {
         Ok(())
     }
 
+    fn migrate_personal_memory_low_trust_ai(&self) -> Result<()> {
+        let already_migrated = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![PERSONAL_MEMORY_LOW_TRUST_AI_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if already_migrated {
+            return Ok(());
+        }
+        self.rebuild_personal_memory_from_confirmed()?;
+        self.conn.lock().execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![PERSONAL_MEMORY_LOW_TRUST_AI_MIGRATION_KEY, now()],
+        )?;
+        Ok(())
+    }
+
     fn provisional_ai_memory_cutoff(&self) -> Result<Option<String>> {
         self.conn
             .lock()
@@ -4034,7 +4059,7 @@ impl AppDb {
     fn is_provisional_ai_memory_session(&self, session: &WorkSession) -> Result<bool> {
         if session.user_confirmed
             || session.source != "ai-review"
-            || session.confidence < 0.92
+            || session.confidence < 0.80
             || session.project_id.is_none()
             || session.task_id.is_none()
             || session
@@ -6246,7 +6271,7 @@ mod tests {
     }
 
     #[test]
-    fn three_consistent_ai_reviews_become_a_low_trust_local_memory() {
+    fn three_eighty_percent_ai_reviews_become_a_low_trust_local_memory() {
         let data_dir =
             std::env::temp_dir().join(format!("screenuse-ai-in-place-test-{}", Uuid::new_v4()));
         let db = AppDb::open_in(data_dir.clone()).expect("open test database");
@@ -6271,7 +6296,7 @@ mod tests {
                     clear_project: Some(false),
                     clear_task: Some(false),
                     category: Some(category.name.clone()),
-                    confidence: Some(0.93),
+                    confidence: Some(0.82),
                     user_confirmed: Some(false),
                 },
                 vec![EvidenceItem {
@@ -6322,7 +6347,7 @@ mod tests {
                 clear_project: Some(false),
                 clear_task: Some(false),
                 category: Some(category.name.clone()),
-                confidence: Some(0.93),
+                confidence: Some(0.82),
                 user_confirmed: Some(false),
             },
             Vec::new(),
@@ -6353,7 +6378,7 @@ mod tests {
                 clear_project: Some(false),
                 clear_task: Some(false),
                 category: Some(category.name.clone()),
-                confidence: Some(0.93),
+                confidence: Some(0.82),
                 user_confirmed: Some(false),
             },
             Vec::new(),
@@ -6385,6 +6410,88 @@ mod tests {
             3
         );
         drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn low_trust_ai_migration_rebuilds_existing_concrete_memories() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-ai-low-trust-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("保研").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(1);
+        for index in 0..3 {
+            let mut event = context_event(
+                &format!("ai-migration-{index}"),
+                "QQ.exe",
+                "申书豪材料群",
+                base + Duration::minutes(index),
+            );
+            event.metadata["activePageTitle"] =
+                serde_json::Value::String("申书豪材料群".into());
+            let session = classification::ingest_event(&db, &event)
+                .expect("ingest AI migration source")
+                .expect("AI migration source session");
+            db.apply_ai_review(
+                &session.id,
+                SessionPatch {
+                    summary: Some("沟通推免成果填报".into()),
+                    project_id: Some(project.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    clear_project: Some(false),
+                    clear_task: Some(false),
+                    category: Some(category.name.clone()),
+                    confidence: Some(0.82),
+                    user_confirmed: Some(false),
+                },
+                Vec::new(),
+            )
+            .expect("apply existing AI review");
+        }
+        db.conn
+            .lock()
+            .execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![PERSONAL_MEMORY_LOW_TRUST_AI_MIGRATION_KEY],
+            )
+            .expect("reset low-trust migration marker");
+        db.conn
+            .lock()
+            .execute("DELETE FROM attribution_memories", [])
+            .expect("clear memories before migration");
+        drop(db);
+
+        let reopened = AppDb::open_in(data_dir.clone()).expect("reopen migrated database");
+        assert_eq!(
+            reopened
+                .conn
+                .lock()
+                .query_row("SELECT COUNT(*) FROM attribution_memories", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count rebuilt AI memories"),
+            3
+        );
+        assert!(reopened
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1",
+                params![PERSONAL_MEMORY_LOW_TRUST_AI_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("read migration marker")
+            .is_some());
+        drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }
 

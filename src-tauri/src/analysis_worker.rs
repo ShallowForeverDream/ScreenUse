@@ -62,7 +62,7 @@ fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bo
     }
 
     let queued = db.analysis_job_session_ids()?;
-    let candidates = db
+    let mut candidates = db
         .list_sessions(2000)?
         .into_iter()
         .filter(|session| {
@@ -73,6 +73,7 @@ fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bo
             }
         })
         .collect::<Vec<_>>();
+    sort_review_candidates(&mut candidates);
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -114,6 +115,10 @@ fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bo
         })?;
     }
     Ok(true)
+}
+
+fn sort_review_candidates(candidates: &mut [WorkSession]) {
+    candidates.sort_by(|left, right| left.started_at.cmp(&right.started_at));
 }
 
 pub async fn run_once(db: Arc<AppDb>) -> Result<bool> {
@@ -759,6 +764,30 @@ mod tests {
         value.ended_at =
             format_time(Utc::now() - ChronoDuration::seconds(AUTO_REVIEW_SETTLE_SECONDS + 1));
         assert!(is_review_candidate(&value, &settings, &queued));
+    }
+
+    #[test]
+    fn review_candidates_are_processed_oldest_first() {
+        let mut newest = session(60);
+        newest.id = "newest".into();
+        newest.started_at = "2026-07-17T10:02:00Z".into();
+        let mut oldest = session(60);
+        oldest.id = "oldest".into();
+        oldest.started_at = "2026-07-17T10:00:00Z".into();
+        let mut middle = session(60);
+        middle.id = "middle".into();
+        middle.started_at = "2026-07-17T10:01:00Z".into();
+        let mut candidates = vec![newest, oldest, middle];
+
+        sort_review_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oldest", "middle", "newest"]
+        );
     }
 
     #[tokio::test]
