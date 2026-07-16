@@ -640,7 +640,7 @@ kbd {
   );
   box-shadow: none;
   opacity: .68;
-  cursor: help;
+  cursor: pointer;
 }
 .day-track-block.untracked:hover, .day-track-block.untracked:focus-visible {
   background: repeating-linear-gradient(

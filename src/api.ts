@@ -59,6 +59,22 @@ export const api = {
   dashboard: () => call<DashboardData>('get_dashboard_data', undefined, fallbackDashboard),
   startCollector: () => call<void>('start_collector'),
   stopCollector: () => call<void>('stop_collector'),
+  createManualSession: (startedAt: string, endedAt: string, patch: SessionPatch) =>
+    call<WorkSession>('create_manual_session', { startedAt, endedAt, patch }, {
+      id: `preview-manual-${Date.now()}`,
+      startedAt,
+      endedAt,
+      projectId: patch.projectId || null,
+      projectName: null,
+      taskId: patch.taskId || null,
+      taskTitle: null,
+      category: patch.category || '杂务',
+      summary: patch.summary || '手动补录',
+      confidence: patch.confidence ?? 1,
+      evidence: [{ kind: 'manual', label: '来源', value: '手动补录未记录时间', weight: 1 }],
+      userConfirmed: true,
+      source: 'manual-entry',
+    }),
   updateSession: (id: string, patch: SessionPatch) => call<WorkSession>('update_session', { id, patch }),
   updateSessions: (ids: string[], patch: SessionPatch) => call<WorkSession[]>('update_sessions', { ids, patch }, []),
   applySessionCorrection: (

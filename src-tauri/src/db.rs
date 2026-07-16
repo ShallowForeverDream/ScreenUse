@@ -1400,6 +1400,94 @@ impl AppDb {
         collect_rows(rows)
     }
 
+    pub fn create_manual_session(
+        &self,
+        started_at: &str,
+        ended_at: &str,
+        patch: SessionPatch,
+    ) -> Result<WorkSession> {
+        let started_at = DateTime::parse_from_rfc3339(started_at)
+            .context("开始时间格式无效")?
+            .with_timezone(&Utc);
+        let ended_at = DateTime::parse_from_rfc3339(ended_at)
+            .context("结束时间格式无效")?
+            .with_timezone(&Utc);
+        if ended_at - started_at < Duration::seconds(5) {
+            bail!("手动补录的时间段至少需要 5 秒");
+        }
+
+        let started_at = fmt(started_at);
+        let ended_at = fmt(ended_at);
+        let task_id = patch
+            .task_id
+            .as_deref()
+            .map(|value| clean_name(value, ""))
+            .filter(|value| !value.is_empty())
+            .context("请选择具体任务后再添加时间段")?;
+        let summary = patch
+            .summary
+            .as_deref()
+            .map(|value| clean_name(value, ""))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "手动补录".into())
+            .chars()
+            .take(160)
+            .collect::<String>();
+        let confidence = patch.confidence.unwrap_or(1.0);
+        if !confidence.is_finite() {
+            bail!("置信度必须是有效数字");
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "manual".into(),
+            label: "来源".into(),
+            value: "手动补录未记录时间".into(),
+            weight: 1.0,
+        }])?;
+        let conn = self.conn.lock();
+        let (project_id, category) = conn
+            .query_row(
+                "SELECT t.project_id,p.category FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?1",
+                params![task_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .context("任务不存在或已经删除")?;
+        let overlaps = conn
+            .query_row(
+                "SELECT 1 FROM work_sessions WHERE julianday(started_at)<julianday(?1) AND julianday(ended_at)>julianday(?2) LIMIT 1",
+                params![ended_at, started_at],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if overlaps {
+            bail!("该空档已经出现其他时间段，请刷新后重试");
+        }
+        conn.execute(
+            "INSERT INTO work_sessions(
+                id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                evidence_json,user_confirmed,source,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,'manual-entry',?10)",
+            params![
+                id,
+                started_at,
+                ended_at,
+                project_id,
+                task_id,
+                category,
+                summary,
+                confidence.clamp(0.0, 1.0),
+                evidence,
+                now(),
+            ],
+        )?;
+        drop(conn);
+        self.get_session(&id)?
+            .context("手动时间段创建后未找到")
+    }
+
     pub fn update_session(&self, id: &str, patch: SessionPatch) -> Result<WorkSession> {
         let current = self.get_session(id)?.context("session not found")?;
         let project_was_explicit = patch.project_id.is_some();
@@ -6810,6 +6898,61 @@ mod tests {
             .expect("load plan links");
         let plan_links: Vec<String> = parse_json(&plan_links);
         assert_eq!(plan_links, vec![merged.id]);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn manual_session_fills_a_gap_with_a_concrete_task() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-manual-entry-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("手动补录项目", "开发")
+            .expect("create project");
+        let task = db.create_task(&project.id, "补录任务").expect("create task");
+        let base = Utc::now() + Duration::days(30);
+        let patch = SessionPatch {
+            summary: Some("补录空档".into()),
+            project_id: None,
+            task_id: Some(task.id.clone()),
+            clear_project: None,
+            clear_task: None,
+            category: Some("杂务".into()),
+            confidence: Some(1.0),
+            user_confirmed: Some(true),
+        };
+
+        let created = db
+            .create_manual_session(
+                &fmt(base),
+                &fmt(base + Duration::seconds(20)),
+                patch.clone(),
+            )
+            .expect("create manual session");
+        assert_eq!(created.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(created.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(created.category, "开发");
+        assert_eq!(created.summary, "补录空档");
+        assert_eq!(created.source, "manual-entry");
+        assert!(created.user_confirmed);
+        assert_eq!(created.evidence[0].value, "手动补录未记录时间");
+
+        assert!(db
+            .create_manual_session(
+                &fmt(base + Duration::seconds(5)),
+                &fmt(base + Duration::seconds(25)),
+                patch.clone(),
+            )
+            .is_err());
+        assert!(db
+            .create_manual_session(
+                &fmt(base + Duration::seconds(30)),
+                &fmt(base + Duration::seconds(33)),
+                patch,
+            )
+            .is_err());
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

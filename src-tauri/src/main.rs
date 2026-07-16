@@ -85,6 +85,19 @@ fn collector_health(state: State<AppState>) -> collectors::CollectorHealth {
 }
 
 #[tauri::command]
+fn create_manual_session(
+    state: State<AppState>,
+    started_at: String,
+    ended_at: String,
+    patch: SessionPatch,
+) -> Result<models::WorkSession, String> {
+    state
+        .db
+        .create_manual_session(&started_at, &ended_at, patch)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 fn update_session(
     state: State<AppState>,
     id: String,
@@ -575,6 +588,7 @@ fn main() {
             start_collector,
             stop_collector,
             collector_health,
+            create_manual_session,
             update_session,
             update_sessions,
             apply_session_correction,

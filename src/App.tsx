@@ -770,6 +770,7 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [selectionResetKey, setSelectionResetKey] = useState(0);
   const [editing, setEditing] = useState<WorkSession[]>([]);
+  const [manualDraft, setManualDraft] = useState<{ startedAt: string; endedAt: string } | null>(null);
   const [undoStatus, setUndoStatus] = useState<UndoStatus>({ available: false });
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -901,6 +902,7 @@ export default function App() {
       if (
         !isTyping
         && editing.length === 0
+        && !manualDraft
         && undoStatus.available
         && (event.ctrlKey || event.metaKey)
         && event.key.toLowerCase() === 'z'
@@ -911,7 +913,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [editing.length, undoLastCorrection, undoStatus.available]);
+  }, [editing.length, manualDraft, undoLastCorrection, undoStatus.available]);
 
   const daySessions = useMemo(
     () =>
@@ -961,6 +963,23 @@ export default function App() {
   }
 
   const currentTab = tabs.find((tab) => tab.id === activeTab) || tabs[0];
+  const manualDraftSession: WorkSession | null = manualDraft
+    ? {
+        id: `manual-draft:${manualDraft.startedAt}:${manualDraft.endedAt}`,
+        startedAt: manualDraft.startedAt,
+        endedAt: manualDraft.endedAt,
+        projectId: null,
+        projectName: null,
+        taskId: null,
+        taskTitle: null,
+        category: '',
+        summary: '补录时间段',
+        confidence: 1,
+        evidence: [{ kind: 'manual', label: '来源', value: '今日时间轴中的未记录空档', weight: 1 }],
+        userConfirmed: true,
+        source: 'manual-draft',
+      }
+    : null;
   const goDate = (offset: number) => {
     const date = dateFromKey(selectedDate);
     date.setDate(date.getDate() + offset);
@@ -1176,6 +1195,10 @@ export default function App() {
             idleCategory={data.settings.idleCategory}
             selectionResetKey={selectionResetKey}
             onEdit={setEditing}
+            onAddGap={(startedAt, endedAt) => {
+              setEditing([]);
+              setManualDraft({ startedAt, endedAt });
+            }}
             onOpenTimeline={() => setActiveTab('timeline')}
             planItems={data.planItems}
           />
@@ -1228,14 +1251,27 @@ export default function App() {
         )}
       </main>
 
-      {editing.length > 0 && (
+      {(editing.length > 0 || manualDraftSession) && (
         <EditSessionModal
-          sessions={editing}
+          mode={manualDraftSession ? 'create' : 'edit'}
+          sessions={manualDraftSession ? [manualDraftSession] : editing}
           projects={data.projects}
           tasks={data.tasks}
           categoryOptions={data.categoryOptions}
-          onClose={() => setEditing([])}
+          onClose={() => {
+            setEditing([]);
+            setManualDraft(null);
+          }}
           onSave={async (sessions, patch, options) => {
+            if (manualDraft) {
+              await runAction(
+                () => api.createManualSession(manualDraft.startedAt, manualDraft.endedAt, patch),
+                '未记录时间段已补录',
+              );
+              setManualDraft(null);
+              setSelectionResetKey((value) => value + 1);
+              return;
+            }
             await runAction(async () => {
               await api.applySessionCorrection(
                 sessions.map((session) => session.id),
@@ -2225,6 +2261,7 @@ function TodayView({
   idleCategory,
   selectionResetKey,
   onEdit,
+  onAddGap,
   onOpenTimeline,
   planItems,
 }: {
@@ -2236,6 +2273,7 @@ function TodayView({
   idleCategory: string;
   selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
+  onAddGap: (startedAt: string, endedAt: string) => void;
   onOpenTimeline: () => void;
   planItems: DashboardData['planItems'];
 }) {
@@ -2445,6 +2483,7 @@ function TodayView({
           onZoomChange={setTimelineZoom}
           selectionResetKey={selectionResetKey}
           onEdit={onEdit}
+          onAddGap={onAddGap}
         />
       </section>
 
@@ -2540,6 +2579,7 @@ function DayActivityTimeline({
   onZoomChange,
   selectionResetKey,
   onEdit,
+  onAddGap,
 }: {
   detailed: boolean;
   sessions: WorkSession[];
@@ -2548,6 +2588,7 @@ function DayActivityTimeline({
   onZoomChange: (zoom: number) => void;
   selectionResetKey: number;
   onEdit: (sessions: WorkSession[]) => void;
+  onAddGap: (startedAt: string, endedAt: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const centerRef = useRef<{ date: string; seconds: number } | null>(null);
@@ -2813,25 +2854,27 @@ function DayActivityTimeline({
               const bounds = sessionBoundsOnDate(displaySession, selectedDate);
               const applications = [...new Set(group.sessions.map(sessionApplication))];
               const app = group.untracked
-                ? 'ScreenUse 未运行、正在重启或自动记录曾暂停'
+                ? '点击补录并选择归属任务 · 采集曾暂停或 ScreenUse 当时未运行'
                 : `${applications.slice(0, 3).join('、')}${applications.length > 3 ? ` 等 ${applications.length} 个应用` : ''}${group.sessions.length > 1 ? ` · 合并 ${group.sessions.length} 段` : ''}`;
               const blockWidth = Math.max(1, Math.max(5, bounds.durationSeconds) * pixelsPerSecond);
               const timeRange = `${formatTimelineClock(group.startedAt, true)}–${formatTimelineClock(group.endedAt, true)}`;
-              const actionLabel = group.sessions.length > 1
-                ? `点击查看 ${group.sessions.length} 个具体时间段`
-                : '点击修正';
+              const actionLabel = group.untracked
+                ? '点击补录并选择归属任务'
+                : group.sessions.length > 1
+                  ? `点击查看 ${group.sessions.length} 个具体时间段`
+                  : '点击修正';
               return (
                 <button
-                  aria-disabled={group.untracked}
-                  aria-label={group.untracked
-                    ? `${timeRange}，${displaySessionSummary(displaySession)}，${app}，悬浮查看原因`
-                    : `${timeRange}，${displaySessionSummary(displaySession)}，${app}，${actionLabel}`}
+                  aria-label={`${timeRange}，${displaySessionSummary(displaySession)}，${app}，${actionLabel}`}
                   className={`day-track-block${group.untracked ? ' untracked' : ''}${!group.untracked && group.sessions.some(needsReview) ? ' needs-review' : ''}`}
                   key={group.id}
                   onBlur={() => setTooltip(null)}
                   onClick={() => {
                     setTooltip(null);
-                    if (group.untracked) return;
+                    if (group.untracked) {
+                      onAddGap(group.startedAt, group.endedAt);
+                      return;
+                    }
                     if (group.sessions.length > 1) {
                       setExpandedGroup({
                         sessionIds: group.sessions.map((session) => session.id),
@@ -5421,6 +5464,7 @@ function SearchCreateSelect({
 }
 
 function EditSessionModal({
+  mode = 'edit',
   sessions,
   projects,
   tasks,
@@ -5429,6 +5473,7 @@ function EditSessionModal({
   onSave,
   runAction,
 }: {
+  mode?: 'edit' | 'create';
   sessions: WorkSession[];
   projects: Project[];
   tasks: Task[];
@@ -5442,7 +5487,8 @@ function EditSessionModal({
   runAction: ActionRunner;
 }) {
   const session = sessions[0];
-  const isBulk = sessions.length > 1;
+  const isCreate = mode === 'create';
+  const isBulk = !isCreate && sessions.length > 1;
   const sharedValue = <T,>(read: (item: WorkSession) => T) => {
     const first = read(session);
     return sessions.every((item) => read(item) === first) ? first : undefined;
@@ -5786,7 +5832,7 @@ function EditSessionModal({
       >
         <div className="modal-head">
           <div>
-            <h2 id="edit-session-title">{isBulk ? '批量修正' : '修正会话'}</h2>
+            <h2 id="edit-session-title">{isCreate ? '添加时间段' : isBulk ? '批量修正' : '修正会话'}</h2>
             <p>
               {isBulk
                 ? `${sessions.length} 条会话 · ${formatDuration(sessions.reduce(
@@ -5900,27 +5946,29 @@ function EditSessionModal({
           </Field>
         </div>
 
-        <div className="correction-options">
-          <div className="correction-memory-note">
-            <Sparkles size={18} />
-            <span><strong>个人记忆会自动学习</strong><small>只用于之后的相似页面；遇到冲突会放弃判断</small></span>
+        {!isCreate && (
+          <div className="correction-options">
+            <div className="correction-memory-note">
+              <Sparkles size={18} />
+              <span><strong>个人记忆会自动学习</strong><small>只用于之后的相似页面；遇到冲突会放弃判断</small></span>
+            </div>
+            <label>
+              <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
+              <span><strong>额外建立强规则</strong><small>仅在有明确识别词时使用</small></span>
+            </label>
+            <label className={!projectId ? 'disabled' : ''}>
+              <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />
+              <span><strong>固定 30 分钟</strong><small>适合 ChatGPT、终端等上下文不明确的应用</small></span>
+            </label>
+            {remember && (
+              <input
+                value={keyword}
+                onChange={(event) => setKeyword(event.target.value)}
+                placeholder="识别词：ICPC、icpc-trainer、网站开发"
+              />
+            )}
           </div>
-          <label>
-            <input className="themed-checkbox" type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
-            <span><strong>额外建立强规则</strong><small>仅在有明确识别词时使用</small></span>
-          </label>
-          <label className={!projectId ? 'disabled' : ''}>
-            <input className="themed-checkbox" type="checkbox" checked={pin} disabled={!projectId} onChange={(event) => setPin(event.target.checked)} />
-            <span><strong>固定 30 分钟</strong><small>适合 ChatGPT、终端等上下文不明确的应用</small></span>
-          </label>
-          {remember && (
-            <input
-              value={keyword}
-              onChange={(event) => setKeyword(event.target.value)}
-              placeholder="识别词：ICPC、icpc-trainer、网站开发"
-            />
-          )}
-        </div>
+        )}
 
         {!isBulk && (
           <>
@@ -5937,16 +5985,18 @@ function EditSessionModal({
               )}
             </details>
 
-            <div className="modal-secondary">
-              <button
-                disabled={new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime() < 10_000}
-                onClick={() => setSplitDialogOpen(true)}
-                title="拆分后两段都至少保留 5 秒"
-                type="button"
-              >
-                <SplitSquareHorizontal size={16} />拆分
-              </button>
-            </div>
+            {!isCreate && (
+              <div className="modal-secondary">
+                <button
+                  disabled={new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime() < 10_000}
+                  onClick={() => setSplitDialogOpen(true)}
+                  title="拆分后两段都至少保留 5 秒"
+                  type="button"
+                >
+                  <SplitSquareHorizontal size={16} />拆分
+                </button>
+              </div>
+            )}
           </>
         )}
 
@@ -5954,7 +6004,13 @@ function EditSessionModal({
           <button onClick={onClose} type="button">取消</button>
           <button
             className="primary"
-            disabled={isBulk && !categoryTouched && !projectTouched && !taskTouched}
+            disabled={
+              (isCreate && !taskId)
+              || (isBulk && !categoryTouched && !projectTouched && !taskTouched)
+              || categoryBusy
+              || projectBusy
+              || taskBusy
+            }
             onClick={() => {
               const patch: SessionPatch = isBulk
                 ? {
@@ -5977,9 +6033,10 @@ function EditSessionModal({
                   };
               void onSave(sessions, patch, { remember, keyword: keyword.trim() || undefined, pin });
             }}
+            title={isCreate && !taskId ? '请先选择或新建具体任务' : undefined}
             type="button"
           >
-            <Check size={17} />{isBulk ? `统一修正 ${sessions.length} 条` : '保存并确认'}
+            <Check size={17} />{isCreate ? '添加时间段' : isBulk ? `统一修正 ${sessions.length} 条` : '保存并确认'}
           </button>
         </div>
       </section>
