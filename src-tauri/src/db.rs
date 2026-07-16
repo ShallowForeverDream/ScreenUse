@@ -2414,6 +2414,39 @@ impl AppDb {
         .map_err(Into::into)
     }
 
+    pub(crate) fn next_task_context(
+        &self,
+        current_session_id: &str,
+        ended_at: &str,
+    ) -> Result<Option<RecentTaskContext>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT ws.project_id,ws.task_id,t.title,ws.category,ws.confidence,
+                    ws.user_confirmed,ws.source,ws.started_at
+             FROM work_sessions ws
+             JOIN tasks t ON t.id=ws.task_id AND t.project_id=ws.project_id
+             WHERE ws.id<>?1 AND ws.started_at>=?2
+                   AND t.status='active'
+             ORDER BY ws.started_at ASC,ws.updated_at DESC
+             LIMIT 1",
+            params![current_session_id, ended_at],
+            |row| {
+                Ok(RecentTaskContext {
+                    project_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    task_title: row.get(2)?,
+                    category: row.get(3)?,
+                    confidence: row.get(4)?,
+                    user_confirmed: row.get::<_, i64>(5)? != 0,
+                    source: row.get(6)?,
+                    boundary_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Option<WorkSession>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -3329,7 +3362,23 @@ impl AppDb {
         } else {
             crate::memory::features_from_session(&session, &events)
         };
-        if !crate::memory::is_discriminative(&features) {
+        let overlay_continuity = if is_task_overlay_session(&session) {
+            classification::previous_task_assignment_for_overlay(self, &session)?
+        } else {
+            None
+        };
+        let has_overlay_continuity = overlay_continuity.is_some();
+        let surrounding_continuity = if !has_overlay_continuity
+            && crate::memory::supports_surrounding_continuity(&features)
+        {
+            classification::surrounding_task_assignment(self, &session)?
+        } else {
+            None
+        };
+        if !crate::memory::is_discriminative(&features)
+            && !has_overlay_continuity
+            && surrounding_continuity.is_none()
+        {
             return Ok(None);
         }
         let event = RawActivityEvent {
@@ -3358,18 +3407,23 @@ impl AppDb {
             decision.category = category.into();
             decision.confidence = decision.confidence.max(category_confidence);
         }
-        if let Some(contextual) = (!ambiguous_context)
-            .then(|| classification::resolve_project_task(self, &event, &decision.category))
-            .transpose()?
-            .flatten()
-        {
-            let current_is_complete = decision.project_id.is_some()
-                && decision.task_id.is_some()
-                && decision.confidence >= 0.84;
-            if !current_is_complete
-                || (contextual.specificity >= 100 && contextual.task_id.is_some())
-                || contextual.confidence > decision.confidence + 0.01
-            {
+        if let Some(contextual) = classification::resolve_project_task(
+            self,
+            &event,
+            &decision.category,
+        )?
+        .filter(|assignment| {
+            !ambiguous_context
+                || (assignment.task_id.is_some()
+                    && assignment.confidence >= 0.90
+                    && assignment.specificity >= 220)
+        }) {
+            if classification::assignment_replaces(
+                decision.project_id.as_deref(),
+                decision.task_id.as_deref(),
+                decision.confidence,
+                &contextual,
+            ) {
                 decision.project_id = Some(contextual.project_id);
                 decision.task_id = contextual.task_id;
                 decision.category = contextual.category;
@@ -3381,24 +3435,51 @@ impl AppDb {
                 decision = exact_ai;
             }
         }
-        let continuity = if ambiguous_context {
+        let sandwich_continuity = if decision.task_id.is_none() {
+            surrounding_continuity
+        } else {
+            None
+        };
+        let has_sandwich_continuity = sandwich_continuity.is_some();
+        let continuity = if has_overlay_continuity {
+            overlay_continuity
+        } else if has_sandwich_continuity {
+            sandwich_continuity
+        } else if ambiguous_context {
             None
         } else {
             classification::recent_task_assignment(self, &session)?
         };
         if let Some(recent) = continuity {
-            let current_is_complete = decision.project_id.is_some()
-                && decision.task_id.is_some()
-                && decision.confidence >= 0.84;
-            if !current_is_complete || recent.confidence > decision.confidence + 0.01 {
+            if has_overlay_continuity
+                || has_sandwich_continuity
+                || classification::assignment_replaces(
+                    decision.project_id.as_deref(),
+                    decision.task_id.as_deref(),
+                    decision.confidence,
+                    &recent,
+                )
+            {
                 decision.project_id = Some(recent.project_id);
                 decision.task_id = recent.task_id;
                 decision.category = recent.category;
                 decision.confidence = decision.confidence.max(recent.confidence);
                 decision.evidence = Some(EvidenceItem {
                     kind: "context-continuity".into(),
-                    label: "连续事务".into(),
-                    value: "当前页面与上一具体任务一致".into(),
+                    label: if has_overlay_continuity {
+                        "截图延续".into()
+                    } else if has_sandwich_continuity {
+                        "前后事务一致".into()
+                    } else {
+                        "连续事务".into()
+                    },
+                    value: if has_overlay_continuity {
+                        "截图工具归入紧邻的上一具体任务".into()
+                    } else if has_sandwich_continuity {
+                        "前后紧邻时间段属于同一具体任务".into()
+                    } else {
+                        "当前页面与上一具体任务一致".into()
+                    },
                     weight: decision.confidence,
                 });
             }
@@ -7671,6 +7752,228 @@ mod tests {
     }
 
     #[test]
+    fn local_review_assigns_a_screenshot_overlay_to_the_previous_concrete_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-screenshot-local-review-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("截图延续项目", "开发")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "实现具体任务")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(5);
+        let evidence = |app: &str| {
+            serde_json::to_string(&vec![EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: app.into(),
+                weight: 0.5,
+            }])
+            .expect("serialize evidence")
+        };
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('overlay-anchor',?1,?2,?3,?4,'开发','正在实现功能',0.98,?5,1,'manual-correction',?6)",
+                params![fmt(base), fmt(base + Duration::seconds(40)), project.id, task.id, evidence("code.exe"), now()],
+            )
+            .expect("insert concrete anchor");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('overlay-target',?1,?2,NULL,NULL,'杂务','Snipper - Snipaste',0.56,?3,0,'context-complete',?4)",
+                params![fmt(base + Duration::seconds(40)), fmt(base + Duration::seconds(45)), evidence("Snipaste.exe"), now()],
+            )
+            .expect("insert screenshot target");
+        }
+
+        let reviewed = db
+            .refresh_session_from_local_attribution("overlay-target")
+            .expect("run local review")
+            .expect("overlay should be assigned locally");
+        assert_eq!(reviewed.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(reviewed.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(reviewed.category, "开发");
+        assert!(reviewed
+            .evidence
+            .iter()
+            .any(|item| item.kind == "context-continuity" && item.label == "截图延续"));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn local_review_uses_matching_immediate_neighbors_but_not_conflicting_ones() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-sandwich-continuity-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let first_project = db
+            .create_project("前后连续项目", "学习")
+            .expect("create first project");
+        let first_task = db
+            .create_task(&first_project.id, "资料整理")
+            .expect("create first task");
+        let second_project = db
+            .create_project("冲突项目", "开发")
+            .expect("create second project");
+        let second_task = db
+            .create_task(&second_project.id, "开发任务")
+            .expect("create second task");
+        let base = Utc::now() + Duration::hours(7);
+        let evidence = |app: &str| {
+            serde_json::to_string(&vec![EvidenceItem {
+                kind: "app".into(),
+                label: "应用".into(),
+                value: app.into(),
+                weight: 0.5,
+            }])
+            .expect("serialize evidence")
+        };
+        let insert_assigned = |id: &str,
+                               start: DateTime<Utc>,
+                               end: DateTime<Utc>,
+                               project_id: &str,
+                               task_id: &str,
+                               category: &str| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,?4,?5,?6,'已确认事务',0.98,?7,1,'manual-correction',?8)",
+                    params![id, fmt(start), fmt(end), project_id, task_id, category, evidence("code.exe"), now()],
+                )
+                .expect("insert assigned neighbor");
+        };
+        let insert_target = |id: &str, start: DateTime<Utc>, end: DateTime<Utc>| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,NULL,NULL,'杂务','临时文档 v3.docx',0.56,?4,0,'context-complete',?5)",
+                    params![id, fmt(start), fmt(end), evidence("wps.exe"), now()],
+                )
+                .expect("insert unassigned target");
+        };
+
+        insert_assigned(
+            "sandwich-before",
+            base,
+            base + Duration::seconds(20),
+            &first_project.id,
+            &first_task.id,
+            "学习",
+        );
+        insert_target(
+            "sandwich-target",
+            base + Duration::seconds(20),
+            base + Duration::seconds(60),
+        );
+        insert_assigned(
+            "sandwich-after",
+            base + Duration::seconds(60),
+            base + Duration::seconds(80),
+            &first_project.id,
+            &first_task.id,
+            "学习",
+        );
+
+        let assigned = db
+            .refresh_session_from_local_attribution("sandwich-target")
+            .expect("review matching sandwich")
+            .expect("matching neighbors should assign target");
+        assert_eq!(assigned.task_id.as_deref(), Some(first_task.id.as_str()));
+        assert!(assigned
+            .evidence
+            .iter()
+            .any(|item| item.label == "前后事务一致"));
+
+        let conflict_base = base + Duration::minutes(10);
+        insert_assigned(
+            "conflict-before",
+            conflict_base,
+            conflict_base + Duration::seconds(20),
+            &first_project.id,
+            &first_task.id,
+            "学习",
+        );
+        insert_target(
+            "conflict-target",
+            conflict_base + Duration::seconds(20),
+            conflict_base + Duration::seconds(40),
+        );
+        insert_assigned(
+            "conflict-after",
+            conflict_base + Duration::seconds(40),
+            conflict_base + Duration::seconds(60),
+            &second_project.id,
+            &second_task.id,
+            "开发",
+        );
+        assert!(db
+            .refresh_session_from_local_attribution("conflict-target")
+            .expect("review conflicting sandwich")
+            .is_none());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn project_only_page_match_does_not_erase_an_exact_learned_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-concrete-task-preservation-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("科研").expect("create category");
+        let project = db
+            .create_project("IOT", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "CVE 漏洞复现")
+            .expect("create task");
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES ('iot-week1-task','IOT week1 具体任务',120,?1,?2,?3,'科研',1,1,?4)",
+                params![
+                    serde_json::json!({
+                        "generation": 3,
+                        "app": "chatgpt",
+                        "exactContext": "iot week1",
+                        "keywords": []
+                    })
+                    .to_string(),
+                    project.id,
+                    task.id,
+                    now()
+                ],
+            )
+            .expect("insert exact learned task rule");
+
+        let session = classification::ingest_event(
+            &db,
+            &context_event(
+                "iot-week1-concrete-task",
+                "ChatGPT.exe",
+                "IOT week1",
+                Utc::now() + Duration::hours(6),
+            ),
+        )
+        .expect("classify learned page")
+        .expect("session");
+        assert_eq!(session.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(session.category, "科研");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn multiple_selected_sessions_are_corrected_together() {
         let data_dir =
             std::env::temp_dir().join(format!("screenuse-bulk-correction-test-{}", Uuid::new_v4()));
@@ -10250,13 +10553,12 @@ mod tests {
                 classification::resolve_project_task(&db, &event, &decision.category)
                     .expect("resolve project and task")
             {
-                let current_is_complete = decision.project_id.is_some()
-                    && decision.task_id.is_some()
-                    && decision.confidence >= 0.84;
-                if !current_is_complete
-                    || (contextual.specificity >= 100 && contextual.task_id.is_some())
-                    || contextual.confidence > decision.confidence + 0.01
-                {
+                if classification::assignment_replaces(
+                    decision.project_id.as_deref(),
+                    decision.task_id.as_deref(),
+                    decision.confidence,
+                    &contextual,
+                ) {
                     decision.project_id = Some(contextual.project_id);
                     decision.task_id = contextual.task_id;
                     decision.category = contextual.category;

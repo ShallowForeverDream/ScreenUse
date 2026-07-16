@@ -28,13 +28,14 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     let contextual_assignment = resolve_project_task(db, event, &session.category)?;
     let recent_assignment = recent_task_assignment(db, &session)?;
     let assignment = strongest_assignment(contextual_assignment, recent_assignment);
-    let is_complete =
-        session.confidence >= 0.84 && session.project_id.is_some() && session.task_id.is_some();
-    let external_context_is_stronger = assignment.as_ref().is_some_and(|assignment| {
-        (assignment.specificity >= 100 && assignment.task_id.is_some())
-            || assignment.confidence > session.confidence + 0.01
-    });
-    if is_complete && !external_context_is_stronger {
+    if !assignment.as_ref().is_some_and(|assignment| {
+        assignment_replaces(
+            session.project_id.as_deref(),
+            session.task_id.as_deref(),
+            session.confidence,
+            assignment,
+        )
+    }) {
         return Ok(Some(session));
     }
 
@@ -70,20 +71,90 @@ pub(crate) fn recent_task_assignment(
     db: &AppDb,
     session: &WorkSession,
 ) -> Result<Option<Assignment>> {
-    let Some(context) = db.recent_task_context(&session.id, &session.started_at)? else {
+    recent_task_assignment_with_policy(db, session, true, 30, 10)
+}
+
+pub(crate) fn previous_task_assignment_for_overlay(
+    db: &AppDb,
+    session: &WorkSession,
+) -> Result<Option<Assignment>> {
+    // Screenshot overlays are transient tools rather than independent work.
+    // Their page text usually says only "截图", so the immediately preceding
+    // concrete task is the decisive signal and no lexical task-title match is
+    // expected. The caller must first prove that `session` is an overlay.
+    recent_task_assignment_with_policy(db, session, false, 5, 120)
+}
+
+pub(crate) fn surrounding_task_assignment(
+    db: &AppDb,
+    session: &WorkSession,
+) -> Result<Option<Assignment>> {
+    let Some(previous) = db.recent_task_context(&session.id, &session.started_at)? else {
         return Ok(None);
     };
-    let (Some(project_id), Some(task_id)) = (context.project_id, context.task_id) else {
+    let Some(next) = db.next_task_context(&session.id, &session.ended_at)? else {
+        return Ok(None);
+    };
+    if !reliable_task_context(&previous) || !reliable_task_context(&next) {
+        return Ok(None);
+    }
+    let (Some(previous_project), Some(previous_task), Some(next_project), Some(next_task)) = (
+        previous.project_id.clone(),
+        previous.task_id.clone(),
+        next.project_id.clone(),
+        next.task_id.clone(),
+    ) else {
+        return Ok(None);
+    };
+    if previous_project != next_project
+        || previous_task != next_task
+        || previous.category != next.category
+    {
+        return Ok(None);
+    }
+    let target_start = chrono::DateTime::parse_from_rfc3339(&session.started_at)?;
+    let target_end = chrono::DateTime::parse_from_rfc3339(&session.ended_at)?;
+    let previous_end = chrono::DateTime::parse_from_rfc3339(&previous.boundary_at)?;
+    let next_start = chrono::DateTime::parse_from_rfc3339(&next.boundary_at)?;
+    if (target_start - previous_end).num_seconds().max(0) > 5
+        || (next_start - target_end).num_seconds().max(0) > 5
+    {
+        return Ok(None);
+    }
+    Ok(Some(Assignment {
+        project_id: previous_project,
+        task_id: Some(previous_task),
+        category: previous.category,
+        confidence: if previous.user_confirmed || next.user_confirmed {
+            0.97
+        } else {
+            0.94
+        },
+        specificity: 110,
+    }))
+}
+
+fn recent_task_assignment_with_policy(
+    db: &AppDb,
+    session: &WorkSession,
+    require_task_match: bool,
+    max_gap_seconds: i64,
+    specificity: i32,
+) -> Result<Option<Assignment>> {
+    let Some(context) = db.recent_task_context(&session.id, &session.started_at)? else {
         return Ok(None);
     };
     // SQLite stores confidence as REAL while the model uses f32.  A literal
     // 0.84 can round to 0.83999997 after loading; keep the intended boundary
     // inclusive so an immediately following app switch inherits the task.
-    if context.source == "collector-idle"
-        || (!context.user_confirmed && context.confidence + 0.0001 < 0.84)
-    {
+    if !reliable_task_context(&context) {
         return Ok(None);
     }
+    let (Some(project_id), Some(task_id)) =
+        (context.project_id.clone(), context.task_id.clone())
+    else {
+        return Ok(None);
+    };
     let features = crate::memory::features_from_session_evidence(session);
     let specific_task_match = !is_generic_task_title(&context.task_title)
         && crate::memory::relates_to_assignment(&features, "", &context.task_title);
@@ -91,22 +162,37 @@ pub(crate) fn recent_task_assignment(
     // name (for example `IOT`) must never copy the previous task (`会议`) onto
     // the new page (`CVE 复现`).  Continuity is allowed to fill a concrete task
     // only when the current metadata also identifies that exact task.
-    if !specific_task_match {
+    if require_task_match && !specific_task_match {
         return Ok(None);
     }
     let started = chrono::DateTime::parse_from_rfc3339(&session.started_at)?;
     let previous_end = chrono::DateTime::parse_from_rfc3339(&context.boundary_at)?;
     let gap_seconds = (started - previous_end).num_seconds().max(0);
-    if gap_seconds > 30 {
+    if gap_seconds > max_gap_seconds {
         return Ok(None);
     }
     Ok(Some(Assignment {
         project_id,
         task_id: Some(task_id),
         category: context.category,
-        confidence: if context.user_confirmed { 0.94 } else { 0.91 },
-        specificity: 10,
+        confidence: if require_task_match {
+            if context.user_confirmed {
+                0.94
+            } else {
+                0.91
+            }
+        } else if context.user_confirmed {
+            0.98
+        } else {
+            0.95
+        },
+        specificity,
     }))
+}
+
+fn reliable_task_context(context: &crate::db::RecentTaskContext) -> bool {
+    context.source != "collector-idle"
+        && (context.user_confirmed || context.confidence + 0.0001 >= 0.84)
 }
 
 pub fn finalize_context(
@@ -154,11 +240,12 @@ pub fn finalize_context(
     let contextual_assignment = resolve_project_task(db, event, &category)?;
     let recent_assignment = recent_task_assignment(db, &session)?;
     if let Some(assignment) = strongest_assignment(contextual_assignment, recent_assignment) {
-        let current_is_complete = project_id.is_some() && task_id.is_some() && confidence >= 0.84;
-        if !current_is_complete
-            || (assignment.specificity >= 100 && assignment.task_id.is_some())
-            || assignment.confidence > confidence + 0.01
-        {
+        if assignment_replaces(
+            project_id.as_deref(),
+            task_id.as_deref(),
+            confidence,
+            &assignment,
+        ) {
             project_id = Some(assignment.project_id);
             task_id = assignment.task_id;
             category = assignment.category;
@@ -195,6 +282,20 @@ fn strongest_assignment(left: Option<Assignment>, right: Option<Assignment>) -> 
         (Some(left), _) => Some(left),
         (None, right) => right,
     }
+}
+
+pub(crate) fn assignment_replaces(
+    current_project_id: Option<&str>,
+    current_task_id: Option<&str>,
+    current_confidence: f32,
+    proposed: &Assignment,
+) -> bool {
+    let current_is_complete =
+        current_project_id.is_some() && current_task_id.is_some() && current_confidence >= 0.84;
+    let proposed_is_complete = proposed.task_id.is_some();
+    (!current_is_complete && (current_task_id.is_none() || proposed_is_complete))
+        || (proposed_is_complete
+            && (proposed.specificity >= 100 || proposed.confidence > current_confidence + 0.01))
 }
 
 pub(crate) fn resolve_project_task(
@@ -980,11 +1081,24 @@ fn normalize(value: &str) -> String {
 }
 
 fn tokens(value: &str) -> Vec<String> {
-    normalize(value)
+    let chunks = normalize(value)
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| token.chars().count() >= 2)
         .map(ToOwned::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+    let mut output = chunks.clone();
+    for chunk in chunks {
+        output.extend(
+            chunk
+                .split(['与', '和', '及'])
+                .filter(|token| token.chars().count() >= 2)
+                .filter(|token| *token != chunk)
+                .map(ToOwned::to_owned),
+        );
+    }
+    output.sort();
+    output.dedup();
+    output
 }
 
 fn contains_any(hay: &str, needles: &[&str]) -> bool {
@@ -1342,5 +1456,33 @@ mod tests {
         .expect("project disambiguates task");
         assert_eq!(resolved.0.id, "iot-meeting");
         assert_eq!(resolved.1.id, "IOT");
+    }
+
+    #[test]
+    fn project_only_context_never_erases_a_concrete_task() {
+        let project_only = Assignment {
+            project_id: "iot".into(),
+            task_id: None,
+            category: "科研".into(),
+            confidence: 0.96,
+            specificity: 220,
+        };
+        assert!(!assignment_replaces(
+            Some("iot"),
+            Some("cve-reproduction"),
+            0.84,
+            &project_only,
+        ));
+
+        let concrete_task = Assignment {
+            task_id: Some("paper-writing".into()),
+            ..project_only
+        };
+        assert!(assignment_replaces(
+            Some("iot"),
+            Some("cve-reproduction"),
+            0.84,
+            &concrete_task,
+        ));
     }
 }

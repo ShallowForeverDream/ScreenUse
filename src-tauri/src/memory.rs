@@ -405,6 +405,40 @@ fn is_contextual_application(app: &str) -> bool {
     )
 }
 
+pub(crate) fn supports_surrounding_continuity(features: &ContextFeatures) -> bool {
+    if matches!(
+        features.app.as_str(),
+        "wps"
+            | "wpsoffice"
+            | "winword"
+            | "excel"
+            | "powerpnt"
+            | "typora"
+            | "obsidian"
+            | "notepad"
+    ) {
+        return true;
+    }
+    if !matches!(
+        features.app.as_str(),
+        "chrome" | "msedge" | "firefox" | "brave" | "tabbit browser"
+    ) {
+        return false;
+    }
+    let label = format!("{} {}", features.page, features.window);
+    [
+        "认证",
+        "登录",
+        "验证你的身份",
+        "verify your identity",
+        "oauth",
+        "sso",
+        "教务系统",
+    ]
+    .iter()
+    .any(|marker| label.contains(marker))
+}
+
 fn choose_similarity_assignment(
     query: &ContextFeatures,
     records: &[MemoryRecord],
@@ -682,11 +716,15 @@ fn choose_manual_keyword_signature(
     query: &ContextFeatures,
     records: &[MemoryRecord],
 ) -> Option<MemoryDecision> {
-    const MIN_TOKEN_SUPPORT: usize = 2;
+    const MIN_REPEATED_TOKEN_SUPPORT: usize = 2;
     let query_tokens = query
         .tokens
         .iter()
         .filter(|token| is_signature_token(token))
+        .filter(|token| {
+            let token = canonical_context(token);
+            token != query.app && !query.app.ends_with(&token)
+        })
         .map(String::as_str)
         .collect::<HashSet<_>>();
     if query_tokens.is_empty() {
@@ -736,9 +774,6 @@ fn choose_manual_keyword_signature(
             continue;
         }
         let (assignment, stats) = assignments.into_iter().next()?;
-        if stats.count < MIN_TOKEN_SUPPORT {
-            continue;
-        }
         let vote = votes.entry(assignment).or_default();
         vote.tokens.push(token);
         vote.max_token_support = vote.max_token_support.max(stats.count);
@@ -772,7 +807,7 @@ fn choose_manual_keyword_signature(
                 .any(|token| vote.tokens.contains(token))
         })
         .count();
-    if supporting_memories < MIN_TOKEN_SUPPORT {
+    if supporting_memories == 0 {
         return None;
     }
 
@@ -783,7 +818,15 @@ fn choose_manual_keyword_signature(
         .max()
         .unwrap_or_default();
     let has_semantic_page = !query.page.is_empty() || !query.domain.is_empty();
-    let enough_evidence = vote.tokens.len() >= 4
+    let exact_page_anchor = canonical_context(&query.page);
+    let one_shot_specific_anchor = has_semantic_page
+        && supporting_memories >= 1
+        && exact_page_anchor.chars().count() >= 4
+        && exact_page_anchor != query.app
+        && !is_context_container_anchor(&exact_page_anchor)
+        && vote.tokens.contains(&exact_page_anchor);
+    let enough_evidence = one_shot_specific_anchor
+        || (vote.max_token_support >= MIN_REPEATED_TOKEN_SUPPORT && vote.tokens.len() >= 4)
         || (has_semantic_page
             && ((vote.tokens.len() >= 3
                 && vote.max_token_support >= 3
@@ -860,6 +903,12 @@ fn is_signature_token(token: &str) -> bool {
                 | "chrome"
                 | "wps"
         )
+}
+
+fn is_context_container_anchor(value: &str) -> bool {
+    ["小黑屋", "工作区", "workspace", "项目空间", "project space"]
+        .iter()
+        .any(|marker| value.contains(marker))
 }
 
 pub fn retrieve_examples(
@@ -1486,6 +1535,74 @@ mod tests {
         let decision = choose_assignment(&query, &records).expect("exact manual context wins");
         assert_eq!(decision.task_id, "IOT");
         assert_eq!(decision.confidence, 0.96);
+    }
+
+    #[test]
+    fn one_manual_exact_page_anchor_can_cover_a_small_title_variant() {
+        let query = features_from_event(&event("WPS.exe", "修改论文"));
+        let decision = choose_assignment(
+            &query,
+            &[record(
+                "manual-paper",
+                "WPS.exe",
+                "修改论文 - 去 AI 味",
+                "论文修改",
+            )],
+        )
+        .expect("specific page anchor should generalize once");
+        assert_eq!(decision.task_id, "论文修改");
+        assert!(decision.confidence >= 0.86);
+    }
+
+    #[test]
+    fn one_manual_app_or_container_token_cannot_generalize_a_task() {
+        let app_query = features_from_event(&event("Tabbit Browser.exe", "Fortinet SSO"));
+        assert!(choose_assignment(
+            &app_query,
+            &[record(
+                "manual-screenuse",
+                "Tabbit Browser.exe",
+                "ScreenUse 开发",
+                "ScreenUse",
+            )],
+        )
+        .is_none());
+
+        let container_query = features_from_event(&event("ChatGPT.exe", "zjh的小黑屋"));
+        assert!(choose_assignment(
+            &container_query,
+            &[record(
+                "manual-paper-container",
+                "ChatGPT.exe",
+                "zjh的小黑屋 · 修改论文",
+                "论文修改",
+            )],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn surrounding_continuity_is_limited_to_documents_and_auth_helpers() {
+        assert!(supports_surrounding_continuity(&features_from_event(&event(
+            "WPS.exe",
+            "成果填报材料.docx",
+        ))));
+        assert!(supports_surrounding_continuity(&features_from_event(&event(
+            "Tabbit Browser.exe",
+            "Fortinet SSO - Tabbit",
+        ))));
+        assert!(!supports_surrounding_continuity(&features_from_event(&event(
+            "ChatGPT.exe",
+            "IOT week1",
+        ))));
+        assert!(!supports_surrounding_continuity(&features_from_event(&event(
+            "QQ.exe",
+            "校园频道文章",
+        ))));
+        assert!(!supports_surrounding_continuity(&features_from_event(&event(
+            "WeMeetApp.exe",
+            "加入会议",
+        ))));
     }
 
     #[test]
