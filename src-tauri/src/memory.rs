@@ -143,7 +143,10 @@ pub fn features_from_session(
         .max_by_key(|(index, event)| (assignment_event_score(session, event), *index))
         .map(|(_, event)| *event)
     {
-        return features_from_event(event);
+        let features = features_from_event(event);
+        if is_discriminative(&features) {
+            return features;
+        }
     }
     if !events.is_empty() && !primary_app.is_empty() {
         // Compaction or an old boundary repair can leave only a neighboring
@@ -249,6 +252,26 @@ pub fn is_discriminative(features: &ContextFeatures) -> bool {
         || (!features.window.is_empty()
             && features.window != features.app
             && !is_generic(&features.window))
+}
+
+pub(crate) fn exact_context_identity(features: &ContextFeatures) -> Option<String> {
+    if features.app.is_empty() {
+        return None;
+    }
+    let (kind, value) = if !features.page.is_empty() {
+        ("page", features.page.as_str())
+    } else if !features.window.is_empty() {
+        ("window", features.window.as_str())
+    } else if !features.file.is_empty() {
+        ("file", features.file.as_str())
+    } else if !features.workspace.is_empty() {
+        ("workspace", features.workspace.as_str())
+    } else if !features.domain.is_empty() {
+        ("domain", features.domain.as_str())
+    } else {
+        return None;
+    };
+    Some(format!("{}\u{1f}{kind}\u{1f}{value}", features.app))
 }
 
 pub fn relates_to_assignment(
@@ -592,7 +615,7 @@ fn choose_similarity_assignment(
     })
 }
 
-fn stable_for_single_ai_memory(features: &ContextFeatures) -> bool {
+pub(crate) fn stable_for_single_ai_memory(features: &ContextFeatures) -> bool {
     if matches!(
         features.app.as_str(),
         "wemeetapp" | "zoom" | "teams" | "msteams" | "dingtalk" | "feishu"
@@ -1205,6 +1228,30 @@ mod tests {
         assert_eq!(features.app, "wemeetapp");
         assert_eq!(features.window, "h1ck0r的个人会议室");
         assert!(features.page.is_empty());
+    }
+
+    #[test]
+    fn a_generic_raw_event_does_not_erase_specific_session_evidence() {
+        let mut session = observed_session("explorer.exe", "大作业 和 5 个其他选项卡 - 文件资源管理器");
+        session.evidence[0].kind = "window".into();
+        session.evidence[0].label = "窗口".into();
+        let generic = event("explorer.exe", "Task Switching");
+
+        let features = features_from_session(&session, &[generic]);
+
+        assert_eq!(features.app, "explorer");
+        assert_eq!(features.window, "大作业");
+        assert!(is_discriminative(&features));
+    }
+
+    #[test]
+    fn exact_page_identity_is_not_changed_by_ai_inferred_workspace_noise() {
+        let mut first = features_from_event(&event("ChatGPT.exe", "一等奖学金人数统计"));
+        let mut second = first.clone();
+        first.workspace.clear();
+        second.workspace = "unrelated-neighbor".into();
+
+        assert_eq!(exact_context_identity(&first), exact_context_identity(&second));
     }
 
     #[test]

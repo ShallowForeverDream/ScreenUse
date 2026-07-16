@@ -278,6 +278,7 @@ async fn run_claimed_job(db: &Arc<AppDb>, job: AnalysisJob) -> Result<()> {
 }
 
 fn refresh_targets_locally(db: &AppDb, targets: &mut Vec<WorkSession>) -> Result<u32> {
+    targets.sort_by(|left, right| left.started_at.cmp(&right.started_at));
     let mut unresolved = Vec::with_capacity(targets.len());
     let mut resolved = 0_u32;
     for target in targets.drain(..) {
@@ -425,7 +426,7 @@ fn persist_results(
     batch: AiAttributionBatch,
 ) -> Result<()> {
     let result_count = batch.results.len() as u32;
-    for result in batch.results {
+    for mut result in batch.results {
         let target = targets
             .iter()
             .find(|session| session.id == result.session_id)
@@ -437,6 +438,10 @@ fn persist_results(
             continue;
         }
         let mut evidence = target.evidence.clone();
+        for item in &mut result.evidence {
+            let kind = item.kind.trim().trim_start_matches("ai-");
+            item.kind = format!("ai-{kind}");
+        }
         evidence.extend(result.evidence);
         evidence.extend(metadata_evidence(events_for_session(events, target)));
         deduplicate_evidence(&mut evidence);

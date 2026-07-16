@@ -30,6 +30,8 @@ const AI_IDLE_REVIEW_REPAIR_MIGRATION_KEY: &str = "migration_ai_idle_review_repa
 const AI_CONCRETE_TASK_REPAIR_MIGRATION_KEY: &str = "migration_ai_concrete_task_repair_v7";
 const AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY: &str =
     "migration_ai_concrete_hierarchy_repair_v8";
+const AI_LEGACY_FAILED_JOB_RETRY_MIGRATION_KEY: &str =
+    "migration_ai_retry_legacy_failures_v1";
 const RECENT_MAINTENANCE_DAYS: i64 = 14;
 const MAX_RECENT_MAINTENANCE_SESSIONS: i64 = 20_000;
 const MAX_PERSONAL_MEMORIES: i64 = 2_000;
@@ -200,6 +202,7 @@ impl AppDb {
         db.repair_ai_reviewed_idle_sessions(&settings, &idle_project_id)?;
         db.migrate_incomplete_ai_review_tasks()?;
         db.migrate_incomplete_ai_review_hierarchy(&settings)?;
+        db.retry_legacy_failed_ai_jobs_once()?;
         db.repair_session_timeline()?;
         db.compact_sessions()?;
         Ok(db)
@@ -349,6 +352,45 @@ impl AppDb {
         tx.execute(
             "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
             params![AI_CONCRETE_HIERARCHY_REPAIR_MIGRATION_KEY, now()],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    fn retry_legacy_failed_ai_jobs_once(&self) -> Result<u32> {
+        let mut conn = self.conn.lock();
+        if conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![AI_LEGACY_FAILED_JOB_RETRY_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE analysis_jobs
+             SET status='pending',retry_count=0,error=NULL,processing_started_at=NULL,
+                 completed_at=NULL,duration_ms=NULL,response=NULL,result_count=0
+             WHERE status='failed' AND error IS NOT NULL AND (
+               error LIKE '%AI did not return every target session%'
+               OR error LIKE '%AI returned unknown taskId%'
+               OR error LIKE '%AI returned an unknown, inactive, or placeholder taskId%'
+               OR error LIKE '%AI review must explicitly select a concrete taskId%'
+               OR error LIKE '%AI returned an unexpected or duplicate sessionId%'
+               OR error LIKE '%AI returned ambiguous session identifiers%'
+               OR error LIKE '%AI returned a project outside the selected category%'
+               OR error LIKE '%Codex AI 复核超过 90 秒%'
+             )",
+            [],
+        )? as u32;
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![AI_LEGACY_FAILED_JOB_RETRY_MIGRATION_KEY, now()],
         )?;
         tx.commit()?;
         Ok(changed)
@@ -2347,7 +2389,7 @@ impl AppDb {
         conn.query_row(
             "SELECT project_id,task_id,category,confidence,user_confirmed,source,ended_at
              FROM work_sessions
-             WHERE id<>?1 AND started_at<=?2
+             WHERE id<>?1 AND started_at<=?2 AND ended_at<=?2
              ORDER BY ended_at DESC,updated_at DESC
              LIMIT 1",
             params![current_session_id, started_at],
@@ -3221,6 +3263,28 @@ impl AppDb {
                 decision.confidence = decision.confidence.max(contextual.confidence);
             }
         }
+        if decision.project_id.is_none() || decision.task_id.is_none() {
+            if let Some(exact_ai) = self.exact_ai_reuse_decision(&session, &features)? {
+                decision = exact_ai;
+            }
+        }
+        if let Some(recent) = classification::recent_task_assignment(self, &session)? {
+            let current_is_complete = decision.project_id.is_some()
+                && decision.task_id.is_some()
+                && decision.confidence >= 0.84;
+            if !current_is_complete || recent.confidence > decision.confidence + 0.01 {
+                decision.project_id = Some(recent.project_id);
+                decision.task_id = recent.task_id;
+                decision.category = recent.category;
+                decision.confidence = decision.confidence.max(recent.confidence);
+                decision.evidence = Some(EvidenceItem {
+                    kind: "context-continuity".into(),
+                    label: "连续事务".into(),
+                    value: "紧邻上一时间段".into(),
+                    weight: decision.confidence,
+                });
+            }
+        }
 
         let Some(task_id) = decision.task_id.as_deref() else {
             return Ok(None);
@@ -3281,6 +3345,113 @@ impl AppDb {
             }
         }
         self.get_session(id)
+    }
+
+    fn exact_ai_reuse_decision(
+        &self,
+        target: &WorkSession,
+        features: &crate::memory::ContextFeatures,
+    ) -> Result<Option<AttributionDecision>> {
+        if !crate::memory::is_discriminative(features)
+            || !crate::memory::stable_for_single_ai_memory(features)
+        {
+            return Ok(None);
+        }
+        let Some(context_identity) = crate::memory::exact_context_identity(features) else {
+            return Ok(None);
+        };
+
+        let mut matching_ai = Vec::new();
+        let mut manual_assignments = HashSet::new();
+        for session in self.list_sessions(MAX_PERSONAL_MEMORIES)? {
+            let observed = crate::memory::features_from_session_evidence(&session);
+            if session.id == target.id
+                || session.summary == "离开/空闲"
+                || session.source == "collector-idle"
+                || crate::memory::exact_context_identity(&observed).as_deref()
+                    != Some(context_identity.as_str())
+            {
+                continue;
+            }
+            let (Some(project_id), Some(task_id), Some(task_title)) = (
+                session.project_id.as_deref(),
+                session.task_id.as_deref(),
+                session.task_title.as_deref(),
+            ) else {
+                continue;
+            };
+            if crate::ai::is_placeholder_task_title(task_title) {
+                continue;
+            }
+            let assignment = format!("{}\u{1f}{project_id}\u{1f}{task_id}", session.category);
+            if session.user_confirmed && is_reliable_memory_session(&session) {
+                manual_assignments.insert(assignment);
+            } else if session.source == "ai-review" && session.confidence + 0.0001 >= 0.84 {
+                matching_ai.push((session, assignment));
+            }
+        }
+        if matching_ai.is_empty() {
+            return Ok(None);
+        }
+        let ai_assignments = matching_ai
+            .iter()
+            .map(|(_, assignment)| assignment.as_str())
+            .collect::<HashSet<_>>();
+        if ai_assignments.len() != 1 {
+            return Ok(None);
+        }
+        let assignment = matching_ai[0].1.as_str();
+        if manual_assignments
+            .iter()
+            .any(|manual| manual.as_str() != assignment)
+        {
+            return Ok(None);
+        }
+        let source = matching_ai
+            .into_iter()
+            .max_by(|left, right| left.0.ended_at.cmp(&right.0.ended_at))
+            .context("exact AI reuse source disappeared")?
+            .0;
+        let category = source.category.clone();
+        let confidence = source.confidence.clamp(0.84, 0.90);
+        Ok(Some(AttributionDecision {
+            project_id: source.project_id,
+            task_id: source.task_id,
+            category: category.clone(),
+            summary: classification::summary_for_event(
+                &RawActivityEvent {
+                    id: String::new(),
+                    source: "exact-ai-reuse".into(),
+                    timestamp: target.started_at.clone(),
+                    app: (!features.app.is_empty()).then(|| features.app.clone()),
+                    window_title: (!features.window.is_empty())
+                        .then(|| features.window.clone())
+                        .or_else(|| (!features.page.is_empty()).then(|| features.page.clone())),
+                    url: (!features.domain.is_empty())
+                        .then(|| format!("https://{}/", features.domain)),
+                    file_path: (!features.file.is_empty()).then(|| features.file.clone()),
+                    workspace: (!features.workspace.is_empty()).then(|| features.workspace.clone()),
+                    input_stats: InputStats::default(),
+                    metadata: if features.page.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"activePageTitle": features.page})
+                    },
+                },
+                &category,
+            ),
+            confidence,
+            evidence: Some(EvidenceItem {
+                kind: "ai-exact-memory".into(),
+                label: "历史精确复核".into(),
+                value: if !features.page.is_empty() {
+                    features.page.clone()
+                } else {
+                    features.window.clone()
+                },
+                weight: confidence,
+            }),
+        }))
     }
 
     pub fn create_analysis_job(&self, job: &AnalysisJob) -> Result<()> {
@@ -6010,6 +6181,296 @@ mod tests {
             .expect("target still exists");
         assert!(unchanged.task_id.is_none());
         assert_ne!(unchanged.source, "ai-review");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn an_exact_point_eighty_four_context_inherits_across_an_immediate_app_switch() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-recent-confidence-boundary-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("课程学习").expect("create category");
+        let project = db
+            .create_project("信息隐藏", &category.name)
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "结课报告")
+            .expect("create task");
+        let base = Utc::now() - Duration::hours(1);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO work_sessions(
+                   id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                   evidence_json,user_confirmed,source,updated_at
+                 ) VALUES('previous',?1,?2,?3,?4,?5,'课程讨论',0.84,'[]',0,'ai-review',?2)",
+                params![
+                    fmt(base),
+                    fmt(base + Duration::seconds(30)),
+                    project.id,
+                    task.id,
+                    category.name,
+                ],
+            )
+            .expect("insert previous exact-boundary context");
+
+        let current = classification::ingest_event(
+            &db,
+            &context_event(
+                "current-document",
+                "wps.exe",
+                "信息隐藏结课报告.docx",
+                base + Duration::seconds(30),
+            ),
+        )
+        .expect("classify immediate app switch")
+        .expect("current session");
+        assert_eq!(current.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(current.task_id.as_deref(), Some(task.id.as_str()));
+        assert!(current.confidence >= 0.90);
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn local_preflight_reuses_one_exact_uncontested_ai_result_but_not_conflicts() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-exact-ai-preflight-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("推免复核").expect("create category");
+        let project = db
+            .create_project("推免", &category.name)
+            .expect("create project");
+        let expected_task = db
+            .create_task(&project.id, "成果填报")
+            .expect("create expected task");
+        let other_task = db
+            .create_task(&project.id, "材料整理")
+            .expect("create other task");
+        let base = Utc::now() - Duration::hours(4);
+        let evidence = |page: &str| {
+            serde_json::to_string(&vec![
+                EvidenceItem {
+                    kind: "page".into(),
+                    label: "当前页面".into(),
+                    value: page.into(),
+                    weight: 0.95,
+                },
+                EvidenceItem {
+                    kind: "app".into(),
+                    label: "应用".into(),
+                    value: "ChatGPT.exe".into(),
+                    weight: 0.7,
+                },
+            ])
+            .expect("serialize evidence")
+        };
+        let insert_assigned = |id: &str,
+                               page: &str,
+                               minute: i64,
+                               task_id: &str,
+                               source: &str,
+                               confirmed: bool| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions(
+                       id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                       evidence_json,user_confirmed,source,updated_at
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,0.87,?8,?9,?10,?3)",
+                    params![
+                        id,
+                        fmt(base + Duration::minutes(minute)),
+                        fmt(base + Duration::minutes(minute) + Duration::seconds(20)),
+                        project.id,
+                        task_id,
+                        category.name,
+                        page,
+                        evidence(page),
+                        confirmed,
+                        source,
+                    ],
+                )
+                .expect("insert assigned context");
+        };
+        let insert_target = |id: &str, page: &str, minute: i64| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO work_sessions(
+                       id,started_at,ended_at,project_id,task_id,category,summary,confidence,
+                       evidence_json,user_confirmed,source,updated_at
+                     ) VALUES(?1,?2,?3,NULL,NULL,'杂务',?4,0.56,?5,0,'context-complete',?3)",
+                    params![
+                        id,
+                        fmt(base + Duration::minutes(minute)),
+                        fmt(base + Duration::minutes(minute) + Duration::seconds(20)),
+                        page,
+                        evidence(page),
+                    ],
+                )
+                .expect("insert unresolved target");
+        };
+
+        insert_assigned(
+            "exact-ai",
+            "一等奖学金人数统计",
+            0,
+            &expected_task.id,
+            "ai-review",
+            false,
+        );
+        insert_target("exact-target", "一等奖学金人数统计", 60);
+        let resolved = db
+            .refresh_session_from_local_attribution("exact-target")
+            .expect("reuse exact AI result")
+            .expect("exact target resolved");
+        assert_eq!(resolved.task_id.as_deref(), Some(expected_task.id.as_str()));
+        assert!(resolved
+            .evidence
+            .iter()
+            .any(|item| item.kind == "ai-exact-memory"));
+
+        insert_assigned(
+            "conflicting-ai-a",
+            "同名冲突页面",
+            70,
+            &expected_task.id,
+            "ai-review",
+            false,
+        );
+        insert_assigned(
+            "conflicting-ai-b",
+            "同名冲突页面",
+            71,
+            &other_task.id,
+            "ai-review",
+            false,
+        );
+        insert_target("conflicting-ai-target", "同名冲突页面", 90);
+        assert!(db
+            .refresh_session_from_local_attribution("conflicting-ai-target")
+            .expect("check conflicting AI target")
+            .is_none());
+
+        insert_assigned(
+            "manual-conflict-ai",
+            "人工纠错页面",
+            100,
+            &expected_task.id,
+            "ai-review",
+            false,
+        );
+        insert_assigned(
+            "manual-conflict-confirmed",
+            "人工纠错页面",
+            101,
+            &other_task.id,
+            "manual-correction",
+            true,
+        );
+        let manual = db
+            .get_session("manual-conflict-confirmed")
+            .expect("load manual correction")
+            .expect("manual correction exists");
+        assert!(db
+            .record_personal_memory(&manual)
+            .expect("store manual correction"));
+        insert_target("manual-conflict-target", "人工纠错页面", 120);
+        let manually_resolved = db
+            .refresh_session_from_local_attribution("manual-conflict-target")
+            .expect("manual memory may resolve the target")
+            .expect("manual correction is authoritative");
+        assert_eq!(manually_resolved.task_id.as_deref(), Some(other_task.id.as_str()));
+        assert!(manually_resolved
+            .evidence
+            .iter()
+            .all(|item| item.kind != "ai-exact-memory"));
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn legacy_fixed_ai_failures_are_retried_once_without_touching_other_failures() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-ai-legacy-retry-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let queued_at = now();
+        for (id, error) in [
+            ("missing-target", "AI did not return every target session"),
+            ("old-timeout", "Codex AI 复核超过 90 秒"),
+            ("unrelated", "网络断开，请稍后再试"),
+        ] {
+            db.create_analysis_job(&AnalysisJob {
+                id: id.into(),
+                chunk_ids: vec![format!("{id}-session")],
+                metadata_range: TimeRange {
+                    started_at: queued_at.clone(),
+                    ended_at: queued_at.clone(),
+                },
+                mode: "metadata-context-review".into(),
+                provider: "codex-account".into(),
+                model: "gpt-test".into(),
+                retry_count: 2,
+                status: "failed".into(),
+                error: Some(error.into()),
+                system_prompt: Some("legacy prompt".into()),
+                user_prompt: Some("legacy request".into()),
+                response: Some("legacy response".into()),
+                queued_at: queued_at.clone(),
+                processing_started_at: Some(queued_at.clone()),
+                completed_at: Some(queued_at.clone()),
+                duration_ms: Some(90_000),
+                result_count: 0,
+                usage: AiUsage::default(),
+            })
+            .expect("create failed job");
+        }
+        db.conn
+            .lock()
+            .execute(
+                "DELETE FROM settings WHERE key=?1",
+                params![AI_LEGACY_FAILED_JOB_RETRY_MIGRATION_KEY],
+            )
+            .expect("reset retry migration");
+
+        assert_eq!(
+            db.retry_legacy_failed_ai_jobs_once()
+                .expect("retry known legacy failures"),
+            2
+        );
+        for id in ["missing-target", "old-timeout"] {
+            let job = db
+                .get_analysis_job(id)
+                .expect("load retried job")
+                .expect("retried job exists");
+            assert_eq!(job.status, "pending");
+            assert_eq!(job.retry_count, 0);
+            assert!(job.error.is_none());
+            assert!(job.response.is_none());
+        }
+        assert_eq!(
+            db.get_analysis_job("unrelated")
+                .expect("load unrelated job")
+                .expect("unrelated job exists")
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            db.retry_legacy_failed_ai_jobs_once()
+                .expect("migration is one-shot"),
+            0
+        );
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -9797,7 +10258,7 @@ mod tests {
             .expect("rebuild coherent memories");
         let settings = db.get_settings().expect("load settings").normalized();
         let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
-        let candidates = db
+        let mut candidates = db
             .list_sessions(20_000)
             .expect("load review candidates")
             .into_iter()
@@ -9814,6 +10275,7 @@ mod tests {
                     && session_duration_seconds(session).unwrap_or_default() >= minimum_seconds
             })
             .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.started_at.cmp(&right.started_at));
         let mut resolved = Vec::new();
         for session in &candidates {
             if let Some(updated) = db

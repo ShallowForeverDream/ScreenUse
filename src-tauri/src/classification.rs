@@ -66,14 +66,21 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     db.get_session(&updated.id)
 }
 
-fn recent_task_assignment(db: &AppDb, session: &WorkSession) -> Result<Option<Assignment>> {
+pub(crate) fn recent_task_assignment(
+    db: &AppDb,
+    session: &WorkSession,
+) -> Result<Option<Assignment>> {
     let Some(context) = db.recent_task_context(&session.id, &session.started_at)? else {
         return Ok(None);
     };
     let (Some(project_id), Some(task_id)) = (context.project_id, context.task_id) else {
         return Ok(None);
     };
-    if context.source == "collector-idle" || (!context.user_confirmed && context.confidence < 0.84)
+    // SQLite stores confidence as REAL while the model uses f32.  A literal
+    // 0.84 can round to 0.83999997 after loading; keep the intended boundary
+    // inclusive so an immediately following app switch inherits the task.
+    if context.source == "collector-idle"
+        || (!context.user_confirmed && context.confidence + 0.0001 < 0.84)
     {
         return Ok(None);
     }
