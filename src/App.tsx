@@ -26,6 +26,7 @@ import {
   Database,
   Download,
   Ellipsis,
+  Eye,
   EyeOff,
   FolderKanban,
   HardDrive,
@@ -3908,7 +3909,7 @@ function ProjectsView({
   const [projectRange, setProjectRange] = useState<ProjectRange>('week');
   const [customRangeStart, setCustomRangeStart] = useState(selectedDate);
   const [customRangeEnd, setCustomRangeEnd] = useState(selectedDate);
-  const [hideZeroProjects, setHideZeroProjects] = useState(false);
+  const [hideZeroProjects, setHideZeroProjects] = useState(true);
   const [selectedProjectId, setSelectedProjectId] = useState(focusProjectId || projects[0]?.id || '');
   const [taskName, setTaskName] = useState('');
   const [sessionDetail, setSessionDetail] = useState<
@@ -4055,7 +4056,6 @@ function ProjectsView({
   useEffect(() => {
     if (focusProjectId && projects.some((project) => project.id === focusProjectId)) {
       setQuery('');
-      setHideZeroProjects(false);
       setSelectedProjectId(focusProjectId);
     }
   }, [focusProjectId]);
@@ -4285,7 +4285,8 @@ function ProjectsView({
             onClick={() => setHideZeroProjects((current) => !current)}
             type="button"
           >
-            <EyeOff size={14} />隐藏 0 秒
+            {hideZeroProjects ? <Eye size={14} /> : <EyeOff size={14} />}
+            {hideZeroProjects ? '显示 0 秒' : '隐藏 0 秒'}
           </button>
         </div>
         {creatingCategory && (
