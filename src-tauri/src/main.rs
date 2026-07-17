@@ -71,11 +71,13 @@ fn get_dashboard_data(state: State<AppState>) -> Result<DashboardData, String> {
 
 #[tauri::command]
 fn start_collector(state: State<AppState>) -> Result<(), String> {
+    state.collector.cancel_manual_away();
     state.collector.start(state.db.clone()).map_err(map_err)
 }
 
 #[tauri::command]
 fn stop_collector(state: State<AppState>) -> Result<(), String> {
+    state.collector.cancel_manual_away();
     state.collector.stop().map_err(map_err)
 }
 
@@ -501,6 +503,62 @@ fn run_optional_ai(db: Arc<AppDb>) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayAction {
+    Open,
+    Start,
+    Pause,
+    Away,
+    Analyze,
+    Quit,
+}
+
+fn tray_action(id: &str) -> Option<TrayAction> {
+    match id {
+        "tray-open" => Some(TrayAction::Open),
+        "tray-start" => Some(TrayAction::Start),
+        "tray-pause" => Some(TrayAction::Pause),
+        "tray-away" => Some(TrayAction::Away),
+        "tray-analyze" => Some(TrayAction::Analyze),
+        "tray-quit" => Some(TrayAction::Quit),
+        _ => None,
+    }
+}
+
+fn sync_tray_state<R: tauri::Runtime>(
+    start: &MenuItem<R>,
+    pause: &MenuItem<R>,
+    away: &MenuItem<R>,
+    tray: &tauri::tray::TrayIcon<R>,
+    health: &collectors::CollectorHealth,
+) {
+    let _ = start.set_text(if health.manual_away {
+        "恢复正常记录"
+    } else {
+        "开始自动记录"
+    });
+    let _ = start.set_enabled(!health.running || health.manual_away);
+    let _ = pause.set_enabled(health.running);
+    let _ = away.set_text(if health.manual_away {
+        "离开中 · 操作 5 秒后恢复"
+    } else {
+        "开始离开"
+    });
+    let _ = away.set_enabled(!health.manual_away);
+    let tooltip = if health.manual_away {
+        "ScreenUse · 离开中 · 持续键鼠操作 5 秒后恢复"
+    } else if health.running {
+        "ScreenUse · 正在自动记录"
+    } else {
+        "ScreenUse · 自动记录已暂停"
+    };
+    let _ = tray.set_tooltip(Some(if health.last_error.is_some() {
+        format!("{tooltip} · 最近一次采集失败")
+    } else {
+        tooltip.to_string()
+    }));
+}
+
 fn setup_tray(
     app: &tauri::App,
     db: Arc<AppDb>,
@@ -509,10 +567,14 @@ fn setup_tray(
     let open = MenuItem::with_id(app, "tray-open", "打开 ScreenUse", true, None::<&str>)?;
     let start = MenuItem::with_id(app, "tray-start", "开始自动记录", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "tray-pause", "暂停自动记录", true, None::<&str>)?;
+    let away = MenuItem::with_id(app, "tray-away", "开始离开", true, None::<&str>)?;
     let analyze = MenuItem::with_id(app, "tray-analyze", "AI复核", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &start, &pause, &analyze, &separator, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &start, &pause, &away, &analyze, &separator, &quit],
+    )?;
 
     let db_for_tray = db.clone();
     let collector_for_tray = collector.clone();
@@ -520,24 +582,73 @@ fn setup_tray(
         .tooltip("ScreenUse · 本地元数据时间账本")
         .menu(&menu)
         .show_menu_on_left_click(true)
-        .on_menu_event(move |app, event| match event.id().as_ref() {
-            "tray-open" => {
+        .on_menu_event(move |app, event| match tray_action(event.id().as_ref()) {
+            Some(TrayAction::Open) => {
                 let _ = show_or_create_main_window(app);
             }
-            "tray-start" => {
-                let _ = collector_for_tray.start(db_for_tray.clone());
+            Some(TrayAction::Start) => {
+                collector_for_tray.cancel_manual_away();
+                if let Err(error) = collector_for_tray.start(db_for_tray.clone()) {
+                    collector_for_tray.report_error(error);
+                }
             }
-            "tray-pause" => {
+            Some(TrayAction::Pause) => {
+                collector_for_tray.cancel_manual_away();
+                if let Err(error) = collector_for_tray.stop() {
+                    collector_for_tray.report_error(error);
+                }
+            }
+            Some(TrayAction::Away) => {
+                collector_for_tray.begin_manual_away();
+                if let Err(error) = collector_for_tray.start(db_for_tray.clone()) {
+                    collector_for_tray.cancel_manual_away();
+                    collector_for_tray.report_error(error);
+                }
+            }
+            Some(TrayAction::Analyze) => run_optional_ai(db_for_tray.clone()),
+            Some(TrayAction::Quit) => {
+                collector_for_tray.cancel_manual_away();
                 let _ = collector_for_tray.stop();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    app.exit(0);
+                });
             }
-            "tray-analyze" => run_optional_ai(db_for_tray.clone()),
-            "tray-quit" => app.exit(0),
             _ => {}
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
+    sync_tray_state(&start, &pause, &away, &tray, &collector.health());
+    let start_for_status = start.clone();
+    let pause_for_status = pause.clone();
+    let away_for_status = away.clone();
+    let tray_for_status = tray.clone();
+    let collector_for_status = collector.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut previous = None;
+        loop {
+            let health = collector_for_status.health();
+            let state = (
+                health.running,
+                health.manual_away,
+                health.last_error.clone(),
+            );
+            if previous.as_ref() != Some(&state) {
+                sync_tray_state(
+                    &start_for_status,
+                    &pause_for_status,
+                    &away_for_status,
+                    &tray_for_status,
+                    &health,
+                );
+                previous = Some(state);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
     app.manage(tray);
     Ok(())
 }
@@ -648,4 +759,20 @@ fn main() {
                 api.prevent_exit();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_visible_tray_command_has_an_action() {
+        assert_eq!(tray_action("tray-open"), Some(TrayAction::Open));
+        assert_eq!(tray_action("tray-start"), Some(TrayAction::Start));
+        assert_eq!(tray_action("tray-pause"), Some(TrayAction::Pause));
+        assert_eq!(tray_action("tray-away"), Some(TrayAction::Away));
+        assert_eq!(tray_action("tray-analyze"), Some(TrayAction::Analyze));
+        assert_eq!(tray_action("tray-quit"), Some(TrayAction::Quit));
+        assert_eq!(tray_action("unknown"), None);
+    }
 }

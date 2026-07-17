@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ pub trait CollectorAdapter {
 #[serde(rename_all = "camelCase")]
 pub struct CollectorHealth {
     pub running: bool,
+    pub manual_away: bool,
     pub last_event_at: Option<String>,
     pub last_error: Option<String>,
 }
@@ -29,6 +31,9 @@ pub struct DesktopCollector {
     running: AtomicBool,
     generation: AtomicU64,
     lifecycle: Mutex<()>,
+    wake: Notify,
+    manual_away: AtomicBool,
+    manual_away_started_at: Mutex<Option<String>>,
     last_event_at: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
 }
@@ -51,7 +56,15 @@ struct PendingContext {
     observations: u8,
 }
 
+#[derive(Debug, Clone)]
+struct ManualAwayReturn {
+    first_event: RawActivityEvent,
+    latest_event: RawActivityEvent,
+}
+
 const SWITCH_CONFIRM_SECONDS: i64 = 5;
+const MANUAL_AWAY_RETURN_SECONDS: i64 = 5;
+const MANUAL_AWAY_POLL_SECONDS: u32 = 1;
 
 impl DesktopCollector {
     pub fn new() -> Self {
@@ -59,6 +72,9 @@ impl DesktopCollector {
             running: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             lifecycle: Mutex::new(()),
+            wake: Notify::new(),
+            manual_away: AtomicBool::new(false),
+            manual_away_started_at: Mutex::new(None),
             last_event_at: Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -68,8 +84,36 @@ impl DesktopCollector {
         *self.last_error.lock() = Some(error.to_string());
     }
 
+    pub fn report_error(&self, error: impl ToString) {
+        self.set_error(error);
+    }
+
     fn clear_error(&self) {
         *self.last_error.lock() = None;
+    }
+
+    pub fn begin_manual_away(&self) {
+        if !self.manual_away.swap(true, Ordering::SeqCst) {
+            *self.manual_away_started_at.lock() = Some(now());
+        }
+        self.wake.notify_one();
+    }
+
+    pub fn cancel_manual_away(&self) {
+        self.manual_away.store(false, Ordering::SeqCst);
+        *self.manual_away_started_at.lock() = None;
+        self.wake.notify_one();
+    }
+
+    pub fn is_manual_away(&self) -> bool {
+        self.manual_away.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_next_poll(&self, seconds: u64) {
+        tokio::select! {
+            _ = sleep(Duration::from_secs(seconds.max(1))) => {}
+            _ = self.wake.notified() => {}
+        }
     }
 }
 
@@ -85,6 +129,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
         tauri::async_runtime::spawn(async move {
             let mut active: Option<ActiveContext> = None;
             let mut pending: Option<PendingContext> = None;
+            let mut manual_away_return: Option<ManualAwayReturn> = None;
             let mut task_view_started_at: Option<String> = None;
             let mut settings = db.get_settings().unwrap_or_default().normalized();
             let mut settings_loaded_at = Instant::now();
@@ -112,33 +157,112 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     Ok(event) => event,
                     Err(error) => {
                         collector.set_error(error);
-                        sleep(Duration::from_secs(5)).await;
+                        collector.wait_for_next_poll(5).await;
                         continue;
                     }
                 };
                 context_store::enrich_event(&mut event);
-                let passive_attention = settings
-                    .passive_content_counts_as_active
-                    .then(|| passive_attention_reason(&event))
-                    .flatten();
-                if let Some(passive_attention_reason) = passive_attention.filter(|_| {
-                    event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64
-                }) {
-                    let input_idle_seconds = event.input_stats.idle_seconds;
-                    mark_metadata(
-                        &mut event,
-                        "inputIdleSeconds",
-                        serde_json::Value::from(input_idle_seconds),
-                    );
-                    mark_metadata(&mut event, "passiveAttention", serde_json::Value::Bool(true));
-                    mark_metadata(
-                        &mut event,
-                        "passiveAttentionReason",
-                        serde_json::Value::String(passive_attention_reason.into()),
-                    );
-                    event.input_stats.idle_seconds = 0;
+                let manual_away = collector.is_manual_away();
+                if !manual_away {
+                    manual_away_return = None;
+                    let passive_attention = settings
+                        .passive_content_counts_as_active
+                        .then(|| passive_attention_reason(&event))
+                        .flatten();
+                    if let Some(passive_attention_reason) = passive_attention.filter(|_| {
+                        event.input_stats.idle_seconds >= settings.idle_threshold_seconds as u64
+                    }) {
+                        let input_idle_seconds = event.input_stats.idle_seconds;
+                        mark_metadata(
+                            &mut event,
+                            "inputIdleSeconds",
+                            serde_json::Value::from(input_idle_seconds),
+                        );
+                        mark_metadata(
+                            &mut event,
+                            "passiveAttention",
+                            serde_json::Value::Bool(true),
+                        );
+                        mark_metadata(
+                            &mut event,
+                            "passiveAttentionReason",
+                            serde_json::Value::String(passive_attention_reason.into()),
+                        );
+                        event.input_stats.idle_seconds = 0;
+                    }
                 }
                 sanitize_event(&mut event);
+
+                if manual_away {
+                    if observe_manual_away_return(
+                        &mut manual_away_return,
+                        &event,
+                        MANUAL_AWAY_POLL_SECONDS,
+                    ) {
+                        let Some(candidate) = manual_away_return.take() else {
+                            continue;
+                        };
+                        collector.cancel_manual_away();
+                        pending = None;
+                        task_view_started_at = None;
+
+                        let boundary = candidate.first_event.timestamp.clone();
+                        let mut start_event = candidate.latest_event.clone();
+                        start_event.timestamp = boundary.clone();
+                        mark_metadata(
+                            &mut start_event,
+                            "manualAwayReturn",
+                            serde_json::Value::Bool(true),
+                        );
+                        mark_metadata(
+                            &mut start_event,
+                            "manualAwayReturnConfirmedSeconds",
+                            serde_json::Value::from(MANUAL_AWAY_RETURN_SECONDS),
+                        );
+                        let signature =
+                            context_signature(&start_event, settings.idle_threshold_seconds);
+                        if let Some(previous) = active.take() {
+                            if let Err(error) =
+                                close_context_at(&collector, &db, previous, boundary.clone())
+                            {
+                                collector.set_error(error);
+                            }
+                        }
+                        match open_context(&collector, &db, start_event, signature) {
+                            Ok(mut context) => {
+                                if candidate.latest_event.timestamp > boundary {
+                                    let mut heartbeat_event = candidate.latest_event;
+                                    mark_metadata(
+                                        &mut heartbeat_event,
+                                        "manualAwayReturn",
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    if let Err(error) = heartbeat_context(
+                                        &collector,
+                                        &db,
+                                        &mut context,
+                                        heartbeat_event,
+                                    ) {
+                                        collector.set_error(error);
+                                    }
+                                }
+                                active = Some(context);
+                            }
+                            Err(error) => collector.set_error(error),
+                        }
+                        collector
+                            .wait_for_next_poll(u64::from(MANUAL_AWAY_POLL_SECONDS))
+                            .await;
+                        continue;
+                    }
+
+                    let manual_started_at = collector.manual_away_started_at.lock().take();
+                    force_manual_away_event(
+                        &mut event,
+                        settings.idle_threshold_seconds,
+                        manual_started_at.as_deref(),
+                    );
+                }
 
                 // Task View is a transition surface, not a standalone activity. Keep its
                 // first timestamp and assign that interval to the context selected next.
@@ -148,7 +272,13 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     if let Some(current) = active.as_mut() {
                         current.last_observed_at = Instant::now();
                     }
-                    sleep(Duration::from_secs(settings.poll_interval_seconds as u64)).await;
+                    collector
+                        .wait_for_next_poll(if manual_away {
+                            u64::from(MANUAL_AWAY_POLL_SECONDS)
+                        } else {
+                            settings.poll_interval_seconds as u64
+                        })
+                        .await;
                     continue;
                 }
 
@@ -285,7 +415,13 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     }
                 }
 
-                sleep(Duration::from_secs(settings.poll_interval_seconds as u64)).await;
+                collector
+                    .wait_for_next_poll(if manual_away {
+                        u64::from(MANUAL_AWAY_POLL_SECONDS)
+                    } else {
+                        settings.poll_interval_seconds as u64
+                    })
+                    .await;
             }
         });
         Ok(())
@@ -295,12 +431,14 @@ impl CollectorAdapter for Arc<DesktopCollector> {
         let _lifecycle = self.lifecycle.lock();
         self.running.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
         Ok(())
     }
 
     fn health(&self) -> CollectorHealth {
         CollectorHealth {
             running: self.running.load(Ordering::SeqCst),
+            manual_away: self.is_manual_away(),
             last_event_at: self.last_event_at.lock().clone(),
             last_error: self.last_error.lock().clone(),
         }
@@ -329,6 +467,65 @@ fn observe_pending_context(
         elapsed_seconds(&candidate.first_event.timestamp, &event.timestamp)
             .is_some_and(|seconds| seconds >= SWITCH_CONFIRM_SECONDS)
     })
+}
+
+fn observe_manual_away_return(
+    candidate: &mut Option<ManualAwayReturn>,
+    event: &RawActivityEvent,
+    poll_interval_seconds: u32,
+) -> bool {
+    let input_idle_milliseconds = event
+        .metadata
+        .get("inputIdleMilliseconds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| event.input_stats.idle_seconds.saturating_mul(1000));
+    let recent_input_limit = u64::from(poll_interval_seconds.max(1))
+        .saturating_mul(1000)
+        .saturating_add(250);
+    if input_idle_milliseconds > recent_input_limit {
+        *candidate = None;
+        return false;
+    }
+
+    match candidate {
+        Some(current) => current.latest_event = event.clone(),
+        None => {
+            *candidate = Some(ManualAwayReturn {
+                first_event: event.clone(),
+                latest_event: event.clone(),
+            });
+        }
+    }
+    candidate.as_ref().is_some_and(|current| {
+        elapsed_seconds(
+            &current.first_event.timestamp,
+            &current.latest_event.timestamp,
+        )
+        .is_some_and(|seconds| seconds >= MANUAL_AWAY_RETURN_SECONDS)
+    })
+}
+
+fn force_manual_away_event(
+    event: &mut RawActivityEvent,
+    idle_threshold_seconds: u32,
+    started_at: Option<&str>,
+) {
+    let input_idle_seconds = event.input_stats.idle_seconds;
+    mark_metadata(
+        event,
+        "inputIdleSeconds",
+        serde_json::Value::from(input_idle_seconds),
+    );
+    mark_metadata(event, "manualAway", serde_json::Value::Bool(true));
+    if let Some(started_at) = started_at.filter(|value| !value.trim().is_empty()) {
+        event.timestamp = started_at.to_string();
+        mark_metadata(
+            event,
+            "manualAwayStartedAt",
+            serde_json::Value::String(started_at.to_string()),
+        );
+    }
+    event.input_stats.idle_seconds = u64::from(idle_threshold_seconds.max(1));
 }
 
 fn open_context(
@@ -850,13 +1047,15 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
         };
-        let idle_seconds = if GetLastInputInfo(&mut last_input).as_bool() {
-            GetTickCount().saturating_sub(last_input.dwTime) as u64 / 1000
+        let idle_milliseconds = if GetLastInputInfo(&mut last_input).as_bool() {
+            GetTickCount().wrapping_sub(last_input.dwTime) as u64
         } else {
             0
         };
+        let idle_seconds = idle_milliseconds / 1000;
 
         let mut metadata = json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" });
+        metadata["inputIdleMilliseconds"] = serde_json::Value::from(idle_milliseconds);
         if is_media_app(&app)
             || (is_chat_client_app(&app) && looks_like_media_window(&native_title))
         {
@@ -2840,6 +3039,108 @@ mod tests {
             pending.as_ref().map(|candidate| candidate.first_event.timestamp.as_str()),
             Some("2026-07-12T10:00:10Z"),
         );
+    }
+
+    #[test]
+    fn manual_away_returns_after_five_seconds_of_sustained_input() {
+        let event = |timestamp: &str, idle_milliseconds: u64| RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: timestamp.into(),
+            app: Some("chrome.exe".into()),
+            window_title: Some("工作页面".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats {
+                idle_seconds: idle_milliseconds / 1000,
+                ..Default::default()
+            },
+            metadata: json!({ "inputIdleMilliseconds": idle_milliseconds }),
+        };
+        let mut candidate = None;
+        assert!(!observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:00Z", 80),
+            1,
+        ));
+        assert!(!observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:04Z", 120),
+            1,
+        ));
+        assert!(observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:05Z", 90),
+            1,
+        ));
+        let candidate = candidate.expect("return candidate");
+        assert_eq!(candidate.first_event.timestamp, "2026-07-17T10:00:00Z");
+        assert_eq!(candidate.latest_event.timestamp, "2026-07-17T10:00:05Z");
+    }
+
+    #[test]
+    fn manual_away_return_resets_when_input_stops() {
+        let event = |timestamp: &str, idle_milliseconds: u64| RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: timestamp.into(),
+            app: Some("code.exe".into()),
+            window_title: Some("ScreenUse".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({ "inputIdleMilliseconds": idle_milliseconds }),
+        };
+        let mut candidate = None;
+        assert!(!observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:00Z", 30),
+            1,
+        ));
+        assert!(!observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:03Z", 2200),
+            1,
+        ));
+        assert!(candidate.is_none());
+        assert!(!observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:04Z", 40),
+            1,
+        ));
+        assert!(observe_manual_away_return(
+            &mut candidate,
+            &event("2026-07-17T10:00:09Z", 70),
+            1,
+        ));
+    }
+
+    #[test]
+    fn manual_away_starts_at_the_tray_click_and_forces_idle_classification() {
+        let mut event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-17T10:00:01Z".into(),
+            app: Some("QQ.exe".into()),
+            window_title: Some("科研群".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({ "inputIdleMilliseconds": 50 }),
+        };
+        force_manual_away_event(
+            &mut event,
+            180,
+            Some("2026-07-17T10:00:00Z"),
+        );
+        assert_eq!(event.timestamp, "2026-07-17T10:00:00Z");
+        assert_eq!(event.input_stats.idle_seconds, 180);
+        assert_eq!(event.metadata["manualAway"].as_bool(), Some(true));
+        assert_eq!(event.metadata["inputIdleSeconds"].as_u64(), Some(0));
+        assert_eq!(context_signature(&event, 180), "idle");
     }
 
     #[test]
