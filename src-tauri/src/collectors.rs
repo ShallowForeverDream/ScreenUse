@@ -1080,15 +1080,20 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
                 metadata["conversationTitle"] =
                     serde_json::Value::String(context.title.clone());
             }
-            if context.source == "chatgpt-conversation" {
-                metadata["chatgptConversationTitle"] =
-                    serde_json::Value::String(context.title.clone());
+            if is_openai_conversation_source(context.source) {
+                metadata["chatgptConversationTitle"] = serde_json::Value::String(
+                    raw_openai_conversation_title(
+                        context.source,
+                        &context.title,
+                        context.workspace.as_deref(),
+                    ),
+                );
             }
             if context.source == "qq-conversation-header" {
                 metadata["qqConversationTitle"] =
                     serde_json::Value::String(context.title.clone());
             }
-            if context.source == "chatgpt-conversation" {
+            if is_openai_conversation_source(context.source) {
                 if let Some(project) = context.workspace {
                     metadata["chatgptProject"] = serde_json::Value::String(project);
                 }
@@ -1398,6 +1403,33 @@ fn is_chat_client_app(app: &str) -> bool {
             | "element"
             | "viber"
     )
+}
+
+#[cfg(windows)]
+fn is_openai_conversation_source(source: &str) -> bool {
+    matches!(
+        source,
+        "chatgpt-conversation" | "codex-project-task" | "codex-task"
+    )
+}
+
+#[cfg(windows)]
+fn raw_openai_conversation_title(
+    source: &str,
+    display_title: &str,
+    project: Option<&str>,
+) -> String {
+    match source {
+        "codex-project-task" => project
+            .and_then(|project| display_title.strip_prefix(&format!("项目-{project}-")))
+            .unwrap_or(display_title)
+            .to_string(),
+        "codex-task" => display_title
+            .strip_prefix("任务-")
+            .unwrap_or(display_title)
+            .to_string(),
+        _ => display_title.to_string(),
+    }
 }
 
 #[cfg(windows)]
@@ -2552,8 +2584,10 @@ fn chatgpt_selected_context(
         let result = (|| -> windows::core::Result<Option<ActivePageContext>> {
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let root = automation.ElementFromHandle(window)?;
+            let content_window = chromium_accessibility_window(window).unwrap_or(window);
+            let root = automation.ElementFromHandle(content_window)?;
             let walker = automation.ControlViewWalker()?;
+            let codex_mode = is_codex_workspace(&automation, &root)?;
             let mut action: Option<IUIAutomationElement> = None;
             for label in [
                 "任务操作",
@@ -2607,10 +2641,19 @@ fn chatgpt_selected_context(
                 }
                 child = walker.GetNextSiblingElement(&element).ok();
             }
-            Ok(title.map(|title| ActivePageContext {
+            let Some(raw_title) = title else { return Ok(None); };
+            if codex_mode && project.is_none() {
+                project = codex_project_for_task(&automation, &root, &walker, &raw_title)?;
+            }
+            let (title, source) = if codex_mode {
+                codex_task_context_title(&raw_title, project.as_deref())
+            } else {
+                (raw_title, "chatgpt-conversation")
+            };
+            Ok(Some(ActivePageContext {
                 title,
                 workspace: project,
-                source: "chatgpt-conversation",
+                source,
                 kind: "conversation",
             }))
         })();
@@ -2618,6 +2661,130 @@ fn chatgpt_selected_context(
             CoUninitialize();
         }
         result.map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn chromium_accessibility_window(
+    window: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, GetClassNameW, IsWindowVisible,
+    };
+
+    struct SearchState {
+        result: Option<HWND>,
+    }
+
+    unsafe extern "system" fn visit(child: HWND, parameter: LPARAM) -> BOOL {
+        let state = &mut *(parameter.0 as *mut SearchState);
+        if !IsWindowVisible(child).as_bool() {
+            return BOOL(1);
+        }
+        let mut class_name = [0u16; 96];
+        let length = GetClassNameW(child, &mut class_name).max(0) as usize;
+        if String::from_utf16_lossy(&class_name[..length]) == "Chrome_RenderWidgetHostHWND" {
+            state.result = Some(child);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut state = SearchState { result: None };
+    unsafe {
+        let _ = EnumChildWindows(
+            window,
+            Some(visit),
+            LPARAM((&mut state as *mut SearchState) as isize),
+        );
+    }
+    state.result
+}
+
+#[cfg(windows)]
+fn is_codex_workspace(
+    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
+    root: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> windows::core::Result<bool> {
+    use windows::core::VARIANT;
+    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_NamePropertyId};
+
+    unsafe {
+        for label in [
+            "切换模式，当前模式：Codex",
+            "切换模式，当前模式: Codex",
+            "Switch mode, current mode: Codex",
+        ] {
+            let condition =
+                automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(label))?;
+            if root.FindFirst(TreeScope_Descendants, &condition).is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn codex_project_for_task(
+    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
+    root: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+    walker: &windows::Win32::UI::Accessibility::IUIAutomationTreeWalker,
+    task_title: &str,
+) -> windows::core::Result<Option<String>> {
+    use std::collections::BTreeSet;
+    use windows::core::VARIANT;
+    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_NamePropertyId};
+
+    let projects = unsafe {
+        let condition =
+            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(task_title))?;
+        let matches = root.FindAll(TreeScope_Descendants, &condition)?;
+        let mut projects = BTreeSet::new();
+        for index in 0..matches.Length()? {
+            let mut element = Some(matches.GetElement(index)?);
+            for _ in 0..8 {
+                let Some(current) = element else { break; };
+                let name = current
+                    .CurrentName()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                if let Some(project) = codex_project_task_list_name(&name) {
+                    projects.insert(project);
+                    break;
+                }
+                element = walker.GetParentElement(&current).ok();
+            }
+        }
+        projects
+    };
+    Ok((projects.len() == 1).then(|| projects.into_iter().next()).flatten())
+}
+
+#[cfg(windows)]
+fn codex_project_task_list_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    value
+        .strip_suffix("中的已安排任务")
+        .or_else(|| value.strip_prefix("Scheduled tasks in "))
+        .or_else(|| value.strip_suffix(" scheduled tasks"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(windows)]
+fn codex_task_context_title(
+    conversation: &str,
+    project: Option<&str>,
+) -> (String, &'static str) {
+    match project.map(str::trim).filter(|project| !project.is_empty()) {
+        Some(project) => (
+            format!("项目-{project}-{conversation}"),
+            "codex-project-task",
+        ),
+        None => (format!("任务-{conversation}"), "codex-task"),
     }
 }
 
@@ -3513,6 +3680,35 @@ mod tests {
         assert_eq!(chatgpt_project_name("项目：HDU"), Some("HDU".into()));
         assert_eq!(chatgpt_project_name("Project: ScreenUse"), Some("ScreenUse".into()));
         assert_eq!(chatgpt_project_name("HDU"), None);
+        assert_eq!(
+            codex_project_task_list_name("HDU中的已安排任务"),
+            Some("HDU".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_tasks_keep_the_project_and_conversation_hierarchy() {
+        assert_eq!(
+            codex_task_context_title("codex_work_bridge", Some("HDU")),
+            ("项目-HDU-codex_work_bridge".into(), "codex-project-task")
+        );
+        assert_eq!(
+            codex_task_context_title("整理成绩", None),
+            ("任务-整理成绩".into(), "codex-task")
+        );
+        assert_eq!(
+            raw_openai_conversation_title(
+                "codex-project-task",
+                "项目-HDU-codex_work_bridge",
+                Some("HDU"),
+            ),
+            "codex_work_bridge"
+        );
+        assert_eq!(
+            raw_openai_conversation_title("codex-task", "任务-整理成绩", None),
+            "整理成绩"
+        );
     }
 
     #[cfg(windows)]

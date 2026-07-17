@@ -1050,6 +1050,8 @@ pub(crate) fn active_context_type(metadata: &serde_json::Value) -> Option<&str> 
             {
                 Some(
                     "chatgpt-conversation"
+                    | "codex-project-task"
+                    | "codex-task"
                     | "qq-conversation-header"
                     | "chat-conversation-header"
                     | "chat-conversation-selection",
@@ -1274,17 +1276,22 @@ mod tests {
 
     #[test]
     fn chatgpt_summary_starts_with_the_current_conversation() {
-        let mut event = event("ChatGPT.exe", "codex_work_bridge");
+        let mut event = event("ChatGPT.exe", "项目-HDU-codex_work_bridge");
         event.workspace = Some("HDU".into());
         event.file_path = Some(r"C:\Program Files\OpenAI\ChatGPT.exe".into());
         event.metadata = json!({
-            "activePageTitle": "codex_work_bridge",
-            "activePageSource": "chatgpt-conversation",
+            "activePageTitle": "项目-HDU-codex_work_bridge",
+            "activePageSource": "codex-project-task",
+            "activeContextType": "conversation",
+            "conversationTitle": "项目-HDU-codex_work_bridge",
             "chatgptConversationTitle": "codex_work_bridge",
             "chatgptProject": "HDU"
         });
 
-        assert_eq!(summary_for_event(&event, "开发"), "codex_work_bridge · HDU");
+        assert_eq!(
+            summary_for_event(&event, "开发"),
+            "项目-HDU-codex_work_bridge"
+        );
     }
 
     #[test]
