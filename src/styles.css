@@ -416,12 +416,20 @@ kbd {
 }
 .date-navigator input {
   width: 126px;
+  min-width: 0;
   min-height: auto;
   padding: 0;
   border: 0;
   background: transparent;
   box-shadow: none;
   font-size: 14px;
+}
+.date-weekday {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 .date-navigator .today-button { width: auto; padding: 0 10px; }
 .date-range-badge {

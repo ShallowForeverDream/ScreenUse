@@ -1374,6 +1374,7 @@ function DateNavigator({
   onNext: () => void;
 }) {
   const today = localDateKey(new Date());
+  const weekday = ['日', '一', '二', '三', '四', '五', '六'][dateFromKey(value).getDay()];
   return (
     <div className="date-navigator">
       <button onClick={onPrevious} type="button" aria-label="前一天">
@@ -1382,6 +1383,9 @@ function DateNavigator({
       <label>
         <CalendarDays size={16} />
         <input type="date" value={value} onChange={(event) => onChange(event.target.value)} />
+        <span className="date-weekday" title={`星期${weekday}`} aria-label={`星期${weekday}`}>
+          周{weekday}
+        </span>
       </label>
       <button onClick={onNext} type="button" aria-label="后一天">
         <ChevronRight size={16} />
