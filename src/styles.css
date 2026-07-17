@@ -1232,6 +1232,7 @@ kbd {
 }
 .toggle-row input:checked + i { background: var(--blue-strong); }
 .toggle-row input:checked + i::after { transform: translateX(13px); }
+.toggle-row.disabled { cursor: wait; opacity: .68; }
 .setting-callout { padding: 10px; display: flex; align-items: flex-start; gap: 9px; border: 1px solid color-mix(in srgb, var(--blue-strong) 16%, transparent); border-radius: 12px; color: var(--blue); background: color-mix(in srgb, var(--blue-strong) 6%, transparent); }
 .setting-callout.good { color: var(--green); border-color: rgba(52, 211, 153, .16); background: rgba(52, 211, 153, .05); }
 .setting-callout strong, .setting-callout span { display: block; }

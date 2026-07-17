@@ -171,6 +171,7 @@ export const api = {
   learnRuleFromSession: (id: string, keyword?: string) => call<AttributionRule>('learn_rule_from_session', { id, keyword: keyword || null }),
   cleanupMediaCache: () => call<number>('cleanup_media_cache', undefined, 0),
   saveSettings: (settings: AppSettings) => call<void>('save_settings', { settings }),
+  setLaunchAtLogin: (enabled: boolean) => call<void>('set_launch_at_login', { enabled }),
   githubSyncStatus: () => call<GithubSyncStatus>('get_github_sync_status', undefined, previewSyncStatus()),
   saveGithubSyncConfig: (
     config: GithubSyncConfig,

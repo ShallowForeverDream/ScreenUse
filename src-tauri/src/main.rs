@@ -381,6 +381,19 @@ fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), St
 }
 
 #[tauri::command]
+fn set_launch_at_login(state: State<AppState>, enabled: bool) -> Result<(), String> {
+    let previous = state.db.get_settings().map_err(map_err)?.normalized();
+    autostart::set_launch_at_login(enabled).map_err(map_err)?;
+    let mut next = previous.clone();
+    next.launch_at_login = enabled;
+    if let Err(error) = state.db.save_settings(&next) {
+        let _ = autostart::set_launch_at_login(previous.launch_at_login);
+        return Err(map_err(error));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn get_github_sync_status(state: State<AppState>) -> Result<GithubSyncStatus, String> {
     github_sync::status(&state.db).map_err(map_err)
 }
@@ -748,6 +761,7 @@ fn main() {
             learn_rule_from_session,
             cleanup_media_cache,
             save_settings,
+            set_launch_at_login,
             get_github_sync_status,
             save_github_sync_config,
             generate_github_sync_key,

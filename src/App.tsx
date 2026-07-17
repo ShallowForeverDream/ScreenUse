@@ -4558,6 +4558,7 @@ function SettingsView({
   const [settings, setSettings] = useState<AppSettings>(data.settings);
   const [savedSettings, setSavedSettings] = useState<AppSettings>(data.settings);
   const [secret, setSecret] = useState('');
+  const [launchAtLoginBusy, setLaunchAtLoginBusy] = useState(false);
   const savedFingerprintRef = useRef(JSON.stringify(data.settings));
 
   useEffect(() => {
@@ -4575,6 +4576,23 @@ function SettingsView({
   const updateTheme = (theme: ThemeMode) => {
     update('theme', theme);
     onThemeChange(theme);
+  };
+
+  const updateLaunchAtLogin = async (enabled: boolean) => {
+    if (launchAtLoginBusy) return;
+    const previous = settings.launchAtLogin;
+    setSettings((current) => ({ ...current, launchAtLogin: enabled }));
+    setLaunchAtLoginBusy(true);
+    try {
+      await runAction(
+        () => api.setLaunchAtLogin(enabled),
+        enabled ? '开机自启已开启' : '开机自启已关闭',
+      );
+    } catch {
+      setSettings((current) => ({ ...current, launchAtLogin: previous }));
+    } finally {
+      setLaunchAtLoginBusy(false);
+    }
   };
 
   const saveAll = useCallback(async () => {
@@ -4716,9 +4734,10 @@ function SettingsView({
         </div>
         <Toggle
           checked={settings.launchAtLogin}
-          onChange={(value) => update('launchAtLogin', value)}
-          title="登录 Windows 后静默启动"
-          detail="从登录启动项进入时只显示托盘，不弹出主窗口。"
+          disabled={launchAtLoginBusy}
+          onChange={(value) => void updateLaunchAtLogin(value)}
+          title="开机后自动启动"
+          detail="切换后立即写入 Windows 启动项，无需再点保存；登录后只显示托盘。"
         />
         <Toggle
           checked={settings.autoStart}
@@ -6331,22 +6350,29 @@ function NumberInput({
 
 function Toggle({
   checked,
+  disabled = false,
   onChange,
   title,
   detail,
 }: {
   checked: boolean;
+  disabled?: boolean;
   onChange: (checked: boolean) => void;
   title: string;
   detail: string;
 }) {
   return (
-    <label className="toggle-row">
+    <label className={`toggle-row ${disabled ? 'disabled' : ''}`}>
       <span>
         <strong>{title}</strong>
         <small>{detail}</small>
       </span>
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+      />
       <i />
     </label>
   );
