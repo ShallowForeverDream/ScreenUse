@@ -62,6 +62,12 @@ struct ManualAwayReturn {
     latest_event: RawActivityEvent,
 }
 
+#[derive(Debug, Clone)]
+struct TransitionHandoff {
+    started_at: String,
+    source: &'static str,
+}
+
 const SWITCH_CONFIRM_SECONDS: i64 = 5;
 const MANUAL_AWAY_RETURN_SECONDS: i64 = 5;
 const MANUAL_AWAY_POLL_SECONDS: u32 = 1;
@@ -130,7 +136,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
             let mut active: Option<ActiveContext> = None;
             let mut pending: Option<PendingContext> = None;
             let mut manual_away_return: Option<ManualAwayReturn> = None;
-            let mut task_view_started_at: Option<String> = None;
+            let mut handoff: Option<TransitionHandoff> = None;
             let mut settings = db.get_settings().unwrap_or_default().normalized();
             let mut settings_loaded_at = Instant::now();
 
@@ -204,7 +210,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         };
                         collector.cancel_manual_away();
                         pending = None;
-                        task_view_started_at = None;
+                        handoff = None;
 
                         let boundary = candidate.first_event.timestamp.clone();
                         let mut start_event = candidate.latest_event.clone();
@@ -264,10 +270,20 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     );
                 }
 
-                // Task View is a transition surface, not a standalone activity. Keep its
-                // first timestamp and assign that interval to the context selected next.
-                if is_windows_task_view(&event) {
-                    task_view_started_at.get_or_insert_with(|| event.timestamp.clone());
+                // Transition surfaces are not standalone activities. Keep their first
+                // timestamp and assign that interval to the semantic context selected next.
+                let handoff_source = if is_windows_task_view(&event) {
+                    Some("windows-task-view")
+                } else if is_incomplete_chat_workspace_handoff(active.as_ref(), &event) {
+                    Some("chat-workspace-loading")
+                } else {
+                    None
+                };
+                if let Some(source) = handoff_source {
+                    handoff.get_or_insert_with(|| TransitionHandoff {
+                        started_at: event.timestamp.clone(),
+                        source,
+                    });
                     pending = None;
                     if let Some(current) = active.as_mut() {
                         current.last_observed_at = Instant::now();
@@ -293,14 +309,13 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         }
                     }
                     pending = None;
-                    task_view_started_at = None;
+                    handoff = None;
                 }
                 let signature = context_signature(&event, settings.idle_threshold_seconds);
                 if active.is_none() {
                     pending = None;
-                    if let Some(boundary) = task_view_started_at.take() {
-                        event.timestamp = boundary;
-                        mark_metadata(&mut event, "taskViewHandoff", serde_json::Value::Bool(true));
+                    if let Some(boundary) = handoff.take() {
+                        apply_transition_handoff(&mut event, &boundary);
                     }
                     match open_context(&collector, &db, event, signature) {
                         Ok(context) => active = Some(context),
@@ -310,7 +325,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     let active_signature = active.as_ref().map(|current| current.signature.clone()).unwrap_or_default();
                     if should_inherit_active_context(&active_signature, &signature, &event) {
                         pending = None;
-                        task_view_started_at = None;
+                        handoff = None;
                         if let Some(current) = active.as_mut() {
                             current.last_observed_at = Instant::now();
                             let inherited_event =
@@ -332,7 +347,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                         }
                     } else if active_signature == signature {
                         pending = None;
-                        task_view_started_at = None;
+                        handoff = None;
                         if let Some(current) = active.as_mut() {
                             current.last_observed_at = Instant::now();
                             let heartbeat_due = current.last_emitted_at.elapsed()
@@ -363,13 +378,8 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                             .as_ref()
                             .map_or(true, |candidate| candidate.signature != signature)
                         {
-                            if let Some(boundary) = task_view_started_at.as_ref() {
-                                transition_event.timestamp = boundary.clone();
-                                mark_metadata(
-                                    &mut transition_event,
-                                    "taskViewHandoff",
-                                    serde_json::Value::Bool(true),
-                                );
+                            if let Some(boundary) = handoff.as_ref() {
+                                apply_transition_handoff(&mut transition_event, boundary);
                             }
                         }
                         // Enter idle immediately because its boundary is backdated. Leaving
@@ -388,7 +398,7 @@ impl CollectorAdapter for Arc<DesktopCollector> {
 
                         if ready {
                             let Some(mut next) = pending.take() else { continue; };
-                            task_view_started_at = None;
+                            handoff = None;
                             mark_metadata(
                                 &mut next.first_event,
                                 "switchConfirmedAfterObservations",
@@ -656,6 +666,60 @@ fn is_windows_task_view(event: &RawActivityEvent) -> bool {
     shell_app
         && (matches!(title.as_str(), "任务视图" | "task view")
             || title.contains("multitaskingviewframe"))
+}
+
+fn is_incomplete_chat_workspace_handoff(
+    active: Option<&ActiveContext>,
+    event: &RawActivityEvent,
+) -> bool {
+    let Some(active) = active else { return false; };
+    let app = event
+        .app
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let active_app = active
+        .event
+        .app
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if app != active_app || !matches!(app.as_str(), "chatgpt" | "chatgpt.exe" | "codex" | "codex.exe") {
+        return false;
+    }
+    let active_has_page = active
+        .event
+        .metadata
+        .get("activePageTitle")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let observed_has_page = event
+        .metadata
+        .get("activePageTitle")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let title = event
+        .window_title
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    active_has_page
+        && !observed_has_page
+        && matches!(title.to_ascii_lowercase().as_str(), "" | "chatgpt" | "codex")
+}
+
+fn apply_transition_handoff(event: &mut RawActivityEvent, handoff: &TransitionHandoff) {
+    event.timestamp.clone_from(&handoff.started_at);
+    mark_metadata(
+        event,
+        "contextHandoff",
+        serde_json::Value::String(handoff.source.into()),
+    );
+    if handoff.source == "windows-task-view" {
+        mark_metadata(event, "taskViewHandoff", serde_json::Value::Bool(true));
+    }
 }
 
 fn should_inherit_active_context(
@@ -2625,7 +2689,10 @@ fn chatgpt_selected_context(
                     }
                 }
             }
-            let Some(parent) = header else { return Ok(None); };
+            let new_task = codex_mode && is_codex_new_task_page(&automation, &root)?;
+            let Some(parent) = header else {
+                return Ok(new_task.then(codex_new_task_context));
+            };
             let mut child = walker.GetFirstChildElement(&parent).ok();
             let mut title = None;
             let mut project = None;
@@ -2641,7 +2708,9 @@ fn chatgpt_selected_context(
                 }
                 child = walker.GetNextSiblingElement(&element).ok();
             }
-            let Some(raw_title) = title else { return Ok(None); };
+            let Some(raw_title) = title else {
+                return Ok(new_task.then(codex_new_task_context));
+            };
             if codex_mode && project.is_none() {
                 project = codex_project_for_task(&automation, &root, &walker, &raw_title)?;
             }
@@ -2724,6 +2793,40 @@ fn is_codex_workspace(
         }
     }
     Ok(false)
+}
+
+#[cfg(windows)]
+fn is_codex_new_task_page(
+    automation: &windows::Win32::UI::Accessibility::IUIAutomation,
+    root: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> windows::core::Result<bool> {
+    use windows::core::VARIANT;
+    use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_NamePropertyId};
+
+    unsafe {
+        for label in [
+            "我们该构建什么？",
+            "What should we build?",
+            "What do you want to build?",
+        ] {
+            let condition =
+                automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(label))?;
+            if root.FindFirst(TreeScope_Descendants, &condition).is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn codex_new_task_context() -> ActivePageContext {
+    ActivePageContext {
+        title: "任务-新建任务".into(),
+        workspace: None,
+        source: "codex-task",
+        kind: "conversation",
+    }
 }
 
 #[cfg(windows)]
@@ -3461,6 +3564,66 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn untitled_chatgpt_loading_is_a_handoff_between_semantic_tasks() {
+        let semantic = RawActivityEvent {
+            id: String::new(),
+            source: "windows-foreground".into(),
+            timestamp: "2026-07-17T03:16:37Z".into(),
+            app: Some("ChatGPT.exe".into()),
+            window_title: Some("项目-HDU-IOT week1".into()),
+            url: None,
+            file_path: None,
+            workspace: Some("HDU".into()),
+            input_stats: InputStats::default(),
+            metadata: json!({
+                "activePageTitle": "项目-HDU-IOT week1",
+                "activePageSource": "codex-project-task"
+            }),
+        };
+        let active = ActiveContext {
+            id: "event".into(),
+            session_id: "session".into(),
+            signature: context_signature(&semantic, 180),
+            started_at: semantic.timestamp.clone(),
+            event: semantic,
+            last_observed_at: Instant::now(),
+            last_emitted_at: Instant::now(),
+        };
+        let mut loading = RawActivityEvent {
+            id: String::new(),
+            source: "windows-foreground".into(),
+            timestamp: "2026-07-17T03:16:59Z".into(),
+            app: Some("ChatGPT.exe".into()),
+            window_title: Some("ChatGPT".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+
+        assert!(is_incomplete_chat_workspace_handoff(Some(&active), &loading));
+        let handoff = TransitionHandoff {
+            started_at: loading.timestamp.clone(),
+            source: "chat-workspace-loading",
+        };
+        loading.timestamp = "2026-07-17T03:17:12Z".into();
+        apply_transition_handoff(&mut loading, &handoff);
+        assert_eq!(loading.timestamp, "2026-07-17T03:16:59Z");
+        assert_eq!(
+            loading.metadata["contextHandoff"].as_str(),
+            Some("chat-workspace-loading")
+        );
+        assert!(!is_incomplete_chat_workspace_handoff(
+            Some(&active),
+            &RawActivityEvent {
+                app: Some("chrome.exe".into()),
+                ..loading
+            }
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn chatgpt_title_filter_rejects_only_generic_chrome() {
@@ -3709,6 +3872,9 @@ mod tests {
             raw_openai_conversation_title("codex-task", "任务-整理成绩", None),
             "整理成绩"
         );
+        let new_task = codex_new_task_context();
+        assert_eq!(new_task.title, "任务-新建任务");
+        assert_eq!(new_task.source, "codex-task");
     }
 
     #[cfg(windows)]
