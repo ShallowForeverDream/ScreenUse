@@ -333,7 +333,7 @@ fn start_analysis_queue(state: State<'_, AppState>) -> Result<(), String> {
     {
         return Err("请先开启 AI 自动复核".into());
     }
-    run_optional_ai(state.db.clone());
+    run_automatic_ai(state.db.clone());
     Ok(())
 }
 
@@ -491,13 +491,29 @@ async fn test_ai_config(settings: AppSettings, secret_name: String) -> Result<St
 }
 
 fn run_optional_ai(db: Arc<AppDb>) {
+    run_optional_ai_with_delay(db, false);
+}
+
+fn run_automatic_ai(db: Arc<AppDb>) {
+    run_optional_ai_with_delay(db, true);
+}
+
+fn run_optional_ai_with_delay(db: Arc<AppDb>, use_automatic_delay: bool) {
     tauri::async_runtime::spawn(async move {
         let has_pending = db
             .queue_health()
             .map(|health| health.pending > 0)
             .unwrap_or(false);
-        if !has_pending && !analysis_worker::enqueue_recent_uncertain(&db).unwrap_or(false) {
-            return;
+        if !has_pending {
+            let queued = if use_automatic_delay {
+                analysis_worker::enqueue_automatic_recent_uncertain(&db)
+            } else {
+                analysis_worker::enqueue_recent_uncertain(&db)
+            }
+            .unwrap_or(false);
+            if !queued {
+                return;
+            }
         }
         let _ = analysis_worker::run_once(db).await;
     });

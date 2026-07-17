@@ -295,6 +295,7 @@ pub struct AppSettings {
     pub ai_provider: String,
     pub ai_review_scope: String,
     pub min_ai_session_minutes: u32,
+    pub ai_review_delay_sessions: u32,
     pub codex_plan: String,
     pub ai_base_url: String,
     pub ai_model: String,
@@ -331,6 +332,7 @@ impl Default for AppSettings {
             ai_provider: String::new(),
             ai_review_scope: "fallback".into(),
             min_ai_session_minutes: 1,
+            ai_review_delay_sessions: 10,
             codex_plan: "pro-20x".into(),
             ai_base_url: "https://api.openai.com/v1".into(),
             ai_model: "".into(),
@@ -363,6 +365,7 @@ impl AppSettings {
         self.idle_category = clean_setting_label(&self.idle_category, "无效");
         self.idle_project_name = clean_setting_label(&self.idle_project_name, "离开");
         self.min_ai_session_minutes = self.min_ai_session_minutes.clamp(0, 240);
+        self.ai_review_delay_sessions = self.ai_review_delay_sessions.min(100);
         self.ai_review_scope = match self.ai_review_scope.as_str() {
             "all" => "all",
             _ => "fallback",
@@ -468,6 +471,7 @@ mod tests {
         assert_eq!(normalized_existing.ai_provider, "codex-account");
         assert_eq!(normalized_existing.ai_model, "gpt-5.6-luna");
         assert_eq!(normalized_existing.min_ai_session_minutes, 1);
+        assert_eq!(normalized_existing.ai_review_delay_sessions, 10);
         assert_eq!(normalized_existing.ai_review_scope, "fallback");
         assert_eq!(normalized_existing.codex_plan, "pro-20x");
 
@@ -511,6 +515,12 @@ mod tests {
             ..AppSettings::default()
         };
         assert_eq!(write_heavy.normalized().heartbeat_seconds, 5);
+
+        let excessive_delay = AppSettings {
+            ai_review_delay_sessions: 500,
+            ..AppSettings::default()
+        };
+        assert_eq!(excessive_delay.normalized().ai_review_delay_sessions, 100);
     }
 }
 

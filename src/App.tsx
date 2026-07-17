@@ -4799,6 +4799,18 @@ function SettingsView({
                 onChange={(value) => update('minAiSessionMinutes', value)}
               />
             </Field>
+            <Field
+              label="自动复核延迟"
+              hint="目标结束后再等待指定数量的新时间段，让模型看到更完整的后续上下文；手动复核不受影响。"
+            >
+              <NumberInput
+                value={settings.aiReviewDelaySessions}
+                min={0}
+                max={100}
+                suffix="个时间段"
+                onChange={(value) => update('aiReviewDelaySessions', value)}
+              />
+            </Field>
             {settings.aiProvider === 'codex-account' && (
               <Field label="Codex 套餐" hint="用于区分固定订阅费与单次信用点消耗。">
                 <select value={settings.codexPlan} onChange={(event) => update('codexPlan', event.target.value)}>

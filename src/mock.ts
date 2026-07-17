@@ -33,6 +33,7 @@ export const fallbackDashboard: DashboardData = {
     aiProvider: 'codex-account',
     aiReviewScope: 'fallback',
     minAiSessionMinutes: 1,
+    aiReviewDelaySessions: 10,
     codexPlan: 'pro-20x',
     aiBaseUrl: 'https://api.openai.com/v1',
     aiModel: 'gpt-5.6-luna',

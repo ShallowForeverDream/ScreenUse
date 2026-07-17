@@ -30,7 +30,7 @@ pub fn start_analysis_worker(db: Arc<AppDb>) {
         loop {
             let settings = db.get_settings().unwrap_or_default().normalized();
             if settings.ai_mode == "auto" {
-                if let Err(error) = enqueue_settled_recent_uncertain(&db) {
+                if let Err(error) = enqueue_automatic_recent_uncertain(&db) {
                     eprintln!("ScreenUse optional AI enqueue error: {error}");
                 }
                 if let Err(error) = run_once(db.clone()).await {
@@ -48,7 +48,7 @@ pub fn enqueue_recent_uncertain(db: &AppDb) -> Result<bool> {
     enqueue_recent_uncertain_inner(db, false)
 }
 
-fn enqueue_settled_recent_uncertain(db: &AppDb) -> Result<bool> {
+pub fn enqueue_automatic_recent_uncertain(db: &AppDb) -> Result<bool> {
     enqueue_recent_uncertain_inner(db, true)
 }
 
@@ -65,12 +65,15 @@ fn enqueue_recent_uncertain_inner(db: &AppDb, require_settle: bool) -> Result<bo
     let mut candidates = db
         .list_sessions(2000)?
         .into_iter()
-        .filter(|session| {
-            if require_settle {
-                is_review_candidate(session, &settings, &queued)
+        .enumerate()
+        .filter_map(|(later_session_count, session)| {
+            let eligible = if require_settle {
+                automatic_review_delay_elapsed(later_session_count, &settings)
+                    && is_review_candidate(&session, &settings, &queued)
             } else {
-                is_review_target(session, &settings) && !queued.contains(&session.id)
-            }
+                is_review_target(&session, &settings) && !queued.contains(&session.id)
+            };
+            eligible.then_some(session)
         })
         .collect::<Vec<_>>();
     sort_review_candidates(&mut candidates);
@@ -571,6 +574,10 @@ fn review_target_has_settled(session: &WorkSession, now: DateTime<Utc>) -> bool 
     })
 }
 
+fn automatic_review_delay_elapsed(later_session_count: usize, settings: &AppSettings) -> bool {
+    later_session_count >= settings.ai_review_delay_sessions as usize
+}
+
 fn is_review_target(session: &WorkSession, settings: &AppSettings) -> bool {
     let minimum_seconds = i64::from(settings.min_ai_session_minutes) * 60;
     let has_reviewable_context =
@@ -773,6 +780,95 @@ mod tests {
         value.ended_at =
             format_time(Utc::now() - ChronoDuration::seconds(AUTO_REVIEW_SETTLE_SECONDS + 1));
         assert!(is_review_candidate(&value, &settings, &queued));
+    }
+
+    #[test]
+    fn automatic_review_waits_for_the_configured_number_of_later_sessions() {
+        let settings = AppSettings {
+            ai_review_delay_sessions: 10,
+            ..AppSettings::default()
+        }
+        .normalized();
+
+        assert!(!automatic_review_delay_elapsed(9, &settings));
+        assert!(automatic_review_delay_elapsed(10, &settings));
+        assert!(automatic_review_delay_elapsed(24, &settings));
+
+        let immediate = AppSettings {
+            ai_review_delay_sessions: 0,
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert!(automatic_review_delay_elapsed(0, &immediate));
+    }
+
+    #[test]
+    fn automatic_enqueue_releases_a_target_after_ten_newer_sessions() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-analysis-delay-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let base = Utc::now() - ChronoDuration::hours(2);
+        let evidence = serde_json::json!([{
+            "kind": "page",
+            "label": "当前页面",
+            "value": "等待后续上下文的独立目标",
+            "weight": 0.9
+        }])
+        .to_string();
+        {
+            let conn = db.conn.lock();
+            conn.execute("DELETE FROM work_sessions", [])
+                .expect("clear seed sessions");
+            for index in 0..10 {
+                let start = base + ChronoDuration::minutes(index * 2);
+                conn.execute(
+                    "INSERT INTO work_sessions VALUES (?1,?2,?3,NULL,NULL,'杂务',?4,0.55,?5,?6,'context-complete',?7)",
+                    rusqlite::params![
+                        format!("delay-{index}"),
+                        format_time(start),
+                        format_time(start + ChronoDuration::minutes(1)),
+                        format!("延迟时间段 {index}"),
+                        evidence,
+                        i64::from(index != 0),
+                        now(),
+                    ],
+                )
+                .expect("insert delayed session");
+            }
+        }
+        let mut settings = db.get_settings().expect("load settings");
+        settings.ai_mode = "auto".into();
+        settings.min_ai_session_minutes = 0;
+        settings.ai_review_delay_sessions = 10;
+        db.save_settings(&settings).expect("save delayed review settings");
+
+        assert!(!enqueue_automatic_recent_uncertain(&db).expect("queue with nine later sessions"));
+        assert!(db.list_analysis_jobs(10).expect("list jobs").is_empty());
+
+        let final_start = base + ChronoDuration::minutes(20);
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('delay-10',?1,?2,NULL,NULL,'杂务','延迟时间段 10',0.95,?3,1,'context-complete',?4)",
+                rusqlite::params![
+                    format_time(final_start),
+                    format_time(final_start + ChronoDuration::minutes(1)),
+                    evidence,
+                    now(),
+                ],
+            )
+            .expect("insert tenth later session");
+        }
+
+        assert!(enqueue_automatic_recent_uncertain(&db).expect("queue after ten later sessions"));
+        let jobs = db.list_analysis_jobs(10).expect("list queued jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].chunk_ids, vec!["delay-0"]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
