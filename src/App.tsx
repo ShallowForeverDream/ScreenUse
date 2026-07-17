@@ -84,6 +84,7 @@ const tabs = [
 ] as const;
 
 type TabId = (typeof tabs)[number]['id'];
+type TimelineRange = 'day' | 'all';
 
 const categoryColors: Record<string, string> = {
   开发: '#60a5fa',
@@ -767,6 +768,7 @@ export default function App() {
   const [loadError, setLoadError] = useState('');
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'error' } | null>(null);
   const [selectedDate, setSelectedDate] = useState(localDateKey(new Date()));
+  const [timelineRange, setTimelineRange] = useState<TimelineRange>('day');
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [selectionResetKey, setSelectionResetKey] = useState(0);
   const [editing, setEditing] = useState<WorkSession[]>([]);
@@ -925,6 +927,14 @@ export default function App() {
         ),
     [data, selectedDate],
   );
+  const timelineSessions = useMemo(
+    () => timelineRange === 'all'
+      ? [...(data?.sessions || [])].sort(
+          (left, right) => new Date(right.startedAt).getTime() - new Date(left.startedAt).getTime(),
+        )
+      : daySessions,
+    [data?.sessions, daySessions, timelineRange],
+  );
   useEffect(() => {
     const validIds = new Set((data?.sessions || []).map((session) => session.id));
     setSelected((current) => {
@@ -936,6 +946,17 @@ export default function App() {
     () => summarizeDay(daySessions, selectedDate, data?.settings),
     [data?.settings, daySessions, selectedDate],
   );
+  const allTimelineStats = useMemo(
+    () => summarizeSessions(
+      data?.sessions || [],
+      (session) => minutesBetween(session.startedAt, session.endedAt),
+      data?.settings,
+    ),
+    [data?.sessions, data?.settings],
+  );
+  const headerStats = activeTab === 'timeline' && timelineRange === 'all'
+    ? allTimelineStats
+    : stats;
 
   if (loading) {
     return (
@@ -984,6 +1005,12 @@ export default function App() {
     const date = dateFromKey(selectedDate);
     date.setDate(date.getDate() + offset);
     setSelectedDate(localDateKey(date));
+    if (activeTab === 'timeline') setTimelineRange('day');
+    setSelected(new Set());
+  };
+  const selectDate = (value: string) => {
+    setSelectedDate(value);
+    if (activeTab === 'timeline') setTimelineRange('day');
     setSelected(new Set());
   };
 
@@ -1087,12 +1114,16 @@ export default function App() {
               <Search size={15} /><span>搜索</span><kbd>Ctrl K</kbd>
             </button>
             {activeTab !== 'settings' && activeTab !== 'ai' && (
-              <DateNavigator
-                value={selectedDate}
-                onChange={setSelectedDate}
-                onPrevious={() => goDate(-1)}
-                onNext={() => goDate(1)}
-              />
+              activeTab === 'timeline' && timelineRange === 'all' ? (
+                <div className="date-range-badge"><CalendarDays size={16} />全部时间</div>
+              ) : (
+                <DateNavigator
+                  value={selectedDate}
+                  onChange={selectDate}
+                  onPrevious={() => goDate(-1)}
+                  onNext={() => goDate(1)}
+                />
+              )
             )}
             <div className="top-actions">
               <button
@@ -1160,27 +1191,27 @@ export default function App() {
             <Kpi
               icon={Clock3}
               title="有效使用"
-              value={formatDuration(stats.activeMinutes)}
-              hint={`离开 ${formatDuration(stats.idleMinutes)}`}
+              value={formatDuration(headerStats.activeMinutes)}
+              hint={`离开 ${formatDuration(headerStats.idleMinutes)}`}
             />
             <Kpi
               icon={Tags}
               title="已归到项目"
-              value={`${stats.classifiedPercent}%`}
-              hint={`${formatDuration(stats.classifiedMinutes)} / ${formatDuration(stats.activeMinutes)}`}
+              value={`${headerStats.classifiedPercent}%`}
+              hint={`${formatDuration(headerStats.classifiedMinutes)} / ${formatDuration(headerStats.activeMinutes)}`}
             />
             <Kpi
               icon={Activity}
               title="上下文"
-              value={`${stats.contextCount} 次`}
-              hint={`最长连续 ${formatDuration(stats.longestMinutes)}`}
+              value={`${headerStats.contextCount} 次`}
+              hint={`最长连续 ${formatDuration(headerStats.longestMinutes)}`}
             />
             <Kpi
               icon={CircleAlert}
               title="待复核"
-              value={`${stats.reviewCount} 条`}
-              hint={stats.reviewCount ? '活动切换后生成，确认一次即可' : '暂无已结束的新时间块'}
-              attention={stats.reviewCount > 0}
+              value={`${headerStats.reviewCount} 条`}
+              hint={headerStats.reviewCount ? '活动切换后生成，确认一次即可' : '暂无已结束的新时间块'}
+              attention={headerStats.reviewCount > 0}
             />
           </section>
         )}
@@ -1205,11 +1236,17 @@ export default function App() {
         )}
         {activeTab === 'timeline' && (
           <TimelineView
-            sessions={daySessions}
+            sessions={timelineSessions}
             projects={data.projects}
             tasks={data.tasks}
+            range={timelineRange}
             selected={selected}
             setSelected={setSelected}
+            onRangeChange={(range) => {
+              setTimelineRange(range);
+              setSelected(new Set());
+              if (range === 'day') setSelectedDate(localDateKey(new Date()));
+            }}
             onEdit={setEditing}
             runAction={runAction}
           />
@@ -3378,16 +3415,20 @@ function TimelineView({
   sessions,
   projects,
   tasks,
+  range,
   selected,
   setSelected,
+  onRangeChange,
   onEdit,
   runAction,
 }: {
   sessions: WorkSession[];
   projects: Project[];
   tasks: Task[];
+  range: TimelineRange;
   selected: Set<string>;
   setSelected: (next: Set<string>) => void;
+  onRangeChange: (range: TimelineRange) => void;
   onEdit: (sessions: WorkSession[]) => void;
   runAction: ActionRunner;
 }) {
@@ -3544,12 +3585,32 @@ function TimelineView({
     <div className="timeline-layout">
       <section className="panel timeline-panel">
         <div className="timeline-toolbar">
+          <div className="timeline-range-tabs" role="radiogroup" aria-label="时间轴时间范围">
+            <button
+              aria-checked={range === 'day'}
+              className={range === 'day' ? 'active' : ''}
+              onClick={() => onRangeChange('day')}
+              role="radio"
+              type="button"
+            >
+              单日
+            </button>
+            <button
+              aria-checked={range === 'all'}
+              className={range === 'all' ? 'active' : ''}
+              onClick={() => onRangeChange('all')}
+              role="radio"
+              type="button"
+            >
+              全部
+            </button>
+          </div>
           <label className="search-field">
             <Search size={16} />
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索项目、摘要、应用或网页"
+              placeholder="搜索任务、项目、摘要、应用或网页"
             />
           </label>
           <div className="selection-controls">
@@ -3612,6 +3673,7 @@ function TimelineView({
                 )}
                 <SessionRow
                   session={session}
+                  showDate={range === 'all'}
                   selected={selected.has(session.id)}
                   onToggle={() => toggle(session.id)}
                   onEdit={() => editSession(session)}
@@ -3632,7 +3694,11 @@ function TimelineView({
           {!filtered.length && (
             <EmptyState
               title="没有匹配的活动"
-              detail={activeFilterCount ? '清空或调整右侧筛选条件后再试。' : '当天还没有可显示的时间段。'}
+              detail={activeFilterCount
+                ? '清空或调整右侧筛选条件后再试。'
+                : range === 'all'
+                  ? '还没有可显示的时间段。'
+                  : '当天还没有可显示的时间段。'}
             />
           )}
         </div>
@@ -3723,12 +3789,14 @@ function TimelineView({
 
 function SessionRow({
   session,
+  showDate,
   selected,
   onToggle,
   onEdit,
   onConfirm,
 }: {
   session: WorkSession;
+  showDate: boolean;
   selected: boolean;
   onToggle: () => void;
   onEdit: () => void;
@@ -3738,15 +3806,15 @@ function SessionRow({
   const evidence = session.evidence.slice(0, 3);
   return (
     <article
-      className={`session-row ${selected ? 'selected' : ''} ${needsReview(session) ? 'needs-review' : ''}`}
+      className={`session-row ${showDate ? 'show-date' : ''} ${selected ? 'selected' : ''} ${needsReview(session) ? 'needs-review' : ''}`}
       style={{ '--session-color': categoryColor(session.category) } as CSSProperties}
     >
       <label className="select-session" title="选择会话">
         <input className="themed-checkbox" type="checkbox" checked={selected} onChange={onToggle} />
       </label>
       <div className="time-cell">
-        <strong>{formatClock(session.startedAt)}</strong>
-        <span>{formatClock(session.endedAt)}</span>
+        <strong>{formatSessionMoment(session.startedAt, showDate)}</strong>
+        <span>{formatSessionMoment(session.endedAt, showDate)}</span>
       </div>
       <div className="session-main">
         <div className="session-head">
@@ -3923,7 +3991,6 @@ function ProjectsView({
       project.name,
       project.category,
       project.description,
-      ...(tasksByProject.get(project.id) || []).map((task) => task.title),
     ].filter(Boolean).join(' ')).includes(needle);
     return matchesSearch && (!hideZeroProjects || (minutesByProject.get(project.id) || 0) > 0);
   });
@@ -4159,7 +4226,7 @@ function ProjectsView({
         />
         <div className="project-search">
           <Search size={16} />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或任务" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或分类" />
           {query && <button onClick={() => setQuery('')} type="button" aria-label="清空项目搜索"><X size={14} /></button>}
         </div>
         <div className="project-date-range" aria-label="项目统计起止时间">
@@ -4328,7 +4395,7 @@ function ProjectsView({
               detail={projects.length
                 ? hideZeroProjects
                   ? `${rangeLabel}没有非零项目，可关闭“隐藏 0 秒”或切换范围。`
-                  : '换个项目名、分类或任务名试试。'
+                  : '换个项目名或分类试试。'
                 : '打开一个代码工作区或修正一条会话即可自动建立。'}
             />
           )}
@@ -6294,6 +6361,18 @@ function summarizeDay(
   dateKey: string,
   settings?: AppSettings,
 ): DayStats {
+  return summarizeSessions(
+    sessions,
+    (session) => sessionMinutesOnDate(session, dateKey),
+    settings,
+  );
+}
+
+function summarizeSessions(
+  sessions: WorkSession[],
+  durationForSession: (session: WorkSession) => number,
+  settings?: AppSettings,
+): DayStats {
   const result = new Map<string, number>();
   let activeMinutes = 0;
   let idleMinutes = 0;
@@ -6302,7 +6381,7 @@ function summarizeDay(
   let reviewCount = 0;
 
   for (const session of sessions) {
-    const minutes = sessionMinutesOnDate(session, dateKey);
+    const minutes = durationForSession(session);
     result.set(session.category, (result.get(session.category) || 0) + minutes);
     if (isIdleSession(session, settings)) {
       idleMinutes += minutes;
