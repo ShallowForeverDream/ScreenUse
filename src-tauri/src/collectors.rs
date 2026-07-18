@@ -159,7 +159,10 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     settings_loaded_at = Instant::now();
                 }
 
-                let mut event = match capture_foreground_event() {
+                let mut event = match capture_foreground_event(
+                    settings.idle_threshold_seconds,
+                    settings.passive_content_counts_as_active,
+                ) {
                     Ok(event) => event,
                     Err(error) => {
                         collector.set_error(error);
@@ -274,6 +277,8 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                 // timestamp and assign that interval to the semantic context selected next.
                 let handoff_source = if is_windows_task_view(&event) {
                     Some("windows-task-view")
+                } else if is_windows_system_tray_overflow(&event) {
+                    Some("windows-system-tray-overflow")
                 } else if is_incomplete_chat_workspace_handoff(active.as_ref(), &event) {
                     Some("chat-workspace-loading")
                 } else {
@@ -668,6 +673,37 @@ fn is_windows_task_view(event: &RawActivityEvent) -> bool {
             || title.contains("multitaskingviewframe"))
 }
 
+fn is_windows_system_tray_overflow(event: &RawActivityEvent) -> bool {
+    let app = event.app.as_deref().unwrap_or_default().trim().to_lowercase();
+    let title = event
+        .metadata
+        .get("nativeWindowTitle")
+        .and_then(serde_json::Value::as_str)
+        .or(event.window_title.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let class_name = event
+        .metadata
+        .get("nativeWindowClass")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let shell_app = [
+        "explorer.exe",
+        "shellexperiencehost.exe",
+        "applicationframehost.exe",
+    ]
+    .contains(&app.as_str());
+    shell_app
+        && (matches!(
+            title.as_str(),
+            "system tray overflow window" | "系统托盘溢出窗口" | "通知区域溢出窗口"
+        ) || class_name.contains("notifyiconoverflowwindow")
+            || class_name.contains("toplevelwindowforoverflowxamlisland"))
+}
+
 fn is_incomplete_chat_workspace_handoff(
     active: Option<&ActiveContext>,
     event: &RawActivityEvent,
@@ -869,10 +905,16 @@ fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
     let local_media_playing = event
         .metadata
         .get("mediaPlaying")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if local_media_playing {
+        .and_then(serde_json::Value::as_bool);
+    if local_media_playing == Some(true) {
         return Some("media-player-foreground");
+    }
+    // Prefer extension and accessibility playback signals. Some Chromium
+    // builds expose neither, so a conservative foreground watch-page fallback
+    // keeps known video pages active. A detected Play button (false) wins,
+    // which means paused media still follows the normal idle rule.
+    if local_media_playing.is_none() && looks_like_foreground_video_page(event) {
+        return Some("browser-video-page-fallback");
     }
 
     let meeting_controls_active = event
@@ -974,6 +1016,76 @@ fn passive_attention_reason(event: &RawActivityEvent) -> Option<&'static str> {
     None
 }
 
+fn looks_like_foreground_video_page(event: &RawActivityEvent) -> bool {
+    let app = event.app.as_deref().unwrap_or_default().to_lowercase();
+    let browser_app = [
+        "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc.exe",
+        "tabbit", "chromium", "thorium", "floorp", "waterfox", "librewolf",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle));
+    if !browser_app {
+        return false;
+    }
+
+    let title = event.window_title.as_deref().unwrap_or_default().trim().to_lowercase();
+    let url = event.url.as_deref().unwrap_or_default().trim().to_lowercase();
+    let video_site = [
+        "bilibili", "哔哩哔哩", "youtube", "youtu.be", "netflix", "iqiyi", "爱奇艺",
+        "youku", "优酷", "v.qq.com", "腾讯视频", "mgtv", "芒果tv", "douyin", "抖音",
+        "kuaishou", "快手", "acfun", "vimeo", "twitch", "disney+", "prime video",
+        "hulu", "xigua", "西瓜视频", "yangshipin", "央视频", "好看视频", "搜狐视频",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle) || url.contains(needle));
+    if !video_site {
+        return false;
+    }
+
+    let non_watch_page = [
+        "搜索结果", "搜索 -", "search results", "首页", "频道首页", "个人中心",
+        "创作中心", "消息中心", "稍后再看", "观看历史",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle));
+    if non_watch_page {
+        return false;
+    }
+
+    let watch_url = [
+        "/video/", "/watch", "/bangumi/play/", "/play/", "/vod/", "/live/", "/episode/",
+    ]
+    .iter()
+    .any(|needle| url.contains(needle));
+    let watch_title = [
+        "在线观看", "正在播放", "高清独家", "纪录片", "电影", "电视剧", "番剧", "直播",
+        " - youtube", "_哔哩哔哩_bilibili", "-bilibili-哔哩哔哩",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle));
+    watch_url || watch_title || has_episode_marker(&title)
+}
+
+fn has_episode_marker(title: &str) -> bool {
+    let mut characters = title.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '第' {
+            continue;
+        }
+        let mut has_number = false;
+        while characters.peek().is_some_and(|value| {
+            value.is_ascii_digit() || "零一二三四五六七八九十百".contains(*value)
+        }) {
+            has_number = true;
+            characters.next();
+        }
+        if has_number && characters.peek() == Some(&'集') {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(windows)]
 unsafe fn process_image_path(pid: u32) -> Result<String> {
     use windows::core::PWSTR;
@@ -1063,12 +1175,16 @@ fn is_hosted_app_candidate(path: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn capture_foreground_event() -> Result<RawActivityEvent> {
+fn capture_foreground_event(
+    idle_threshold_seconds: u32,
+    passive_content_counts_as_active: bool,
+) -> Result<RawActivityEvent> {
     use std::path::PathBuf;
     use windows::Win32::System::SystemInformation::GetTickCount;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId,
     };
 
     unsafe {
@@ -1084,6 +1200,9 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
             GetWindowTextW(window, &mut buffer)
         };
         let native_title = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
+        let mut class_buffer = vec![0u16; 256];
+        let class_length = GetClassNameW(window, &mut class_buffer).max(0) as usize;
+        let native_class = String::from_utf16_lossy(&class_buffer[..class_length]);
 
         let mut pid = 0u32;
         let _ = GetWindowThreadProcessId(window, Some(&mut pid));
@@ -1120,14 +1239,31 @@ fn capture_foreground_event() -> Result<RawActivityEvent> {
 
         let mut metadata = json!({ "pid": pid, "platform": "windows", "capture": "metadata-only" });
         metadata["inputIdleMilliseconds"] = serde_json::Value::from(idle_milliseconds);
-        if is_media_app(&app)
-            || (is_chat_client_app(&app) && looks_like_media_window(&native_title))
+        metadata["nativeWindowClass"] = serde_json::Value::String(native_class);
+        let probe_passive_attention = passive_content_counts_as_active
+            && idle_seconds.saturating_add(10) >= u64::from(idle_threshold_seconds);
+        if probe_passive_attention
+            && (is_browser_app_name(&app)
+                || is_media_app(&app)
+                || (is_chat_client_app(&app) && looks_like_media_window(&native_title)))
         {
-            if let Some(playing) = foreground_media_playing(window).ok().flatten() {
+            let system_media_playing = foreground_system_media_playing(&app).ok().flatten();
+            let media_playing = system_media_playing
+                .or_else(|| foreground_media_playing(window).ok().flatten());
+            if let Some(playing) = media_playing {
                 metadata["mediaPlaying"] = serde_json::Value::Bool(playing);
+                metadata["mediaPlayingSource"] = serde_json::Value::String(
+                    if system_media_playing.is_some() {
+                        "windows-media-session"
+                    } else {
+                        "foreground-accessibility"
+                    }
+                    .into(),
+                );
             }
         }
-        if (is_meeting_app(&app) || is_chat_client_app(&app))
+        if probe_passive_attention
+            && (is_meeting_app(&app) || is_chat_client_app(&app))
             && foreground_meeting_active(window).unwrap_or(false)
         {
             metadata["meetingActive"] = serde_json::Value::Bool(true);
@@ -1194,6 +1330,74 @@ struct ActivePageContext {
 }
 
 #[cfg(windows)]
+struct ForegroundMediaCache {
+    app: String,
+    checked_at: Instant,
+    value: Option<bool>,
+}
+
+#[cfg(windows)]
+fn foreground_system_media_playing(app: &str) -> Result<Option<bool>> {
+    use std::sync::OnceLock;
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    };
+
+    static CACHE: OnceLock<Mutex<Option<ForegroundMediaCache>>> = OnceLock::new();
+    let app_key = normalized_app_name(app);
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(cached) = cache.lock().as_ref() {
+        if cached.app == app_key && cached.checked_at.elapsed() < Duration::from_secs(5) {
+            return Ok(cached.value);
+        }
+    }
+
+    let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.get()?;
+    let mut matched = false;
+    let mut playing = false;
+    for session in manager.GetSessions()? {
+        let source = session.SourceAppUserModelId()?.to_string().to_lowercase();
+        if !system_media_source_matches_app(&source, &app_key) {
+            continue;
+        }
+        matched = true;
+        if session.GetPlaybackInfo()?.PlaybackStatus()?
+            == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+        {
+            playing = true;
+            break;
+        }
+    }
+    let result = matched.then_some(playing);
+    *cache.lock() = Some(ForegroundMediaCache {
+        app: app_key,
+        checked_at: Instant::now(),
+        value: result,
+    });
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn system_media_source_matches_app(source: &str, app: &str) -> bool {
+    if app.contains("msedge") {
+        source.contains("msedge") || source.contains("microsoftedge")
+    } else if app.contains("chrome") {
+        source.contains("chrome")
+    } else if app.contains("firefox") {
+        source.contains("firefox")
+    } else if app.contains("brave") {
+        source.contains("brave")
+    } else if app.contains("vivaldi") {
+        source.contains("vivaldi")
+    } else if app.contains("opera") {
+        source.contains("opera")
+    } else {
+        source.contains(app)
+    }
+}
+
+#[cfg(windows)]
 fn foreground_media_playing(
     window: windows::Win32::Foundation::HWND,
 ) -> Result<Option<bool>> {
@@ -1202,14 +1406,18 @@ fn foreground_media_playing(
         &[
             "暂停",
             "暂停播放",
+            "暂停视频",
             "Pause",
+            "Pause (k)",
             "Pause playback",
             "Pause video",
         ],
         &[
             "播放",
             "继续播放",
+            "播放视频",
             "Play",
+            "Play (k)",
             "Play video",
             "Resume playback",
         ],
@@ -1262,19 +1470,27 @@ fn foreground_accessible_state(
                 &VARIANT::from(UIA_ButtonControlTypeId.0),
             )?;
             let buttons = root.FindAll(TreeScope_Descendants, &condition)?;
+            let mut saw_negative = false;
             for index in 0..buttons.Length()? {
                 let name = buttons
                     .GetElement(index)?
                     .CurrentName()
                     .map(|value| value.to_string())
                     .unwrap_or_default();
-                for (names, state) in [(positive_names, true), (negative_names, false)] {
-                    if names.iter().any(|candidate| name.eq_ignore_ascii_case(candidate)) {
-                        return Ok(Some(state));
-                    }
+                if positive_names
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    return Ok(Some(true));
+                }
+                if negative_names
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    saw_negative = true;
                 }
             }
-            Ok(None)
+            Ok(saw_negative.then_some(false))
         })();
         if initialized {
             CoUninitialize();
@@ -3144,7 +3360,10 @@ fn valid_chatgpt_title(value: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-fn capture_foreground_event() -> Result<RawActivityEvent> {
+fn capture_foreground_event(
+    _idle_threshold_seconds: u32,
+    _passive_content_counts_as_active: bool,
+) -> Result<RawActivityEvent> {
     Err(anyhow!("foreground metadata collector is currently implemented for Windows"))
 }
 
@@ -3459,6 +3678,30 @@ mod tests {
         };
         assert_eq!(passive_attention_reason(&event), Some("browser-video-playing"));
         assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            window_title: Some("闪闪的儿科医生4-纪录片-高清独家在线观看-bilibili-哔哩哔哩".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), Some("browser-video-page-fallback"));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            window_title: Some("闪闪的儿科医生4-纪录片-高清独家在线观看-bilibili-哔哩哔哩".into()),
+            metadata: json!({"mediaPlaying": false}),
+            ..event.clone()
+        }), None);
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            window_title: Some("哔哩哔哩 (゜-゜)つロ 干杯~-bilibili".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }), None);
+        assert!(looks_like_foreground_video_page(&RawActivityEvent {
+            app: Some("msedge.exe".into()),
+            window_title: Some("纪录片 第十二集 - 优酷".into()),
+            metadata: json!({}),
+            ..event.clone()
+        }));
+        assert_eq!(passive_attention_reason(&RawActivityEvent {
             app: Some("WeMeetApp.exe".into()),
             window_title: Some("申书豪预定的会议".into()),
             metadata: json!({}),
@@ -3559,6 +3802,32 @@ mod tests {
             ..event.clone()
         }));
         assert!(!is_windows_task_view(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            ..event
+        }));
+    }
+
+    #[test]
+    fn windows_system_tray_overflow_is_a_handoff_surface() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-17T10:00:00Z".into(),
+            app: Some("explorer.exe".into()),
+            window_title: Some("系统托盘溢出窗口".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        assert!(is_windows_system_tray_overflow(&event));
+        assert!(is_windows_system_tray_overflow(&RawActivityEvent {
+            window_title: Some(String::new()),
+            metadata: json!({"nativeWindowClass": "TopLevelWindowForOverflowXamlIsland"}),
+            ..event.clone()
+        }));
+        assert!(!is_windows_system_tray_overflow(&RawActivityEvent {
             app: Some("chrome.exe".into()),
             ..event
         }));
@@ -3835,6 +4104,18 @@ mod tests {
         assert!(!is_hosted_app_candidate(
             r"C:\Windows\SystemApps\TextInputHost.exe"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_media_sessions_are_scoped_to_the_foreground_browser() {
+        assert!(system_media_source_matches_app("chrome.exe", "chrome"));
+        assert!(system_media_source_matches_app(
+            "microsoft.microsoftedge.stable_8wekyb3d8bbwe!microsoftedge",
+            "msedge",
+        ));
+        assert!(!system_media_source_matches_app("chrome.exe", "msedge"));
+        assert!(!system_media_source_matches_app("spotify.exe", "chrome"));
     }
 
     #[cfg(windows)]
