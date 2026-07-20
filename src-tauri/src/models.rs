@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const DEFAULT_CATEGORIES: [&str; 7] = ["学习", "写作", "开发", "沟通", "娱乐", "杂务", "无效"];
+pub const DEFAULT_CATEGORIES: [&str; 8] = [
+    "学习", "写作", "开发", "沟通", "娱乐", "杂务", "休息", "无效",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -441,7 +443,20 @@ pub struct DashboardData {
     pub trends: Vec<TrendPoint>,
     pub categories: Vec<TrendPoint>,
     pub queue: QueueHealth,
+    pub sleep_debt: SleepDebtSummary,
     pub collector_running: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SleepDebtSummary {
+    pub as_of_date: String,
+    pub started_on: String,
+    pub daily_target_seconds: u64,
+    pub sleep_seconds_today: u64,
+    pub first_layer_seconds: u64,
+    pub second_layer_seconds: u64,
+    pub total_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

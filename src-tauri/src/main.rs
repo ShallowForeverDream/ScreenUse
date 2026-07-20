@@ -21,6 +21,7 @@ mod memory;
 mod models;
 mod pricing;
 mod secrets;
+mod sleep_debt;
 
 use collectors::{CollectorAdapter, DesktopCollector};
 use db::AppDb;

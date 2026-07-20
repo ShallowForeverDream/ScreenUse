@@ -480,6 +480,7 @@ kbd {
 .kpi span:not(.kpi-icon) { display: block; color: var(--muted); font-size: 13px; }
 .kpi strong { display: block; margin: 5px 0 2px; font-size: 21px; letter-spacing: -.035em; white-space: nowrap; }
 .kpi small { display: none; }
+.kpi.with-hint small { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .panel {
   min-width: 0;

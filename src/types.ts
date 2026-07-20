@@ -257,7 +257,18 @@ export interface DashboardData {
   trends: TrendPoint[];
   categories: TrendPoint[];
   queue: QueueHealth;
+  sleepDebt: SleepDebtSummary;
   collectorRunning: boolean;
+}
+
+export interface SleepDebtSummary {
+  asOfDate: string;
+  startedOn: string;
+  dailyTargetSeconds: number;
+  sleepSecondsToday: number;
+  firstLayerSeconds: number;
+  secondLayerSeconds: number;
+  totalSeconds: number;
 }
 
 export interface SessionPatch {

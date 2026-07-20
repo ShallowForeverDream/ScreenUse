@@ -13,6 +13,7 @@ export const fallbackDashboard: DashboardData = {
     { name: '沟通', color: '#34d399', isBuiltin: true },
     { name: '娱乐', color: '#fb7185', isBuiltin: true },
     { name: '杂务', color: '#fbbf24', isBuiltin: true },
+    { name: '休息', color: '#2dd4bf', isBuiltin: true },
     { name: '无效', color: '#94a3b8', isBuiltin: true },
   ],
   settings: {
@@ -49,12 +50,15 @@ export const fallbackDashboard: DashboardData = {
     { id: 'p1', name: 'ScreenUse', category: '开发', source: 'workspace-auto', color: '#60a5fa', description: '根据 VS Code 工作区自动识别', createdAt: iso(700), updatedAt: iso(5) },
     { id: 'p2', name: '课程与论文', category: '学习', source: 'manual', color: '#a78bfa', description: '课程、论文和资料阅读', createdAt: iso(1200), updatedAt: iso(45) },
     { id: 'p3', name: '日常事务', category: '杂务', source: 'manual', color: '#fbbf24', description: '零散电脑事务', createdAt: iso(1800), updatedAt: iso(90) },
+    { id: 'system-rest-sleep', name: '睡眠', category: '休息', source: 'sleep-system', color: '#2dd4bf', description: '睡眠与午睡时间', createdAt: iso(1800), updatedAt: iso(90) },
   ],
   tasks: [
     { id: 't1', projectId: 'p1', title: '日常开发', status: 'active', source: 'workspace-auto', plannedDueAt: null, createdAt: iso(700), updatedAt: iso(5) },
     { id: 't4', projectId: 'p1', title: '界面优化', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(500), updatedAt: iso(3) },
     { id: 't2', projectId: 'p2', title: '资料阅读', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(1200), updatedAt: iso(45) },
     { id: 't3', projectId: 'p3', title: '日常事务', status: 'active', source: 'manual', plannedDueAt: null, createdAt: iso(1800), updatedAt: iso(90) },
+    { id: 'system-rest-sleep-nap', projectId: 'system-rest-sleep', title: '午睡', status: 'active', source: 'sleep-system:nap', plannedDueAt: null, createdAt: iso(1800), updatedAt: iso(90) },
+    { id: 'system-rest-sleep-night', projectId: 'system-rest-sleep', title: '睡觉', status: 'active', source: 'sleep-system:sleep', plannedDueAt: null, createdAt: iso(1800), updatedAt: iso(90) },
   ],
   sessions: [
     { id: 's1', startedAt: iso(188), endedAt: iso(126), projectId: 'p1', projectName: 'ScreenUse', taskId: 't1', taskTitle: '日常开发', category: '开发', summary: 'ScreenUse · collectors.rs', confidence: 0.91, userConfirmed: false, source: 'collector-rule', evidence: [{ kind: 'workspace', label: '工作区', value: 'ScreenUse', weight: 0.8 }, { kind: 'app', label: '应用', value: 'Code.exe', weight: 0.5 }] },
@@ -74,6 +78,15 @@ export const fallbackDashboard: DashboardData = {
     { label: '学习', value: 42, group: '学习' },
     { label: '杂务', value: 24, group: '杂务' },
   ],
+  sleepDebt: {
+    asOfDate: now.toISOString().slice(0, 10),
+    startedOn: now.toISOString().slice(0, 10),
+    dailyTargetSeconds: 8 * 3_600,
+    sleepSecondsToday: 0,
+    firstLayerSeconds: 8 * 3_600,
+    secondLayerSeconds: 0,
+    totalSeconds: 8 * 3_600,
+  },
   queue: {
     pending: 0,
     running: 0,

@@ -94,6 +94,7 @@ const categoryColors: Record<string, string> = {
   沟通: '#34d399',
   娱乐: '#fb7185',
   杂务: '#fbbf24',
+  休息: '#2dd4bf',
   无效: '#94a3b8',
   离开: '#94a3b8',
   未记录: '#cbd5e1',
@@ -1196,10 +1197,14 @@ export default function App() {
               hint={`离开 ${formatDuration(headerStats.idleMinutes)}`}
             />
             <Kpi
-              icon={Tags}
-              title="已归到项目"
-              value={`${headerStats.classifiedPercent}%`}
-              hint={`${formatDuration(headerStats.classifiedMinutes)} / ${formatDuration(headerStats.activeMinutes)}`}
+              icon={Moon}
+              title="睡眠缺失"
+              value={formatPreciseDuration(data.sleepDebt.totalSeconds)}
+              hint={data.sleepDebt.totalSeconds > 0
+                ? `第一层 ${formatPreciseDuration(data.sleepDebt.firstLayerSeconds)} · 第二层 ${formatPreciseDuration(data.sleepDebt.secondLayerSeconds)}`
+                : `今日已休息 ${formatPreciseDuration(data.sleepDebt.sleepSecondsToday)}`}
+              attention={data.sleepDebt.totalSeconds > 0}
+              showHint
             />
             <Kpi
               icon={Activity}
@@ -6259,15 +6264,17 @@ function Kpi({
   value,
   hint,
   attention = false,
+  showHint = false,
 }: {
   icon: typeof Activity;
   title: string;
   value: string;
   hint: string;
   attention?: boolean;
+  showHint?: boolean;
 }) {
   return (
-    <div className={`kpi ${attention ? 'attention' : ''}`} title={hint}>
+    <div className={`kpi ${attention ? 'attention' : ''} ${showHint ? 'with-hint' : ''}`} title={hint}>
       <span className="kpi-icon"><Icon size={18} /></span>
       <div>
         <span>{title}</span>

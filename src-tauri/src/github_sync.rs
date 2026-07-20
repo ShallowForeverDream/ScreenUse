@@ -4,12 +4,13 @@ use crate::models::{
     SyncDeviceInfo, Task, WorkSession,
 };
 use crate::secrets;
+use crate::sleep_debt;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -80,6 +81,8 @@ struct SyncSnapshot {
     rules: Vec<SyncRule>,
     tombstones: Vec<SyncTombstone>,
     devices: Vec<SyncDeviceInfo>,
+    #[serde(default)]
+    sleep_debt_started_on: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -315,6 +318,13 @@ impl AppDb {
             })?)?;
             values
         };
+        let sleep_debt_started_on = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![sleep_debt::START_DATE_SETTING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         drop(conn);
 
         let generated_at = now();
@@ -338,6 +348,7 @@ impl AppDb {
             rules,
             tombstones,
             devices,
+            sleep_debt_started_on,
         })
     }
 
@@ -470,6 +481,16 @@ impl AppDb {
                 }
                 _ => {}
             }
+        }
+        if let Some(started_on) = snapshot.sleep_debt_started_on.as_deref().filter(|value| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        }) {
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                   value=MIN(settings.value,excluded.value),updated_at=excluded.updated_at",
+                params![sleep_debt::START_DATE_SETTING_KEY, started_on, now()],
+            )?;
         }
         tx.commit()?;
         drop(conn);
@@ -886,6 +907,14 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
     if left.schema_version != SNAPSHOT_SCHEMA || right.schema_version != SNAPSHOT_SCHEMA {
         bail!("同步快照版本不兼容");
     }
+    let sleep_debt_started_on = match (
+        left.sleep_debt_started_on.clone(),
+        right.sleep_debt_started_on.clone(),
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     let tombstones = merge_latest(
         left.tombstones,
         right.tombstones,
@@ -1030,6 +1059,7 @@ fn merge_snapshots(left: SyncSnapshot, right: SyncSnapshot) -> Result<SyncSnapsh
         rules,
         tombstones,
         devices,
+        sleep_debt_started_on,
     })
 }
 
@@ -1139,6 +1169,7 @@ mod tests {
             rules: vec![],
             tombstones: vec![],
             devices: vec![],
+            sleep_debt_started_on: None,
         }
     }
 

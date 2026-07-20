@@ -1,7 +1,8 @@
 use crate::classification;
 use crate::models::*;
+use crate::sleep_debt;
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, SecondsFormat, TimeZone, Utc};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
@@ -187,6 +188,8 @@ impl AppDb {
         db.migrate()?;
         db.clear_obsolete_project_descriptions()?;
         db.seed_if_empty()?;
+        db.configure_sleep_target()?;
+        db.ensure_sleep_debt_start_date()?;
         db.migrate_process_file_paths()?;
         db.migrate_personal_memory()?;
         db.migrate_process_file_memories()?;
@@ -819,6 +822,121 @@ impl AppDb {
         Ok(())
     }
 
+    fn configure_sleep_target(&self) -> Result<()> {
+        let mut conn = self.conn.lock();
+        if conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key=?1 LIMIT 1",
+                params![sleep_debt::TARGET_MIGRATION_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let tx = conn.transaction()?;
+        let updated_at = now();
+        tx.execute(
+            "DELETE FROM sync_tombstones WHERE entity_kind='category' AND entity_id=?1",
+            params![sleep_debt::CATEGORY_NAME],
+        )?;
+        tx.execute(
+            "INSERT INTO activity_categories(name,color,is_builtin,created_at,updated_at)
+             VALUES(?1,?2,1,?3,?3)
+             ON CONFLICT(name) DO UPDATE SET is_builtin=1,updated_at=excluded.updated_at",
+            params![
+                sleep_debt::CATEGORY_NAME,
+                color_for_category(sleep_debt::CATEGORY_NAME),
+                updated_at
+            ],
+        )?;
+
+        let project_id = tx
+            .query_row(
+                "SELECT id FROM projects
+                 WHERE source=?1 OR (name=?2 AND category=?3)
+                 ORDER BY CASE WHEN source=?1 THEN 0 ELSE 1 END,created_at ASC
+                 LIMIT 1",
+                params![
+                    sleep_debt::PROJECT_SOURCE,
+                    sleep_debt::PROJECT_NAME,
+                    sleep_debt::CATEGORY_NAME
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| sleep_debt::PROJECT_ID.to_string());
+        tx.execute(
+            "INSERT INTO projects(id,name,category,source,color,description,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+             ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name,category=excluded.category,source=excluded.source,
+               color=excluded.color,description=excluded.description,updated_at=excluded.updated_at",
+            params![
+                project_id,
+                sleep_debt::PROJECT_NAME,
+                sleep_debt::CATEGORY_NAME,
+                sleep_debt::PROJECT_SOURCE,
+                color_for_category(sleep_debt::CATEGORY_NAME),
+                "睡眠与午睡时间，用于计算两层睡眠缺失",
+                updated_at
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_tombstones WHERE entity_kind='project' AND entity_id=?1",
+            params![project_id],
+        )?;
+
+        configure_sleep_task(
+            &tx,
+            &project_id,
+            sleep_debt::NAP_TASK_ID,
+            sleep_debt::NAP_TASK_TITLE,
+            sleep_debt::NAP_TASK_SOURCE,
+            &updated_at,
+        )?;
+        configure_sleep_task(
+            &tx,
+            &project_id,
+            sleep_debt::SLEEP_TASK_ID,
+            sleep_debt::SLEEP_TASK_TITLE,
+            sleep_debt::SLEEP_TASK_SOURCE,
+            &updated_at,
+        )?;
+        tx.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,'done',?2)",
+            params![sleep_debt::TARGET_MIGRATION_KEY, updated_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn ensure_sleep_debt_start_date(&self) -> Result<NaiveDate> {
+        let today = Local::now().date_naive();
+        let conn = self.conn.lock();
+        let stored = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![sleep_debt::START_DATE_SETTING_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(date) = stored
+            .as_deref()
+            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        {
+            return Ok(date.min(today));
+        }
+        conn.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![sleep_debt::START_DATE_SETTING_KEY, today.to_string(), now()],
+        )?;
+        Ok(today)
+    }
+
     pub fn get_settings(&self) -> Result<AppSettings> {
         let conn = self.conn.lock();
         let raw: Option<String> = conn
@@ -974,8 +1092,114 @@ impl AppDb {
             trends: self.project_task_trends()?,
             categories: self.category_trends()?,
             queue: self.queue_health()?,
+            sleep_debt: self.sleep_debt_summary()?,
             collector_running,
         })
+    }
+
+    fn sleep_debt_summary(&self) -> Result<SleepDebtSummary> {
+        let started_on = self.ensure_sleep_debt_start_date()?;
+        let as_of = Local::now().date_naive();
+        let range_start = local_midnight_utc(started_on)?;
+        let range_end = local_midnight_utc(
+            as_of
+                .succ_opt()
+                .context("cannot calculate the day after the sleep-debt date")?,
+        )?;
+
+        let rows = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT ws.started_at,ws.ended_at
+                 FROM work_sessions ws
+                 JOIN tasks t ON t.id=ws.task_id
+                 JOIN projects p ON p.id=t.project_id
+                 WHERE p.source=?1
+                   AND t.source IN (?2,?3)
+                   AND ws.ended_at>?4 AND ws.started_at<?5
+                 ORDER BY ws.started_at ASC",
+            )?;
+            let values = stmt.query_map(
+                params![
+                    sleep_debt::PROJECT_SOURCE,
+                    sleep_debt::NAP_TASK_SOURCE,
+                    sleep_debt::SLEEP_TASK_SOURCE,
+                    fmt(range_start),
+                    fmt(range_end)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            collect_rows(values)?
+        };
+
+        let mut intervals_by_day = HashMap::<NaiveDate, Vec<(DateTime<Utc>, DateTime<Utc>)>>::new();
+        for (started_at, ended_at) in rows {
+            let Ok(mut cursor) = DateTime::parse_from_rfc3339(&started_at)
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            let Ok(mut end) = DateTime::parse_from_rfc3339(&ended_at)
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            cursor = cursor.max(range_start);
+            end = end.min(range_end);
+            if end <= cursor {
+                continue;
+            }
+
+            while cursor < end {
+                let date = cursor.with_timezone(&Local).date_naive();
+                let Some(next_date) = date.succ_opt() else {
+                    break;
+                };
+                let next_midnight = local_midnight_utc(next_date)?;
+                let segment_end = end.min(next_midnight);
+                intervals_by_day
+                    .entry(date)
+                    .or_default()
+                    .push((cursor, segment_end));
+                if segment_end <= cursor {
+                    break;
+                }
+                cursor = segment_end;
+            }
+        }
+
+        let sleep_seconds_by_day = intervals_by_day
+            .into_iter()
+            .map(|(date, mut intervals)| {
+                intervals.sort_by_key(|(start, _)| *start);
+                let mut total = 0_u64;
+                let mut merged: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+                for (start, end) in intervals {
+                    match merged.as_mut() {
+                        Some((_, merged_end)) if start <= *merged_end => {
+                            *merged_end = (*merged_end).max(end);
+                        }
+                        Some((merged_start, merged_end)) => {
+                            total = total.saturating_add(
+                                (*merged_end - *merged_start).num_seconds().max(0) as u64,
+                            );
+                            merged = Some((start, end));
+                        }
+                        None => merged = Some((start, end)),
+                    }
+                }
+                if let Some((start, end)) = merged {
+                    total = total.saturating_add((end - start).num_seconds().max(0) as u64);
+                }
+                (date, total)
+            })
+            .collect::<HashMap<_, _>>();
+
+        Ok(sleep_debt::calculate(
+            started_on,
+            as_of,
+            &sleep_seconds_by_day,
+        ))
     }
 
     pub fn list_categories(&self) -> Result<Vec<CategoryOption>> {
@@ -5690,6 +5914,52 @@ fn record_tombstone(conn: &Connection, entity_kind: &str, entity_id: &str) -> Re
     Ok(())
 }
 
+fn configure_sleep_task(
+    conn: &Connection,
+    project_id: &str,
+    default_id: &str,
+    title: &str,
+    source: &str,
+    updated_at: &str,
+) -> Result<String> {
+    let task_id = conn
+        .query_row(
+            "SELECT id FROM tasks
+             WHERE source=?1 OR (project_id=?2 AND title=?3)
+             ORDER BY CASE WHEN source=?1 THEN 0 ELSE 1 END,created_at ASC
+             LIMIT 1",
+            params![source, project_id, title],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| default_id.to_string());
+    conn.execute(
+        "INSERT INTO tasks(id,project_id,title,status,source,planned_due_at,created_at,updated_at)
+         VALUES(?1,?2,?3,'active',?4,NULL,?5,?5)
+         ON CONFLICT(id) DO UPDATE SET
+           project_id=excluded.project_id,title=excluded.title,status='active',
+           source=excluded.source,updated_at=excluded.updated_at",
+        params![task_id, project_id, title, source, updated_at],
+    )?;
+    conn.execute(
+        "DELETE FROM sync_tombstones WHERE entity_kind='task' AND entity_id=?1",
+        params![task_id],
+    )?;
+    Ok(task_id)
+}
+
+fn local_midnight_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
+    let local_time = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid local midnight")?;
+    let local = Local
+        .from_local_datetime(&local_time)
+        .single()
+        .or_else(|| Local.from_local_datetime(&local_time).earliest())
+        .context("cannot resolve local midnight")?;
+    Ok(local.with_timezone(&Utc))
+}
+
 fn color_for_category(category: &str) -> &'static str {
     match category {
         "开发" => "#38bdf8",
@@ -5697,6 +5967,7 @@ fn color_for_category(category: &str) -> &'static str {
         "写作" => "#f0abfc",
         "沟通" => "#34d399",
         "娱乐" => "#fb7185",
+        "休息" => "#2dd4bf",
         "无效" => "#94a3b8",
         "离开" => "#94a3b8",
         _ => "#facc15",
@@ -6189,6 +6460,38 @@ fn dir_size(path: PathBuf) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleep_target_is_seeded_and_dashboard_reports_debt() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-sleep-target-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let sleep_project = db
+            .list_projects()
+            .expect("list projects")
+            .into_iter()
+            .find(|project| project.source == sleep_debt::PROJECT_SOURCE)
+            .expect("sleep project");
+        assert_eq!(sleep_project.name, "睡眠");
+        assert_eq!(sleep_project.category, "休息");
+
+        let titles = db
+            .list_tasks()
+            .expect("list tasks")
+            .into_iter()
+            .filter(|task| task.project_id == sleep_project.id)
+            .map(|task| task.title)
+            .collect::<HashSet<_>>();
+        assert_eq!(titles, HashSet::from(["午睡".into(), "睡觉".into()]));
+
+        let debt = db.dashboard(false).expect("dashboard").sleep_debt;
+        assert_eq!(debt.started_on, debt.as_of_date);
+        assert_eq!(debt.daily_target_seconds, 8 * 3_600);
+        assert!(debt.first_layer_seconds >= debt.daily_target_seconds);
+        assert_eq!(debt.second_layer_seconds, 0);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
 
     fn chat_event(id: &str, title: &str) -> RawActivityEvent {
         RawActivityEvent {
