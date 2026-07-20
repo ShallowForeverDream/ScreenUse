@@ -2432,7 +2432,7 @@ function TodayView({
             </div>
           )}
         />
-        {stats.activeMinutes === 0 && stats.idleMinutes === 0 ? (
+        {stats.categories.every((item) => item.minutes <= 0) ? (
           <EmptyState title="这一天还没有记录" detail="保持 ScreenUse 在托盘运行即可自动出现数据。" />
         ) : (
           <>
@@ -6646,6 +6646,8 @@ function summarizeSessions(
     result.set(session.category, (result.get(session.category) || 0) + minutes);
     if (isIdleSession(session, settings)) {
       idleMinutes += minutes;
+    }
+    if (!countsAsEffectiveUse(session, settings)) {
       continue;
     }
     activeMinutes += minutes;
@@ -6661,7 +6663,7 @@ function summarizeSessions(
     classifiedPercent: activeMinutes
       ? Math.round((classifiedMinutes / activeMinutes) * 100)
       : 0,
-    contextCount: sessions.filter((session) => !isIdleSession(session, settings)).length,
+    contextCount: sessions.filter((session) => countsAsEffectiveUse(session, settings)).length,
     reviewCount,
     longestMinutes,
     categories: [...result.entries()]
@@ -6698,6 +6700,14 @@ function isIdleSession(session: WorkSession, settings?: AppSettings) {
     settings &&
     session.category === settings.idleCategory &&
     session.projectName === settings.idleProjectName,
+  );
+}
+
+function countsAsEffectiveUse(session: WorkSession, settings?: AppSettings) {
+  return (
+    session.category !== '休息' &&
+    session.category !== '无效' &&
+    !isIdleSession(session, settings)
   );
 }
 
