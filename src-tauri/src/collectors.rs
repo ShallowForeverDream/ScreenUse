@@ -275,7 +275,13 @@ impl CollectorAdapter for Arc<DesktopCollector> {
 
                 // Transition surfaces are not standalone activities. Keep their first
                 // timestamp and assign that interval to the semantic context selected next.
-                let handoff_source = if is_windows_task_view(&event) {
+                // An idle observation must still enter the configured away state even if
+                // the task switcher was left open.
+                let handoff_source = if event.input_stats.idle_seconds
+                    >= settings.idle_threshold_seconds as u64
+                {
+                    None
+                } else if is_windows_task_switch_surface(&event) {
                     Some("windows-task-view")
                 } else if is_windows_system_tray_overflow(&event) {
                     Some("windows-system-tray-overflow")
@@ -648,9 +654,28 @@ fn idle_boundary_at(event: &RawActivityEvent, active_started_at: &str) -> String
     }
 }
 
-fn is_windows_task_view(event: &RawActivityEvent) -> bool {
+fn is_windows_task_switch_surface(event: &RawActivityEvent) -> bool {
     let app = event.app.as_deref().unwrap_or_default().trim().to_lowercase();
-    let title = event.window_title.as_deref().unwrap_or_default().trim().to_lowercase();
+    let title = event
+        .window_title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let native_title = event
+        .metadata
+        .get("nativeWindowTitle")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let class_name = event
+        .metadata
+        .get("nativeWindowClass")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     if matches!(app.as_str(), "searchhost.exe" | "searchapp.exe")
         && matches!(title.as_str(), "" | "search" | "搜索")
     {
@@ -668,9 +693,16 @@ fn is_windows_task_view(event: &RawActivityEvent) -> bool {
         "taskhostw.exe",
     ]
     .contains(&app.as_str());
+    let switch_title = |value: &str| {
+        matches!(
+            value,
+            "任务切换" | "任务视图" | "task switching" | "task switcher" | "task view"
+        ) || value.contains("multitaskingviewframe")
+    };
     shell_app
-        && (matches!(title.as_str(), "任务视图" | "task view")
-            || title.contains("multitaskingviewframe"))
+        && (switch_title(&title)
+            || switch_title(&native_title)
+            || class_name.contains("multitaskingviewframe"))
 }
 
 fn is_windows_system_tray_overflow(event: &RawActivityEvent) -> bool {
@@ -3782,8 +3814,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_view_is_a_handoff_surface() {
-        let event = RawActivityEvent {
+    fn windows_task_switcher_is_assigned_to_the_next_context() {
+        let mut event = RawActivityEvent {
             id: String::new(),
             source: "test".into(),
             timestamp: "2026-07-12T10:00:00Z".into(),
@@ -3795,16 +3827,44 @@ mod tests {
             input_stats: InputStats::default(),
             metadata: json!({}),
         };
-        assert!(is_windows_task_view(&event));
-        assert!(is_windows_task_view(&RawActivityEvent {
+        assert!(is_windows_task_switch_surface(&event));
+        assert!(is_windows_task_switch_surface(&RawActivityEvent {
+            window_title: Some("任务切换".into()),
+            ..event.clone()
+        }));
+        assert!(is_windows_task_switch_surface(&RawActivityEvent {
+            window_title: Some("Task Switching".into()),
+            ..event.clone()
+        }));
+        assert!(is_windows_task_switch_surface(&RawActivityEvent {
+            window_title: Some("应用".into()),
+            metadata: json!({"nativeWindowTitle": "任务切换"}),
+            ..event.clone()
+        }));
+        assert!(is_windows_task_switch_surface(&RawActivityEvent {
             app: Some("SearchHost.exe".into()),
             window_title: Some("搜索".into()),
             ..event.clone()
         }));
-        assert!(!is_windows_task_view(&RawActivityEvent {
+        assert!(!is_windows_task_switch_surface(&RawActivityEvent {
             app: Some("chrome.exe".into()),
-            ..event
+            ..event.clone()
         }));
+
+        let handoff = TransitionHandoff {
+            started_at: event.timestamp.clone(),
+            source: "windows-task-view",
+        };
+        event.app = Some("ChatGPT.exe".into());
+        event.window_title = Some("项目-HDU-IOT week1".into());
+        event.timestamp = "2026-07-12T10:00:05Z".into();
+        apply_transition_handoff(&mut event, &handoff);
+        assert_eq!(event.timestamp, "2026-07-12T10:00:00Z");
+        assert_eq!(
+            event.metadata["contextHandoff"].as_str(),
+            Some("windows-task-view")
+        );
+        assert_eq!(event.metadata["taskViewHandoff"].as_bool(), Some(true));
     }
 
     #[test]
