@@ -21,6 +21,7 @@ pub fn ingest_event(db: &AppDb, event: &RawActivityEvent) -> Result<Option<WorkS
     if session.user_confirmed
         || session.source == "collector-idle"
         || session.summary.trim() == "离开/空闲"
+        || has_correction_rule(&session)
     {
         return Ok(Some(session));
     }
@@ -255,6 +256,10 @@ pub fn finalize_context(
         db.mark_session_awaiting_confirmation(&updated.id)?;
         return db.get_session(&updated.id);
     }
+    if has_correction_rule(&session) {
+        db.mark_session_awaiting_confirmation(&session.id)?;
+        return db.coalesce_session_neighbors(&session.id).map(Some);
+    }
     let (local_category, local_confidence) =
         classify_category(event, settings.idle_threshold_seconds);
     let mut category = if session.confidence >= 0.84 {
@@ -311,6 +316,13 @@ fn strongest_assignment(left: Option<Assignment>, right: Option<Assignment>) -> 
         (Some(left), _) => Some(left),
         (None, right) => right,
     }
+}
+
+fn has_correction_rule(session: &WorkSession) -> bool {
+    session
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "correction-rule")
 }
 
 pub(crate) fn assignment_replaces(

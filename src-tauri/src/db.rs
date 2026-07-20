@@ -3258,8 +3258,16 @@ impl AppDb {
                             summary: classification::summary_for_event(event, &category),
                             confidence: 0.84,
                             evidence: Some(EvidenceItem {
-                                kind: "rule".into(),
-                                label: "识别规则".into(),
+                                kind: if created_from_correction {
+                                    "correction-rule".into()
+                                } else {
+                                    "rule".into()
+                                },
+                                label: if created_from_correction {
+                                    "人工强规则".into()
+                                } else {
+                                    "识别规则".into()
+                                },
                                 value: _name,
                                 weight: 0.84,
                             }),
@@ -3409,33 +3417,39 @@ impl AppDb {
         };
 
         let mut decision = self.heuristic_attribution(&event, false, &settings, None)?;
+        let correction_rule_hit = decision
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.kind == "correction-rule");
         let (category, category_confidence) =
             classification::classify_category(&event, settings.idle_threshold_seconds);
         if decision.confidence < 0.84 {
             decision.category = category.into();
             decision.confidence = decision.confidence.max(category_confidence);
         }
-        if let Some(contextual) = classification::resolve_project_task(
-            self,
-            &event,
-            &decision.category,
-        )?
-        .filter(|assignment| {
-            !ambiguous_context
-                || (assignment.task_id.is_some()
-                    && assignment.confidence >= 0.90
-                    && assignment.specificity >= 220)
-        }) {
-            if classification::assignment_replaces(
-                decision.project_id.as_deref(),
-                decision.task_id.as_deref(),
-                decision.confidence,
-                &contextual,
-            ) {
-                decision.project_id = Some(contextual.project_id);
-                decision.task_id = contextual.task_id;
-                decision.category = contextual.category;
-                decision.confidence = decision.confidence.max(contextual.confidence);
+        if !correction_rule_hit {
+            if let Some(contextual) = classification::resolve_project_task(
+                self,
+                &event,
+                &decision.category,
+            )?
+            .filter(|assignment| {
+                !ambiguous_context
+                    || (assignment.task_id.is_some()
+                        && assignment.confidence >= 0.90
+                        && assignment.specificity >= 220)
+            }) {
+                if classification::assignment_replaces(
+                    decision.project_id.as_deref(),
+                    decision.task_id.as_deref(),
+                    decision.confidence,
+                    &contextual,
+                ) {
+                    decision.project_id = Some(contextual.project_id);
+                    decision.task_id = contextual.task_id;
+                    decision.category = contextual.category;
+                    decision.confidence = decision.confidence.max(contextual.confidence);
+                }
             }
         }
         if decision.project_id.is_none() || decision.task_id.is_none() {
@@ -4962,7 +4976,7 @@ impl AppDb {
                 "SELECT id,matcher_json,project_id,task_id,category
                  FROM attribution_rules
                  WHERE created_from_correction=1 AND enabled=1
-                 ORDER BY updated_at DESC",
+                 ORDER BY updated_at DESC,id DESC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -4976,7 +4990,7 @@ impl AppDb {
             collect_rows(rows)?
         };
 
-        let mut seen = HashSet::new();
+        let mut seen_matchers = HashMap::<String, String>::new();
         let mut changed = 0_u32;
         let conn = self.conn.lock();
         for (id, original_matcher, project_id, task_id, category) in rules {
@@ -5034,17 +5048,26 @@ impl AppDb {
                 }
             }
             let matcher_json = matcher.to_string();
-            let identity = serde_json::to_string(&(
-                &matcher_json,
+            let assignment = serde_json::to_string(&(
                 project_id.as_deref(),
                 task_id.as_deref(),
                 &category,
             ))?;
-            if !seen.insert(identity) {
-                conn.execute("DELETE FROM attribution_rules WHERE id=?1", params![id])?;
+            if let Some(current_assignment) = seen_matchers.get(&matcher_json) {
+                if current_assignment == &assignment {
+                    conn.execute("DELETE FROM attribution_rules WHERE id=?1", params![id])?;
+                } else {
+                    conn.execute(
+                        "UPDATE attribution_rules
+                         SET matcher_json=?1,enabled=0,updated_at=?2
+                         WHERE id=?3",
+                        params![matcher_json, now(), id],
+                    )?;
+                }
                 changed += 1;
                 continue;
             }
+            seen_matchers.insert(matcher_json.clone(), assignment);
             if matcher_json != original_matcher {
                 conn.execute(
                     "UPDATE attribution_rules SET matcher_json=?1,updated_at=?2 WHERE id=?3",
@@ -5274,35 +5297,68 @@ impl AppDb {
             created_from_correction: true,
             enabled: true,
         };
-        let conn = self.conn.lock();
         let matcher_json = rule.matcher.to_string();
-        if let Some(existing_id) = conn
+        let timestamp = now();
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        if let Some(existing_id) = transaction
             .query_row(
                 "SELECT id FROM attribution_rules
-                 WHERE created_from_correction=1 AND enabled=1
+                 WHERE created_from_correction=1
                    AND matcher_json=?1
                    AND COALESCE(project_id,'')=COALESCE(?2,'')
                    AND COALESCE(task_id,'')=COALESCE(?3,'')
                    AND category=?4
-                 ORDER BY updated_at DESC
+                 ORDER BY enabled DESC,updated_at DESC,id DESC
                  LIMIT 1",
-                params![matcher_json, rule.project_id, rule.task_id, rule.category],
+                params![
+                    &matcher_json,
+                    rule.project_id.as_deref(),
+                    rule.task_id.as_deref(),
+                    &rule.category
+                ],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
         {
-            conn.execute(
-                "UPDATE attribution_rules SET name=?1,priority=?2,updated_at=?3 WHERE id=?4",
-                params![rule.name, rule.priority, now(), existing_id],
+            transaction.execute(
+                "UPDATE attribution_rules
+                 SET enabled=0,updated_at=?1
+                 WHERE created_from_correction=1 AND enabled=1
+                   AND matcher_json=?2 AND id<>?3",
+                params![&timestamp, &matcher_json, &existing_id],
+            )?;
+            transaction.execute(
+                "UPDATE attribution_rules
+                 SET name=?1,priority=?2,enabled=1,updated_at=?3
+                 WHERE id=?4",
+                params![&rule.name, rule.priority, &timestamp, &existing_id],
             )?;
             rule.id = existing_id;
+            transaction.commit()?;
             return Ok(rule);
         }
-        conn.execute(
+        transaction.execute(
+            "UPDATE attribution_rules
+             SET enabled=0,updated_at=?1
+             WHERE created_from_correction=1 AND enabled=1 AND matcher_json=?2",
+            params![&timestamp, &matcher_json],
+        )?;
+        transaction.execute(
             "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,1,1,?8)",
-            params![rule.id, rule.name, rule.priority, matcher_json, rule.project_id, rule.task_id, rule.category, now()],
+            params![
+                &rule.id,
+                &rule.name,
+                rule.priority,
+                &matcher_json,
+                rule.project_id.as_deref(),
+                rule.task_id.as_deref(),
+                &rule.category,
+                &timestamp
+            ],
         )?;
+        transaction.commit()?;
         Ok(rule)
     }
 
@@ -9190,6 +9246,176 @@ mod tests {
             .expect("normalized keywords");
         assert!(keywords.iter().any(|value| value == "成果填报"));
         assert!(keywords.iter().any(|value| value == "预推免"));
+        drop(conn);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn latest_learned_rule_replaces_a_conflicting_assignment() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-latest-rule-wins-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("杂务测试").expect("create category");
+        let project = db
+            .create_project("日常杂务测试", &category.name)
+            .expect("create project");
+        let old_task = db
+            .create_task(&project.id, "旧归类")
+            .expect("create old task");
+        let new_task = db
+            .create_task(&project.id, "时间整理")
+            .expect("create new task");
+        let base = Utc::now() + Duration::minutes(30);
+
+        let first = classification::ingest_event(
+            &db,
+            &context_event("strong-rule-old", "screenuse.exe", "ScreenUse", base),
+        )
+        .expect("ingest first event")
+        .expect("first session");
+        db.update_session(
+            &first.id,
+            SessionPatch {
+                summary: Some("screenuse".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(old_task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct first session");
+        let old_rule = db
+            .learn_rule_from_session(&first.id, Some("screenuse.exe"))
+            .expect("learn old rule");
+
+        let second = classification::ingest_event(
+            &db,
+            &context_event(
+                "strong-rule-new",
+                "screenuse.exe",
+                "ScreenUse",
+                base + Duration::minutes(1),
+            ),
+        )
+        .expect("ingest second event")
+        .expect("second session");
+        db.update_session(
+            &second.id,
+            SessionPatch {
+                summary: Some("screenuse".into()),
+                project_id: Some(project.id.clone()),
+                task_id: Some(new_task.id.clone()),
+                clear_project: Some(false),
+                clear_task: Some(false),
+                category: Some(category.name.clone()),
+                confidence: Some(0.98),
+                user_confirmed: Some(true),
+            },
+        )
+        .expect("correct second session");
+        let new_rule = db
+            .learn_rule_from_session(&second.id, Some("screenuse.exe"))
+            .expect("learn replacement rule");
+        assert_ne!(old_rule.id, new_rule.id);
+
+        let conn = db.conn.lock();
+        let old_enabled = conn
+            .query_row(
+                "SELECT enabled FROM attribution_rules WHERE id=?1",
+                params![old_rule.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load old rule");
+        let new_enabled = conn
+            .query_row(
+                "SELECT enabled FROM attribution_rules WHERE id=?1",
+                params![new_rule.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load new rule");
+        assert_eq!(old_enabled, 0);
+        assert_eq!(new_enabled, 1);
+        drop(conn);
+
+        let future = classification::ingest_event(
+            &db,
+            &context_event(
+                "strong-rule-future",
+                "screenuse.exe",
+                "ScreenUse",
+                base + Duration::minutes(2),
+            ),
+        )
+        .expect("ingest future event")
+        .expect("future session");
+        assert_eq!(future.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(future.task_id.as_deref(), Some(new_task.id.as_str()));
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn rule_normalization_disables_older_conflicting_assignments() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-rule-conflict-repair-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let category = db.create_category("归一化测试").expect("create category");
+        let project = db
+            .create_project("规则修复", &category.name)
+            .expect("create project");
+        let old_task = db.create_task(&project.id, "旧任务").expect("old task");
+        let new_task = db.create_task(&project.id, "新任务").expect("new task");
+        let matcher = serde_json::json!({
+            "generation": 3,
+            "keywords": [format!("conflict-{}", Uuid::new_v4())],
+            "matchMode": "any",
+        })
+        .to_string();
+        let old_rule_id = Uuid::new_v4().to_string();
+        let new_rule_id = Uuid::new_v4().to_string();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES (?1,'old',90,?2,?3,?4,?5,1,1,'2026-07-19T00:00:00Z')",
+                params![old_rule_id, matcher, project.id, old_task.id, category.name],
+            )
+            .expect("insert old rule");
+            conn.execute(
+                "INSERT INTO attribution_rules(id,name,priority,matcher_json,project_id,task_id,category,created_from_correction,enabled,updated_at)
+                 VALUES (?1,'new',90,?2,?3,?4,?5,1,1,'2026-07-20T00:00:00Z')",
+                params![new_rule_id, matcher, project.id, new_task.id, category.name],
+            )
+            .expect("insert new rule");
+        }
+
+        db.normalize_correction_rules()
+            .expect("normalize conflicting rules");
+        let conn = db.conn.lock();
+        let old_enabled = conn
+            .query_row(
+                "SELECT enabled FROM attribution_rules WHERE id=?1",
+                params![old_rule_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load old rule");
+        let new_enabled = conn
+            .query_row(
+                "SELECT enabled FROM attribution_rules WHERE id=?1",
+                params![new_rule_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load new rule");
+        assert_eq!(old_enabled, 0);
+        assert_eq!(new_enabled, 1);
         drop(conn);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
