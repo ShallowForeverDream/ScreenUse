@@ -86,6 +86,17 @@ export const fallbackDashboard: DashboardData = {
     firstLayerSeconds: 8 * 3_600,
     secondLayerSeconds: 0,
     totalSeconds: 8 * 3_600,
+    days: [{
+      date: now.toISOString().slice(0, 10),
+      sleepSeconds: 0,
+      dailyTargetSeconds: 8 * 3_600,
+      dailyShortfallSeconds: 8 * 3_600,
+      dailySurplusSeconds: 0,
+      mondayDebtAddedSeconds: 0,
+      firstLayerSeconds: 8 * 3_600,
+      secondLayerSeconds: 0,
+      periods: [],
+    }],
   },
   queue: {
     pending: 0,

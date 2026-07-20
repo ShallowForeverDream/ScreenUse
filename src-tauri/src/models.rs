@@ -457,6 +457,31 @@ pub struct SleepDebtSummary {
     pub first_layer_seconds: u64,
     pub second_layer_seconds: u64,
     pub total_seconds: u64,
+    pub days: Vec<SleepDebtDay>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SleepDebtDay {
+    pub date: String,
+    pub sleep_seconds: u64,
+    pub daily_target_seconds: u64,
+    pub daily_shortfall_seconds: u64,
+    pub daily_surplus_seconds: u64,
+    pub monday_debt_added_seconds: u64,
+    pub first_layer_seconds: u64,
+    pub second_layer_seconds: u64,
+    pub periods: Vec<SleepPeriod>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SleepPeriod {
+    pub session_id: String,
+    pub task_title: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -269,6 +269,27 @@ export interface SleepDebtSummary {
   firstLayerSeconds: number;
   secondLayerSeconds: number;
   totalSeconds: number;
+  days: SleepDebtDay[];
+}
+
+export interface SleepDebtDay {
+  date: string;
+  sleepSeconds: number;
+  dailyTargetSeconds: number;
+  dailyShortfallSeconds: number;
+  dailySurplusSeconds: number;
+  mondayDebtAddedSeconds: number;
+  firstLayerSeconds: number;
+  secondLayerSeconds: number;
+  periods: SleepPeriod[];
+}
+
+export interface SleepPeriod {
+  sessionId: string;
+  taskTitle: string;
+  startedAt: string;
+  endedAt: string;
+  durationSeconds: number;
 }
 
 export interface SessionPatch {

@@ -1,4 +1,4 @@
-use crate::models::SleepDebtSummary;
+use crate::models::{SleepDebtDay, SleepDebtSummary};
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use std::collections::HashMap;
 
@@ -20,6 +20,7 @@ const MONDAY_DEBT_SECONDS: f64 = 3.0 * 60.0 * 60.0;
 const FIRST_LAYER_GROWTH: f64 = 1.5;
 const SECOND_LAYER_GROWTH: f64 = 2.0;
 const SECOND_LAYER_REPAYMENT_EFFECT: f64 = 1.0 / 3.0;
+const HEATMAP_HISTORY_DAYS: usize = 371;
 
 #[derive(Debug, Clone)]
 struct FirstLayerDebt {
@@ -45,6 +46,7 @@ pub(crate) fn calculate(
 
     let mut first_layer = Vec::<FirstLayerDebt>::new();
     let mut second_layer = Vec::<SecondLayerDebt>::new();
+    let mut days = Vec::<SleepDebtDay>::new();
     let mut day = started_on;
 
     while day <= as_of {
@@ -76,13 +78,16 @@ pub(crate) fn calculate(
             }
         }
 
-        if day.weekday() == Weekday::Mon {
+        let monday_debt_added_seconds = if day.weekday() == Weekday::Mon {
             first_layer.push(FirstLayerDebt {
                 origin: day,
                 amount: MONDAY_DEBT_SECONDS,
                 compounds_daily: false,
             });
-        }
+            MONDAY_DEBT_SECONDS as u64
+        } else {
+            0
+        };
 
         let slept = sleep_seconds_by_day.get(&day).copied().unwrap_or_default() as f64;
         if slept < DAILY_TARGET_SECONDS {
@@ -102,7 +107,22 @@ pub(crate) fn calculate(
 
         first_layer.retain(|debt| debt.amount >= 0.5);
         second_layer.retain(|debt| debt.amount >= 0.5);
+        days.push(SleepDebtDay {
+            date: day.to_string(),
+            sleep_seconds: slept.round() as u64,
+            daily_target_seconds: DAILY_TARGET_SECONDS as u64,
+            daily_shortfall_seconds: (DAILY_TARGET_SECONDS - slept).max(0.0).round() as u64,
+            daily_surplus_seconds: (slept - DAILY_TARGET_SECONDS).max(0.0).round() as u64,
+            monday_debt_added_seconds,
+            first_layer_seconds: rounded_sum(first_layer.iter().map(|debt| debt.amount)),
+            second_layer_seconds: rounded_sum(second_layer.iter().map(|debt| debt.amount)),
+            periods: Vec::new(),
+        });
         day += Duration::days(1);
+    }
+
+    if days.len() > HEATMAP_HISTORY_DAYS {
+        days.drain(..days.len() - HEATMAP_HISTORY_DAYS);
     }
 
     let first_layer_seconds = rounded_sum(first_layer.iter().map(|debt| debt.amount));
@@ -118,6 +138,7 @@ pub(crate) fn calculate(
         first_layer_seconds,
         second_layer_seconds,
         total_seconds: first_layer_seconds.saturating_add(second_layer_seconds),
+        days,
     }
 }
 
@@ -160,6 +181,7 @@ fn empty_summary(as_of: NaiveDate) -> SleepDebtSummary {
         first_layer_seconds: 0,
         second_layer_seconds: 0,
         total_seconds: 0,
+        days: Vec::new(),
     }
 }
 

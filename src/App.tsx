@@ -70,6 +70,7 @@ import type {
   GithubSyncStatus,
   Project,
   SessionPatch,
+  SleepDebtSummary,
   Task,
   ThemeMode,
   UndoStatus,
@@ -778,6 +779,7 @@ export default function App() {
   const [undoStatus, setUndoStatus] = useState<UndoStatus>({ available: false });
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [sleepDebtOpen, setSleepDebtOpen] = useState(false);
   const [projectFocusId, setProjectFocusId] = useState('');
   const loadSequenceRef = useRef(0);
   const toastTimerRef = useRef<number | null>(null);
@@ -1204,6 +1206,7 @@ export default function App() {
                 ? `第一层 ${formatPreciseDuration(data.sleepDebt.firstLayerSeconds)} · 第二层 ${formatPreciseDuration(data.sleepDebt.secondLayerSeconds)}`
                 : `今日已休息 ${formatPreciseDuration(data.sleepDebt.sleepSecondsToday)}`}
               attention={data.sleepDebt.totalSeconds > 0}
+              onClick={() => setSleepDebtOpen(true)}
               showHint
             />
             <Kpi
@@ -1293,6 +1296,18 @@ export default function App() {
           <SettingsView data={data} runAction={runAction} onThemeChange={setThemeMode} />
         )}
       </main>
+
+      {sleepDebtOpen && (
+        <SleepDebtModal
+          summary={data.sleepDebt}
+          sessions={data.sessions}
+          onClose={() => setSleepDebtOpen(false)}
+          onEdit={(session) => {
+            setSleepDebtOpen(false);
+            setEditing([session]);
+          }}
+        />
+      )}
 
       {(editing.length > 0 || manualDraftSession) && (
         <EditSessionModal
@@ -6258,6 +6273,190 @@ function EditSessionModal({
   );
 }
 
+function SleepDebtModal({
+  summary,
+  sessions,
+  onClose,
+  onEdit,
+}: {
+  summary: SleepDebtSummary;
+  sessions: WorkSession[];
+  onClose: () => void;
+  onEdit: (session: WorkSession) => void;
+}) {
+  const [selectedDate, setSelectedDate] = useState(summary.asOfDate);
+  const dayMap = useMemo(
+    () => new Map(summary.days.map((day) => [day.date, day])),
+    [summary.days],
+  );
+  const sessionsById = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session])),
+    [sessions],
+  );
+  const heatmapDates = useMemo(() => {
+    const asOf = dateFromKey(summary.asOfDate);
+    const currentWeekMonday = new Date(asOf);
+    currentWeekMonday.setDate(asOf.getDate() - ((asOf.getDay() + 6) % 7));
+    const firstDay = new Date(currentWeekMonday);
+    firstDay.setDate(currentWeekMonday.getDate() - 52 * 7);
+    return Array.from({ length: 53 * 7 }, (_, index) => {
+      const date = new Date(firstDay);
+      date.setDate(firstDay.getDate() + index);
+      return localDateKey(date);
+    });
+  }, [summary.asOfDate]);
+  const selectedDay = dayMap.get(selectedDate) || summary.days[summary.days.length - 1];
+
+  useEffect(() => {
+    if (!dayMap.has(selectedDate)) setSelectedDate(summary.asOfDate);
+  }, [dayMap, selectedDate, summary.asOfDate]);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  const selectedDateValue = selectedDay ? dateFromKey(selectedDay.date) : dateFromKey(summary.asOfDate);
+  const weekday = ['日', '一', '二', '三', '四', '五', '六'][selectedDateValue.getDay()];
+  const selectedDebt = selectedDay
+    ? selectedDay.firstLayerSeconds + selectedDay.secondLayerSeconds
+    : summary.totalSeconds;
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="modal sleep-debt-modal" role="dialog" aria-modal="true" aria-label="睡眠缺失与睡眠热力图">
+        <div className="modal-head sleep-debt-head">
+          <div>
+            <h2>睡眠缺失</h2>
+            <p>每日 8 小时 · 第一层优先偿还 · 记录始于 {summary.startedOn}</p>
+          </div>
+          <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
+            <X size={18} />
+          </button>
+        </div>
+
+        <section className="sleep-debt-overview" aria-label="当前睡眠缺失概览">
+          <div><span>当前合计</span><strong>{formatPreciseDuration(summary.totalSeconds)}</strong></div>
+          <div><span>第一层</span><strong>{formatPreciseDuration(summary.firstLayerSeconds)}</strong></div>
+          <div><span>第二层</span><strong>{formatPreciseDuration(summary.secondLayerSeconds)}</strong></div>
+          <div><span>今日睡眠</span><strong>{formatPreciseDuration(summary.sleepSecondsToday)}</strong></div>
+        </section>
+
+        <section className="sleep-heatmap-panel">
+          <div className="sleep-section-head">
+            <div>
+              <h3>睡眠热力图</h3>
+              <p>颜色越深，记录的睡眠越接近或超过 8 小时</p>
+            </div>
+            <div className="sleep-heat-legend" aria-label="睡眠时长颜色图例">
+              <span>少</span>
+              {[0, 1, 2, 3, 4, 5].map((level) => <i data-level={level} key={level} />)}
+              <span>充足</span>
+            </div>
+          </div>
+          <div className="sleep-heatmap-scroll">
+            <div className="sleep-weekdays" aria-hidden="true">
+              {['一', '二', '三', '四', '五', '六', '日'].map((day) => <span key={day}>{day}</span>)}
+            </div>
+            <div className="sleep-heatmap-grid">
+              {heatmapDates.map((date) => {
+                const day = dayMap.get(date);
+                const tracked = date >= summary.startedOn && date <= summary.asOfDate;
+                const level = sleepHeatLevel(day?.sleepSeconds || 0, summary.dailyTargetSeconds);
+                const label = day
+                  ? `${date}：睡眠 ${formatPreciseDuration(day.sleepSeconds)}`
+                  : tracked
+                    ? `${date}：未记录睡眠`
+                    : date > summary.asOfDate
+                      ? `${date}：未来日期`
+                      : `${date}：尚未开始统计`;
+                return (
+                  <button
+                    aria-label={label}
+                    aria-pressed={selectedDate === date}
+                    className={`${tracked ? '' : 'untracked'} ${selectedDate === date ? 'selected' : ''}`}
+                    data-level={level}
+                    disabled={!tracked || !day}
+                    key={date}
+                    onClick={() => setSelectedDate(date)}
+                    title={label}
+                    type="button"
+                  />
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {selectedDay && (
+          <section className="sleep-day-detail">
+            <div className="sleep-section-head sleep-day-title">
+              <div>
+                <h3>{selectedDay.date} · 周{weekday}</h3>
+                <p>{selectedDay.date === summary.asOfDate ? '截至当前记录' : '当日最终记录'} · {selectedDay.periods.length} 个睡眠时间段</p>
+              </div>
+              {selectedDay.mondayDebtAddedSeconds > 0 && (
+                <span className="sleep-monday-badge">周一额外 +{formatPreciseDuration(selectedDay.mondayDebtAddedSeconds)}</span>
+              )}
+            </div>
+            <div className="sleep-day-metrics">
+              <div><span>实际睡眠</span><strong>{formatPreciseDuration(selectedDay.sleepSeconds)}</strong></div>
+              <div><span>每日目标</span><strong>{formatPreciseDuration(selectedDay.dailyTargetSeconds)}</strong></div>
+              <div className={selectedDay.dailyShortfallSeconds > 0 ? 'negative' : 'positive'}>
+                <span>{selectedDay.dailyShortfallSeconds > 0 ? '当日不足' : '当日超额'}</span>
+                <strong>{formatPreciseDuration(selectedDay.dailyShortfallSeconds || selectedDay.dailySurplusSeconds)}</strong>
+              </div>
+              <div><span>当日累计缺失</span><strong>{formatPreciseDuration(selectedDebt)}</strong></div>
+            </div>
+            <div className="sleep-period-list">
+              {!selectedDay.periods.length && (
+                <div className="sleep-period-empty">
+                  <Moon size={20} />
+                  <span>当天还没有归入“午睡”或“睡觉”的时间段</span>
+                </div>
+              )}
+              {selectedDay.periods.map((period, index) => {
+                const session = sessionsById.get(period.sessionId);
+                return (
+                  <button
+                    disabled={!session}
+                    key={`${period.sessionId}:${period.startedAt}:${index}`}
+                    onClick={() => session && onEdit(session)}
+                    title={session ? '点击修正这个睡眠时间段' : '该历史时间段不在当前编辑缓存中'}
+                    type="button"
+                  >
+                    <span className="sleep-period-time">
+                      <strong>{formatTimelineClock(period.startedAt, true)}</strong>
+                      <small>{formatTimelineClock(period.endedAt, true)}</small>
+                    </span>
+                    <span className="sleep-period-name"><strong>{period.taskTitle}</strong><small>睡眠时间段</small></span>
+                    <b>{formatPreciseDuration(period.durationSeconds)}</b>
+                    {session && <Pencil size={15} />}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function sleepHeatLevel(sleepSeconds: number, targetSeconds: number) {
+  if (sleepSeconds <= 0 || targetSeconds <= 0) return 0;
+  const ratio = sleepSeconds / targetSeconds;
+  if (ratio < 0.25) return 1;
+  if (ratio < 0.5) return 2;
+  if (ratio < 0.75) return 3;
+  if (ratio < 1) return 4;
+  return 5;
+}
+
 function Kpi({
   icon: Icon,
   title,
@@ -6265,6 +6464,7 @@ function Kpi({
   hint,
   attention = false,
   showHint = false,
+  onClick,
 }: {
   icon: typeof Activity;
   title: string;
@@ -6272,16 +6472,25 @@ function Kpi({
   hint: string;
   attention?: boolean;
   showHint?: boolean;
+  onClick?: () => void;
 }) {
-  return (
-    <div className={`kpi ${attention ? 'attention' : ''} ${showHint ? 'with-hint' : ''}`} title={hint}>
+  const content = (
+    <>
       <span className="kpi-icon"><Icon size={18} /></span>
       <div>
         <span>{title}</span>
         <strong>{value}</strong>
         <small>{hint}</small>
       </div>
-    </div>
+    </>
+  );
+  const className = `kpi ${attention ? 'attention' : ''} ${showHint ? 'with-hint' : ''} ${onClick ? 'clickable' : ''}`;
+  return onClick ? (
+    <button className={className} onClick={onClick} title={`${hint} · 点击查看详情`} type="button">
+      {content}
+    </button>
+  ) : (
+    <div className={className} title={hint}>{content}</div>
   );
 }
 

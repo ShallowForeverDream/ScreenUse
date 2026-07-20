@@ -285,6 +285,8 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     Some("windows-task-view")
                 } else if is_windows_system_tray_overflow(&event) {
                     Some("windows-system-tray-overflow")
+                } else if is_windows_quick_settings(&event) {
+                    Some("windows-quick-settings")
                 } else if is_incomplete_chat_workspace_handoff(active.as_ref(), &event) {
                     Some("chat-workspace-loading")
                 } else {
@@ -734,6 +736,29 @@ fn is_windows_system_tray_overflow(event: &RawActivityEvent) -> bool {
             "system tray overflow window" | "系统托盘溢出窗口" | "通知区域溢出窗口"
         ) || class_name.contains("notifyiconoverflowwindow")
             || class_name.contains("toplevelwindowforoverflowxamlisland"))
+}
+
+fn is_windows_quick_settings(event: &RawActivityEvent) -> bool {
+    let app = event.app.as_deref().unwrap_or_default().trim().to_lowercase();
+    let title = event
+        .metadata
+        .get("nativeWindowTitle")
+        .and_then(serde_json::Value::as_str)
+        .or(event.window_title.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let class_name = event
+        .metadata
+        .get("nativeWindowClass")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    matches!(app.as_str(), "shellhost.exe" | "shellexperiencehost.exe")
+        && (matches!(title.as_str(), "快速设置" | "quick settings")
+            || class_name.contains("quicksettings")
+            || class_name.contains("controlcenterwindow"))
 }
 
 fn is_incomplete_chat_workspace_handoff(
@@ -3888,6 +3913,35 @@ mod tests {
             ..event.clone()
         }));
         assert!(!is_windows_system_tray_overflow(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            ..event
+        }));
+    }
+
+    #[test]
+    fn windows_quick_settings_is_a_handoff_surface() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-20T10:00:00Z".into(),
+            app: Some("ShellHost.exe".into()),
+            window_title: Some("快速设置".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({}),
+        };
+        assert!(is_windows_quick_settings(&event));
+        assert!(is_windows_quick_settings(&RawActivityEvent {
+            window_title: Some(String::new()),
+            metadata: json!({
+                "nativeWindowTitle": "Quick Settings",
+                "nativeWindowClass": "ControlCenterWindow"
+            }),
+            ..event.clone()
+        }));
+        assert!(!is_windows_quick_settings(&RawActivityEvent {
             app: Some("chrome.exe".into()),
             ..event
         }));

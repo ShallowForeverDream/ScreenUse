@@ -481,6 +481,9 @@ kbd {
 .kpi strong { display: block; margin: 5px 0 2px; font-size: 21px; letter-spacing: -.035em; white-space: nowrap; }
 .kpi small { display: none; }
 .kpi.with-hint small { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi.clickable { width: 100%; color: inherit; text-align: left; cursor: pointer; appearance: none; transition: transform .16s ease, border-color .16s ease, background .16s ease; }
+.kpi.clickable:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--blue-strong) 32%, var(--border)); background: color-mix(in srgb, var(--panel) 94%, var(--blue-strong)); }
+.kpi.clickable:active { transform: translateY(0); }
 
 .panel {
   min-width: 0;
@@ -1352,6 +1355,81 @@ kbd {
 .modal-head h2 { margin-bottom: 4px; font-size: 20px; }
 .modal-head p { margin-bottom: 0; color: var(--muted); font-size: 12px; }
 .icon-button { width: 34px; height: 34px; padding: 0; }
+.sleep-debt-modal { width: min(980px, 100%); }
+.sleep-debt-head { align-items: flex-start; }
+.sleep-debt-overview, .sleep-day-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+}
+.sleep-debt-overview > div, .sleep-day-metrics > div {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-subtle);
+}
+.sleep-debt-overview span, .sleep-day-metrics span { display: block; color: var(--muted); font-size: 11px; }
+.sleep-debt-overview strong, .sleep-day-metrics strong { display: block; margin-top: 5px; overflow: hidden; color: var(--text-strong); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.sleep-day-metrics .negative strong { color: var(--rose); }
+.sleep-day-metrics .positive strong { color: var(--green); }
+.sleep-heatmap-panel, .sleep-day-detail {
+  padding: 15px;
+  display: grid;
+  gap: 13px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-subtle);
+}
+.sleep-section-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.sleep-section-head h3 { margin: 0; color: var(--text-strong); font-size: 15px; }
+.sleep-section-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+.sleep-heat-legend { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.sleep-heat-legend i, .sleep-heatmap-grid button {
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 65%, transparent);
+  border-radius: 4px;
+  appearance: none;
+}
+.sleep-heat-legend i[data-level="0"], .sleep-heatmap-grid button[data-level="0"] { background: var(--track); }
+.sleep-heat-legend i[data-level="1"], .sleep-heatmap-grid button[data-level="1"] { background: color-mix(in srgb, var(--blue-strong) 18%, var(--track)); }
+.sleep-heat-legend i[data-level="2"], .sleep-heatmap-grid button[data-level="2"] { background: color-mix(in srgb, var(--blue-strong) 34%, var(--track)); }
+.sleep-heat-legend i[data-level="3"], .sleep-heatmap-grid button[data-level="3"] { background: color-mix(in srgb, var(--blue-strong) 52%, var(--track)); }
+.sleep-heat-legend i[data-level="4"], .sleep-heatmap-grid button[data-level="4"] { background: color-mix(in srgb, var(--blue-strong) 72%, var(--track)); }
+.sleep-heat-legend i[data-level="5"], .sleep-heatmap-grid button[data-level="5"] { background: var(--blue-strong); }
+.sleep-heatmap-scroll { min-width: 0; overflow-x: auto; padding: 2px 2px 7px; display: flex; gap: 7px; scrollbar-color: color-mix(in srgb, var(--blue-strong) 24%, transparent) transparent; }
+.sleep-weekdays { flex: 0 0 13px; display: grid; grid-template-rows: repeat(7, 15px); gap: 4px; color: var(--subtle); font-size: 9px; line-height: 15px; text-align: center; }
+.sleep-heatmap-grid { width: max-content; display: grid; grid-template-rows: repeat(7, 15px); grid-auto-flow: column; grid-auto-columns: 15px; gap: 4px; }
+.sleep-heatmap-grid button { cursor: pointer; }
+.sleep-heatmap-grid button:hover:not(:disabled) { border-color: var(--text-secondary); transform: scale(1.12); }
+.sleep-heatmap-grid button.selected { border-color: var(--text-strong); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-strong) 35%, transparent); }
+.sleep-heatmap-grid button.untracked { opacity: .38; background: var(--surface-subtle); cursor: default; }
+.sleep-day-title { align-items: flex-start; }
+.sleep-monday-badge { padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--rose) 22%, var(--border)); border-radius: 999px; color: var(--rose); background: color-mix(in srgb, var(--rose) 8%, var(--surface-subtle)); font-size: 10px; font-weight: 750; white-space: nowrap; }
+.sleep-period-list { display: grid; gap: 7px; }
+.sleep-period-list > button {
+  width: 100%;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) auto 18px;
+  align-items: center;
+  gap: 11px;
+  color: var(--text);
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--control);
+}
+.sleep-period-list > button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--blue-strong) 28%, var(--border)); background: var(--control-hover); }
+.sleep-period-list > button:disabled { opacity: .72; }
+.sleep-period-time strong, .sleep-period-time small, .sleep-period-name strong, .sleep-period-name small { display: block; }
+.sleep-period-time strong, .sleep-period-name strong { color: var(--text-strong); font-size: 12px; }
+.sleep-period-time small, .sleep-period-name small { margin-top: 2px; color: var(--muted); font-size: 10px; }
+.sleep-period-list > button > b { color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+.sleep-period-list > button > svg { color: var(--muted); }
+.sleep-period-empty { padding: 18px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); border: 1px dashed var(--border-strong); border-radius: 12px; background: var(--panel-soft); font-size: 12px; }
 .modal-evidence { padding: 11px; display: grid; gap: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-subtle); }
 .modal-evidence summary { color: var(--text-secondary); font-size: 12px; font-weight: 750; cursor: pointer; }
 .modal-evidence span { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 8px; color: #8d9aaf; font-size: 11px; overflow-wrap: anywhere; }
@@ -2067,6 +2145,10 @@ kbd {
   .review-panel .all-clear span { grid-column: 2; }
   .modal-backdrop { padding: 10px; }
   .modal { max-height: calc(100vh - 20px); }
+  .sleep-debt-overview, .sleep-day-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sleep-section-head { align-items: flex-start; flex-direction: column; }
+  .sleep-period-list > button { grid-template-columns: 76px minmax(0, 1fr) max-content; gap: 8px; }
+  .sleep-period-list > button > svg { display: none; }
   .distribution-row { grid-template-columns: 10px 44px minmax(60px, 1fr) max-content 15px; }
   .distribution-row.project { grid-template-columns: 10px minmax(80px, 120px) minmax(50px, 1fr) max-content 15px; }
   .panel-title { flex-wrap: wrap; }

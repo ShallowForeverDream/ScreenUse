@@ -162,6 +162,14 @@ struct SeedSession<'a> {
     confidence: f32,
 }
 
+#[derive(Debug, Clone)]
+struct SleepSessionSlice {
+    session_id: String,
+    task_title: String,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+}
+
 pub struct AppDb {
     pub(crate) conn: Mutex<Connection>,
     data_dir: PathBuf,
@@ -1110,7 +1118,7 @@ impl AppDb {
         let rows = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT ws.started_at,ws.ended_at
+                "SELECT ws.id,t.title,ws.started_at,ws.ended_at
                  FROM work_sessions ws
                  JOIN tasks t ON t.id=ws.task_id
                  JOIN projects p ON p.id=t.project_id
@@ -1127,13 +1135,20 @@ impl AppDb {
                     fmt(range_start),
                     fmt(range_end)
                 ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
             )?;
             collect_rows(values)?
         };
 
-        let mut intervals_by_day = HashMap::<NaiveDate, Vec<(DateTime<Utc>, DateTime<Utc>)>>::new();
-        for (started_at, ended_at) in rows {
+        let mut intervals_by_day = HashMap::<NaiveDate, Vec<SleepSessionSlice>>::new();
+        for (session_id, task_title, started_at, ended_at) in rows {
             let Ok(mut cursor) = DateTime::parse_from_rfc3339(&started_at)
                 .map(|value| value.with_timezone(&Utc))
             else {
@@ -1160,7 +1175,12 @@ impl AppDb {
                 intervals_by_day
                     .entry(date)
                     .or_default()
-                    .push((cursor, segment_end));
+                    .push(SleepSessionSlice {
+                        session_id: session_id.clone(),
+                        task_title: task_title.clone(),
+                        started_at: cursor,
+                        ended_at: segment_end,
+                    });
                 if segment_end <= cursor {
                     break;
                 }
@@ -1169,8 +1189,12 @@ impl AppDb {
         }
 
         let sleep_seconds_by_day = intervals_by_day
-            .into_iter()
-            .map(|(date, mut intervals)| {
+            .iter()
+            .map(|(date, slices)| {
+                let mut intervals = slices
+                    .iter()
+                    .map(|slice| (slice.started_at, slice.ended_at))
+                    .collect::<Vec<_>>();
                 intervals.sort_by_key(|(start, _)| *start);
                 let mut total = 0_u64;
                 let mut merged: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
@@ -1191,15 +1215,38 @@ impl AppDb {
                 if let Some((start, end)) = merged {
                     total = total.saturating_add((end - start).num_seconds().max(0) as u64);
                 }
-                (date, total)
+                (*date, total)
             })
             .collect::<HashMap<_, _>>();
 
-        Ok(sleep_debt::calculate(
+        let mut summary = sleep_debt::calculate(
             started_on,
             as_of,
             &sleep_seconds_by_day,
-        ))
+        );
+        for day in &mut summary.days {
+            let Ok(date) = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d") else {
+                continue;
+            };
+            let Some(slices) = intervals_by_day.get(&date) else {
+                continue;
+            };
+            let mut periods = slices
+                .iter()
+                .map(|slice| SleepPeriod {
+                    session_id: slice.session_id.clone(),
+                    task_title: slice.task_title.clone(),
+                    started_at: fmt(slice.started_at),
+                    ended_at: fmt(slice.ended_at),
+                    duration_seconds: (slice.ended_at - slice.started_at)
+                        .num_seconds()
+                        .max(0) as u64,
+                })
+                .collect::<Vec<_>>();
+            periods.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+            day.periods = periods;
+        }
+        Ok(summary)
     }
 
     pub fn list_categories(&self) -> Result<Vec<CategoryOption>> {
@@ -2756,6 +2803,87 @@ impl AppDb {
             return Ok(current);
         }
         self.merge_sessions_into(&previous, &[current])
+    }
+
+    fn absorb_transition_handoff_into_next(&self, id: &str) -> Result<WorkSession> {
+        let current = self.get_session(id)?.context("session not found")?;
+        if !is_next_context_handoff_session(&current) {
+            return Ok(current);
+        }
+        let next_id = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT id FROM work_sessions
+                 WHERE id<>?1 AND started_at>=?2
+                 ORDER BY started_at ASC LIMIT 1",
+                params![current.id, current.ended_at],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        };
+        let Some(next_id) = next_id else {
+            return Ok(current);
+        };
+        let next = self
+            .get_session(&next_id)?
+            .context("next session not found")?;
+        if next.project_id.is_none()
+            || next.task_id.is_none()
+            || next.source == "collector-idle"
+            || next.category == "离开"
+            || !within_gap_seconds(&current.ended_at, &next.started_at, 5)
+        {
+            return Ok(current);
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE work_sessions SET started_at=?1,updated_at=?2 WHERE id=?3",
+            params![current.started_at, now(), next.id],
+        )?;
+        tx.execute(
+            "UPDATE activities SET started_at=?1 WHERE session_id=?2",
+            params![current.started_at, next.id],
+        )?;
+        let plan_updates = {
+            let mut stmt = tx.prepare(
+                "SELECT id,matched_session_ids_json FROM plan_items
+                 WHERE matched_session_ids_json LIKE ?1",
+            )?;
+            let rows = stmt.query_map(params![format!("%{}%", current.id)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (plan_id, matched_json) = row?;
+                let mut matched: Vec<String> = parse_json(&matched_json);
+                for session_id in &mut matched {
+                    if session_id == &current.id {
+                        *session_id = next.id.clone();
+                    }
+                }
+                matched.sort();
+                matched.dedup();
+                updates.push((plan_id, serde_json::to_string(&matched)?));
+            }
+            updates
+        };
+        for (plan_id, matched_json) in plan_updates {
+            tx.execute(
+                "UPDATE plan_items SET matched_session_ids_json=?1,updated_at=?2 WHERE id=?3",
+                params![matched_json, now(), plan_id],
+            )?;
+        }
+        record_tombstone(&tx, "session", &current.id)?;
+        tx.execute(
+            "DELETE FROM work_sessions WHERE id=?1",
+            params![current.id],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_session(&next.id)?
+            .context("next session missing after handoff merge")
     }
 
     fn find_short_detour_anchor(
@@ -4512,6 +4640,11 @@ impl AppDb {
         let mut changed = 0;
         for id in ids {
             if self.get_session(&id)?.is_some() {
+                let handed_off = self.absorb_transition_handoff_into_next(&id)?;
+                if handed_off.id != id {
+                    changed += 1;
+                    continue;
+                }
                 let absorbed = self.absorb_short_auto_session(&id)?;
                 if absorbed.id != id {
                     changed += 1;
@@ -6203,6 +6336,35 @@ fn is_task_overlay_session(session: &WorkSession) -> bool {
         })
 }
 
+fn is_next_context_handoff_session(session: &WorkSession) -> bool {
+    if session.user_confirmed || !is_auto_session_source(&session.source) {
+        return false;
+    }
+    let app = primary_session_app(session).unwrap_or_default();
+    let shell_app = matches!(
+        app.trim_end_matches(".exe"),
+        "explorer" | "shellhost" | "shellexperiencehost" | "applicationframehost"
+    );
+    if !shell_app {
+        return false;
+    }
+    let summary = session.summary.trim().to_lowercase();
+    [
+        "任务切换",
+        "任务视图",
+        "task switching",
+        "task switcher",
+        "task view",
+        "系统托盘溢出窗口",
+        "通知区域溢出窗口",
+        "system tray overflow",
+        "快速设置",
+        "quick settings",
+    ]
+    .iter()
+    .any(|label| summary.contains(label))
+}
+
 fn is_task_overlay_app_name(app: &str) -> bool {
     let app = app.trim().trim_end_matches(".exe");
     matches!(
@@ -6378,6 +6540,8 @@ fn is_context_memory_noise(value: &str) -> bool {
             | "校内实习"
     ) || [
         "系统托盘溢出窗口",
+        "快速设置",
+        "quick settings",
         "任务视图",
         "任务切换",
         "程序管理器",
@@ -6475,19 +6639,50 @@ mod tests {
         assert_eq!(sleep_project.name, "睡眠");
         assert_eq!(sleep_project.category, "休息");
 
-        let titles = db
+        let sleep_tasks = db
             .list_tasks()
             .expect("list tasks")
             .into_iter()
             .filter(|task| task.project_id == sleep_project.id)
-            .map(|task| task.title)
+            .collect::<Vec<_>>();
+        let titles = sleep_tasks
+            .iter()
+            .map(|task| task.title.clone())
             .collect::<HashSet<_>>();
         assert_eq!(titles, HashSet::from(["午睡".into(), "睡觉".into()]));
+
+        let sleep_task = sleep_tasks
+            .iter()
+            .find(|task| task.source == sleep_debt::SLEEP_TASK_SOURCE)
+            .expect("sleep task");
+        let today = Local::now().date_naive();
+        let day_start = local_midnight_utc(today).expect("local midnight");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('sleep-period',?1,?2,?3,?4,'休息','睡觉',1.0,'[]',1,'manual-correction',?5)",
+                params![
+                    fmt(day_start + Duration::hours(1)),
+                    fmt(day_start + Duration::hours(3)),
+                    sleep_project.id,
+                    sleep_task.id,
+                    now()
+                ],
+            )
+            .expect("insert sleep period");
+        }
 
         let debt = db.dashboard(false).expect("dashboard").sleep_debt;
         assert_eq!(debt.started_on, debt.as_of_date);
         assert_eq!(debt.daily_target_seconds, 8 * 3_600);
-        assert!(debt.first_layer_seconds >= debt.daily_target_seconds);
+        assert_eq!(debt.sleep_seconds_today, 2 * 3_600);
+        let today = debt.days.last().expect("today heatmap row");
+        assert_eq!(today.sleep_seconds, 2 * 3_600);
+        assert_eq!(today.periods.len(), 1);
+        assert_eq!(today.periods[0].session_id, "sleep-period");
+        assert_eq!(today.periods[0].task_title, "睡觉");
+        assert_eq!(today.periods[0].duration_seconds, 2 * 3_600);
+        assert!(debt.first_layer_seconds >= 6 * 3_600);
         assert_eq!(debt.second_layer_seconds, 0);
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
@@ -7966,6 +8161,73 @@ mod tests {
             .expect("load switch")
             .is_some());
         assert!(db.get_session("qq-return").expect("load return").is_some());
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn historical_quick_settings_is_absorbed_into_the_next_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-quick-settings-handoff-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("快速设置衔接测试", "开发")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "继续工作")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(4);
+        let shell_evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "ShellHost.exe".into(),
+            weight: 0.5,
+        }])
+        .expect("serialize shell evidence");
+        let task_evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "ChatGPT.exe".into(),
+            weight: 0.5,
+        }])
+        .expect("serialize task evidence");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('quick-settings',?1,?2,NULL,NULL,'杂务','ShellHost · 快速设置',0.56,?3,0,'context-complete',?4)",
+                params![fmt(base), fmt(base + Duration::seconds(26)), shell_evidence, now()],
+            )
+            .expect("insert quick settings");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('next-task',?1,?2,?3,?4,'开发','继续工作',0.92,?5,0,'context-complete',?6)",
+                params![
+                    fmt(base + Duration::seconds(26)),
+                    fmt(base + Duration::seconds(90)),
+                    project.id,
+                    task.id,
+                    task_evidence,
+                    now()
+                ],
+            )
+            .expect("insert next task");
+        }
+
+        assert_eq!(db.compact_sessions().expect("compact handoff"), 1);
+        assert!(db
+            .get_session("quick-settings")
+            .expect("load quick settings")
+            .is_none());
+        let next = db
+            .get_session("next-task")
+            .expect("load next task")
+            .expect("next task remains");
+        assert_eq!(next.started_at, fmt(base));
+        assert_eq!(next.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(next.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(next.summary, "继续工作");
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
