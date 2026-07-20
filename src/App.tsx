@@ -2347,10 +2347,12 @@ function TodayView({
   const [showDetailedSegments, setShowDetailedSegments] = useState(false);
   const review = sessions.filter(needsReview).slice(0, 4);
   const distributionRank = (category: string) => category === '无效'
-    ? 2
-    : category === '离开' || category === idleCategory
-      ? 1
-      : 0;
+    ? 3
+    : category === '休息'
+      ? 2
+      : category === '离开' || category === idleCategory
+        ? 1
+        : 0;
   const categoryDistributionRows = stats.categories
     .filter((item) => item.minutes > 0)
     .map((item, index) => ({ item, index }))
