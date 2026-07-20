@@ -2429,14 +2429,17 @@ fn clean_explorer_location(value: &str) -> Option<(String, String)> {
         .or_else(|| value.trim().strip_prefix("Address: "))
         .unwrap_or(value.trim())
         .trim();
-    if workspace.is_empty() || matches!(workspace, "地址栏" | "Address bar") {
+    if workspace.is_empty()
+        || workspace.chars().count() > 520
+        || matches!(workspace, "地址栏" | "Address bar")
+    {
         return None;
     }
-    let title = workspace
+    let folder = workspace
         .rsplit(['\\', '/', '>'])
         .map(str::trim)
         .find(|part| !part.is_empty())?;
-    clean_explorer_folder_name(title).map(|title| (title, workspace.to_string()))
+    clean_explorer_folder_name(folder).map(|_| (workspace.to_string(), workspace.to_string()))
 }
 
 #[cfg(windows)]
@@ -4178,7 +4181,10 @@ mod tests {
         );
         assert_eq!(
             clean_explorer_location(r"C:\College\ICPC\icpc-trainer"),
-            Some(("icpc-trainer".into(), r"C:\College\ICPC\icpc-trainer".into()))
+            Some((
+                r"C:\College\ICPC\icpc-trainer".into(),
+                r"C:\College\ICPC\icpc-trainer".into()
+            ))
         );
     }
 

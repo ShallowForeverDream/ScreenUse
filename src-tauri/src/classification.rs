@@ -959,6 +959,14 @@ pub(crate) fn summary_for_event(event: &RawActivityEvent, category: &str) -> Str
         );
     }
     if let Some(kind) = active_context_type(&event.metadata) {
+        if kind == "folder" {
+            if let Some(path) = event_current_page_title(event)
+                .map(clean_title)
+                .filter(|path| !path.is_empty())
+            {
+                return cap(&path, 520);
+            }
+        }
         if matches!(kind, "document" | "meeting" | "terminal" | "media") {
             if let Some(title) = event_current_page_title(event)
                 .map(clean_title)
@@ -1363,6 +1371,22 @@ mod tests {
         assert_eq!(
             summary_for_event(&event, "写作"),
             "CVE-2026-44277 · WorkSpace"
+        );
+    }
+
+    #[test]
+    fn explorer_summary_keeps_the_complete_active_path() {
+        let mut event = event("explorer.exe", "work");
+        event.workspace = Some(r"C:\College\HDU\0day\images\work".into());
+        event.metadata = json!({
+            "activePageTitle": r"C:\College\HDU\0day\images\work",
+            "activePageSource": "explorer-address-bar",
+            "activeContextType": "folder"
+        });
+
+        assert_eq!(
+            summary_for_event(&event, "开发"),
+            r"C:\College\HDU\0day\images\work"
         );
     }
 
