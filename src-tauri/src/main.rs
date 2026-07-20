@@ -504,10 +504,6 @@ async fn test_ai_config(settings: AppSettings, secret_name: String) -> Result<St
     Ok("配置可读取。AI 会接收目标会话、前后时间线和完整分类树。".into())
 }
 
-fn run_optional_ai(db: Arc<AppDb>) {
-    run_optional_ai_with_delay(db, false);
-}
-
 fn run_automatic_ai(db: Arc<AppDb>) {
     run_optional_ai_with_delay(db, true);
 }
@@ -539,7 +535,8 @@ enum TrayAction {
     Start,
     Pause,
     Away,
-    Analyze,
+    EnableAiReview,
+    DisableAiReview,
     Quit,
 }
 
@@ -549,32 +546,63 @@ fn tray_action(id: &str) -> Option<TrayAction> {
         "tray-start" => Some(TrayAction::Start),
         "tray-pause" => Some(TrayAction::Pause),
         "tray-away" => Some(TrayAction::Away),
-        "tray-analyze" => Some(TrayAction::Analyze),
+        "tray-enable-ai-review" => Some(TrayAction::EnableAiReview),
+        "tray-disable-ai-review" => Some(TrayAction::DisableAiReview),
         "tray-quit" => Some(TrayAction::Quit),
         _ => None,
     }
 }
 
+fn set_ai_review_enabled(db: &AppDb, enabled: bool) -> anyhow::Result<()> {
+    let mut settings = db.get_settings()?;
+    settings.ai_mode = if enabled { "auto" } else { "off" }.into();
+    let settings = settings.normalized();
+    db.save_settings(&settings)
+}
+
+struct TrayMenuItems<R: tauri::Runtime> {
+    start: MenuItem<R>,
+    pause: MenuItem<R>,
+    away: MenuItem<R>,
+    enable_ai_review: MenuItem<R>,
+    disable_ai_review: MenuItem<R>,
+}
+
+impl<R: tauri::Runtime> Clone for TrayMenuItems<R> {
+    fn clone(&self) -> Self {
+        Self {
+            start: self.start.clone(),
+            pause: self.pause.clone(),
+            away: self.away.clone(),
+            enable_ai_review: self.enable_ai_review.clone(),
+            disable_ai_review: self.disable_ai_review.clone(),
+        }
+    }
+}
+
 fn sync_tray_state<R: tauri::Runtime>(
-    start: &MenuItem<R>,
-    pause: &MenuItem<R>,
-    away: &MenuItem<R>,
+    items: &TrayMenuItems<R>,
     tray: &tauri::tray::TrayIcon<R>,
     health: &collectors::CollectorHealth,
+    ai_review_enabled: bool,
 ) {
-    let _ = start.set_text(if health.manual_away {
+    let _ = items.start.set_text(if health.manual_away {
         "恢复正常记录"
     } else {
         "开始自动记录"
     });
-    let _ = start.set_enabled(!health.running || health.manual_away);
-    let _ = pause.set_enabled(health.running);
-    let _ = away.set_text(if health.manual_away {
+    let _ = items
+        .start
+        .set_enabled(!health.running || health.manual_away);
+    let _ = items.pause.set_enabled(health.running);
+    let _ = items.away.set_text(if health.manual_away {
         "离开中 · 操作 5 秒后恢复"
     } else {
         "开始离开"
     });
-    let _ = away.set_enabled(!health.manual_away);
+    let _ = items.away.set_enabled(!health.manual_away);
+    let _ = items.enable_ai_review.set_enabled(!ai_review_enabled);
+    let _ = items.disable_ai_review.set_enabled(ai_review_enabled);
     let tooltip = if health.manual_away {
         "ScreenUse · 离开中 · 持续键鼠操作 5 秒后恢复"
     } else if health.running {
@@ -598,13 +626,42 @@ fn setup_tray(
     let start = MenuItem::with_id(app, "tray-start", "开始自动记录", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "tray-pause", "暂停自动记录", true, None::<&str>)?;
     let away = MenuItem::with_id(app, "tray-away", "开始离开", true, None::<&str>)?;
-    let analyze = MenuItem::with_id(app, "tray-analyze", "AI复核", true, None::<&str>)?;
+    let enable_ai_review = MenuItem::with_id(
+        app,
+        "tray-enable-ai-review",
+        "开启AI复核",
+        true,
+        None::<&str>,
+    )?;
+    let disable_ai_review = MenuItem::with_id(
+        app,
+        "tray-disable-ai-review",
+        "关闭AI复核",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &start, &pause, &away, &analyze, &separator, &quit],
+        &[
+            &open,
+            &start,
+            &pause,
+            &away,
+            &enable_ai_review,
+            &disable_ai_review,
+            &separator,
+            &quit,
+        ],
     )?;
+    let tray_items = TrayMenuItems {
+        start,
+        pause,
+        away,
+        enable_ai_review,
+        disable_ai_review,
+    };
 
     let db_for_tray = db.clone();
     let collector_for_tray = collector.clone();
@@ -635,7 +692,18 @@ fn setup_tray(
                     collector_for_tray.report_error(error);
                 }
             }
-            Some(TrayAction::Analyze) => run_optional_ai(db_for_tray.clone()),
+            Some(TrayAction::EnableAiReview) => {
+                if let Err(error) = set_ai_review_enabled(&db_for_tray, true) {
+                    eprintln!("ScreenUse tray AI review enable error: {error}");
+                } else {
+                    run_automatic_ai(db_for_tray.clone());
+                }
+            }
+            Some(TrayAction::DisableAiReview) => {
+                if let Err(error) = set_ai_review_enabled(&db_for_tray, false) {
+                    eprintln!("ScreenUse tray AI review disable error: {error}");
+                }
+            }
             Some(TrayAction::Quit) => {
                 collector_for_tray.cancel_manual_away();
                 let _ = collector_for_tray.stop();
@@ -651,28 +719,40 @@ fn setup_tray(
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
-    sync_tray_state(&start, &pause, &away, &tray, &collector.health());
-    let start_for_status = start.clone();
-    let pause_for_status = pause.clone();
-    let away_for_status = away.clone();
+    let ai_review_enabled = db
+        .get_settings()
+        .map(|settings| settings.normalized().ai_mode == "auto")
+        .unwrap_or(false);
+    sync_tray_state(
+        &tray_items,
+        &tray,
+        &collector.health(),
+        ai_review_enabled,
+    );
+    let tray_items_for_status = tray_items.clone();
     let tray_for_status = tray.clone();
     let collector_for_status = collector.clone();
+    let db_for_status = db.clone();
     tauri::async_runtime::spawn(async move {
         let mut previous = None;
         loop {
             let health = collector_for_status.health();
+            let ai_review_enabled = db_for_status
+                .get_settings()
+                .map(|settings| settings.normalized().ai_mode == "auto")
+                .unwrap_or(false);
             let state = (
                 health.running,
                 health.manual_away,
                 health.last_error.clone(),
+                ai_review_enabled,
             );
             if previous.as_ref() != Some(&state) {
                 sync_tray_state(
-                    &start_for_status,
-                    &pause_for_status,
-                    &away_for_status,
+                    &tray_items_for_status,
                     &tray_for_status,
                     &health,
+                    ai_review_enabled,
                 );
                 previous = Some(state);
             }
@@ -802,7 +882,14 @@ mod tests {
         assert_eq!(tray_action("tray-start"), Some(TrayAction::Start));
         assert_eq!(tray_action("tray-pause"), Some(TrayAction::Pause));
         assert_eq!(tray_action("tray-away"), Some(TrayAction::Away));
-        assert_eq!(tray_action("tray-analyze"), Some(TrayAction::Analyze));
+        assert_eq!(
+            tray_action("tray-enable-ai-review"),
+            Some(TrayAction::EnableAiReview)
+        );
+        assert_eq!(
+            tray_action("tray-disable-ai-review"),
+            Some(TrayAction::DisableAiReview)
+        );
         assert_eq!(tray_action("tray-quit"), Some(TrayAction::Quit));
         assert_eq!(tray_action("unknown"), None);
     }
