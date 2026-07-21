@@ -6337,13 +6337,13 @@ fn is_task_overlay_session(session: &WorkSession) -> bool {
 }
 
 fn is_next_context_handoff_session(session: &WorkSession) -> bool {
-    if session.user_confirmed || !is_auto_session_source(&session.source) {
-        return false;
-    }
     let app = primary_session_app(session).unwrap_or_default();
     let app = app.trim_end_matches(".exe");
     if matches!(app, "listary" | "utools") {
-        return true;
+        return !matches!(session.source.as_str(), "manual-entry" | "manual-merge");
+    }
+    if session.user_confirmed || !is_auto_session_source(&session.source) {
+        return false;
     }
     let shell_app = matches!(
         app,
@@ -8268,7 +8268,7 @@ mod tests {
         {
             let conn = db.conn.lock();
             conn.execute(
-                "INSERT INTO work_sessions VALUES ('app-launcher',?1,?2,NULL,NULL,'杂务','Listary · LauncherSearchWindow',0.56,?3,0,'context-complete',?4)",
+                "INSERT INTO work_sessions VALUES ('app-launcher',?1,?2,NULL,NULL,'杂务','Listary · LauncherSearchWindow',0.56,?3,1,'manual-correction',?4)",
                 params![fmt(base), fmt(base + Duration::seconds(9)), launcher_evidence, now()],
             )
             .expect("insert app launcher");
@@ -8295,6 +8295,8 @@ mod tests {
         utools.evidence[0].value = "uTools.exe".into();
         utools.summary = "uTools".into();
         assert!(is_next_context_handoff_session(&utools));
+        utools.source = "manual-entry".into();
+        assert!(!is_next_context_handoff_session(&utools));
 
         assert_eq!(db.compact_sessions().expect("compact handoff"), 1);
         assert!(db
