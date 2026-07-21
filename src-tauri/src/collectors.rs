@@ -2349,7 +2349,7 @@ fn explorer_active_context(
         CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern,
         IUIAutomationValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
         UIA_ControlTypePropertyId, UIA_SelectionItemPatternId, UIA_TabItemControlTypeId,
-        UIA_ValuePatternId,
+        UIA_SplitButtonControlTypeId, UIA_ValuePatternId,
     };
 
     unsafe {
@@ -2358,6 +2358,42 @@ fn explorer_active_context(
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
             let root = automation.ElementFromHandle(window)?;
+
+            let breadcrumb_condition = automation.CreatePropertyCondition(
+                UIA_AutomationIdPropertyId,
+                &VARIANT::from("PART_BreadcrumbBar"),
+            )?;
+            if let Ok(breadcrumb_bar) =
+                root.FindFirst(TreeScope_Descendants, &breadcrumb_condition)
+            {
+                let split_button_condition = automation.CreatePropertyCondition(
+                    UIA_ControlTypePropertyId,
+                    &VARIANT::from(UIA_SplitButtonControlTypeId.0),
+                )?;
+                if let Ok(elements) =
+                    breadcrumb_bar.FindAll(TreeScope_Descendants, &split_button_condition)
+                {
+                    let mut breadcrumbs = Vec::new();
+                    for index in 0..elements.Length()? {
+                        let name = elements
+                            .GetElement(index)?
+                            .CurrentName()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default();
+                        if !name.trim().is_empty() {
+                            breadcrumbs.push(name);
+                        }
+                    }
+                    if let Some(workspace) = explorer_path_from_breadcrumbs(&breadcrumbs) {
+                        return Ok(Some(ActivePageContext {
+                            title: workspace.clone(),
+                            workspace: Some(workspace),
+                            source: "explorer-breadcrumb-path",
+                            kind: "folder",
+                        }));
+                    }
+                }
+            }
 
             let address_condition = automation.CreatePropertyCondition(
                 UIA_AutomationIdPropertyId,
@@ -2452,6 +2488,35 @@ fn clean_explorer_location(value: &str) -> Option<(String, String)> {
         .map(str::trim)
         .find(|part| !part.is_empty())?;
     clean_explorer_folder_name(folder).map(|_| (workspace.to_string(), workspace.to_string()))
+}
+
+#[cfg(windows)]
+fn explorer_path_from_breadcrumbs(parts: &[String]) -> Option<String> {
+    let (drive_index, drive) = parts
+        .iter()
+        .enumerate()
+        .find_map(|(index, part)| explorer_drive_designator(part).map(|drive| (index, drive)))?;
+    let mut path = drive;
+    for part in parts.iter().skip(drive_index + 1) {
+        let Some(folder) = clean_explorer_folder_name(part) else {
+            continue;
+        };
+        if folder.contains('\\') || folder.contains('/') {
+            return None;
+        }
+        path.push('\\');
+        path.push_str(&folder);
+    }
+    clean_explorer_location(&path).map(|(_, workspace)| workspace)
+}
+
+#[cfg(windows)]
+fn explorer_drive_designator(value: &str) -> Option<String> {
+    let characters: Vec<char> = value.trim().chars().collect();
+    characters.windows(2).find_map(|pair| {
+        (pair[0].is_ascii_alphabetic() && pair[1] == ':')
+            .then(|| format!("{}:", pair[0].to_ascii_uppercase()))
+    })
 }
 
 #[cfg(windows)]
@@ -4223,6 +4288,29 @@ mod tests {
                 r"C:\College\ICPC\icpc-trainer".into(),
                 r"C:\College\ICPC\icpc-trainer".into()
             ))
+        );
+        assert_eq!(
+            explorer_path_from_breadcrumbs(&[
+                "此电脑".into(),
+                "Windows-SSD (C:)".into(),
+                "College".into(),
+                "HDU".into(),
+                "0day".into(),
+                "AI_WORK".into(),
+            ]),
+            Some(r"C:\College\HDU\0day\AI_WORK".into())
+        );
+        assert_eq!(
+            explorer_path_from_breadcrumbs(&[
+                "This PC".into(),
+                "Local Disk (d:)".into(),
+                "MY_PROJECT".into(),
+            ]),
+            Some(r"D:\MY_PROJECT".into())
+        );
+        assert_eq!(
+            explorer_path_from_breadcrumbs(&["此电脑".into(), "AI_WORK".into()]),
+            None
         );
     }
 

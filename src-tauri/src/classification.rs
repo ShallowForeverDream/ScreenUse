@@ -1080,7 +1080,10 @@ pub(crate) fn active_context_type(metadata: &serde_json::Value) -> Option<&str> 
                     Some("document")
                 }
                 Some(
-                    "explorer-address-bar" | "explorer-selected-tab" | "explorer-window-title",
+                    "explorer-breadcrumb-path"
+                    | "explorer-address-bar"
+                    | "explorer-selected-tab"
+                    | "explorer-window-title",
                 ) => Some("folder"),
                 Some("vscode-extension") => Some("editor"),
                 _ => None,
