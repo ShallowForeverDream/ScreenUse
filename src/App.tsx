@@ -1200,12 +1200,9 @@ export default function App() {
             />
             <Kpi
               icon={Moon}
-              title="睡眠缺失"
-              value={formatPreciseDuration(data.sleepDebt.totalSeconds)}
-              hint={data.sleepDebt.totalSeconds > 0
-                ? `第一层 ${formatPreciseDuration(data.sleepDebt.firstLayerSeconds)} · 第二层 ${formatPreciseDuration(data.sleepDebt.secondLayerSeconds)}`
-                : `今日已休息 ${formatPreciseDuration(data.sleepDebt.sleepSecondsToday)}`}
-              attention={data.sleepDebt.totalSeconds > 0}
+              title="今日睡眠"
+              value={formatPreciseDuration(data.sleepDebt.sleepSecondsToday)}
+              hint="点击查看睡眠缺失与每日明细"
               onClick={() => setSleepDebtOpen(true)}
               showHint
             />
@@ -6287,6 +6284,7 @@ function SleepDebtModal({
   onEdit: (session: WorkSession) => void;
 }) {
   const [selectedDate, setSelectedDate] = useState(summary.asOfDate);
+  const heatmapScrollRef = useRef<HTMLDivElement>(null);
   const dayMap = useMemo(
     () => new Map(summary.days.map((day) => [day.date, day])),
     [summary.days],
@@ -6299,19 +6297,32 @@ function SleepDebtModal({
     const asOf = dateFromKey(summary.asOfDate);
     const currentWeekMonday = new Date(asOf);
     currentWeekMonday.setDate(asOf.getDate() - ((asOf.getDay() + 6) % 7));
-    const firstDay = new Date(currentWeekMonday);
-    firstDay.setDate(currentWeekMonday.getDate() - 52 * 7);
-    return Array.from({ length: 53 * 7 }, (_, index) => {
-      const date = new Date(firstDay);
-      date.setDate(firstDay.getDate() + index);
-      return localDateKey(date);
-    });
-  }, [summary.asOfDate]);
+    const historyFloor = new Date(currentWeekMonday);
+    historyFloor.setDate(currentWeekMonday.getDate() - 52 * 7);
+
+    const startedOn = dateFromKey(summary.startedOn);
+    const startedWeekMonday = new Date(startedOn);
+    startedWeekMonday.setDate(startedOn.getDate() - ((startedOn.getDay() + 6) % 7));
+    const firstDay = startedWeekMonday > historyFloor ? startedWeekMonday : historyFloor;
+    const lastDay = new Date(currentWeekMonday);
+    lastDay.setDate(currentWeekMonday.getDate() + 6);
+
+    const dates: string[] = [];
+    for (const date = new Date(firstDay); date <= lastDay; date.setDate(date.getDate() + 1)) {
+      dates.push(localDateKey(date));
+    }
+    return dates;
+  }, [summary.asOfDate, summary.startedOn]);
   const selectedDay = dayMap.get(selectedDate) || summary.days[summary.days.length - 1];
 
   useEffect(() => {
     if (!dayMap.has(selectedDate)) setSelectedDate(summary.asOfDate);
   }, [dayMap, selectedDate, summary.asOfDate]);
+  useLayoutEffect(() => {
+    const scroll = heatmapScrollRef.current;
+    if (!scroll) return;
+    scroll.scrollLeft = scroll.scrollWidth;
+  }, [heatmapDates]);
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
@@ -6360,7 +6371,7 @@ function SleepDebtModal({
               <span>充足</span>
             </div>
           </div>
-          <div className="sleep-heatmap-scroll">
+          <div className="sleep-heatmap-scroll" ref={heatmapScrollRef}>
             <div className="sleep-weekdays" aria-hidden="true">
               {['一', '二', '三', '四', '五', '六', '日'].map((day) => <span key={day}>{day}</span>)}
             </div>
