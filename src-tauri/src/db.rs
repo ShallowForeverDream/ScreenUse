@@ -6341,8 +6341,12 @@ fn is_next_context_handoff_session(session: &WorkSession) -> bool {
         return false;
     }
     let app = primary_session_app(session).unwrap_or_default();
+    let app = app.trim_end_matches(".exe");
+    if matches!(app, "listary" | "utools") {
+        return true;
+    }
     let shell_app = matches!(
-        app.trim_end_matches(".exe"),
+        app,
         "explorer" | "shellhost" | "shellexperiencehost" | "applicationframehost"
     );
     if !shell_app {
@@ -8228,6 +8232,82 @@ mod tests {
         assert_eq!(next.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(next.task_id.as_deref(), Some(task.id.as_str()));
         assert_eq!(next.summary, "继续工作");
+
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn historical_app_launcher_is_absorbed_into_the_next_task() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "screenuse-app-launcher-handoff-test-{}",
+            Uuid::new_v4()
+        ));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let project = db
+            .create_project("启动器衔接测试", "开发")
+            .expect("create project");
+        let task = db
+            .create_task(&project.id, "继续工作")
+            .expect("create task");
+        let base = Utc::now() + Duration::hours(4);
+        let launcher_evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "Listary.exe".into(),
+            weight: 0.5,
+        }])
+        .expect("serialize launcher evidence");
+        let task_evidence = serde_json::to_string(&vec![EvidenceItem {
+            kind: "app".into(),
+            label: "应用".into(),
+            value: "Code.exe".into(),
+            weight: 0.5,
+        }])
+        .expect("serialize task evidence");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('app-launcher',?1,?2,NULL,NULL,'杂务','Listary · LauncherSearchWindow',0.56,?3,0,'context-complete',?4)",
+                params![fmt(base), fmt(base + Duration::seconds(9)), launcher_evidence, now()],
+            )
+            .expect("insert app launcher");
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('launcher-next-task',?1,?2,?3,?4,'开发','继续工作',0.92,?5,0,'context-complete',?6)",
+                params![
+                    fmt(base + Duration::seconds(9)),
+                    fmt(base + Duration::seconds(90)),
+                    project.id,
+                    task.id,
+                    task_evidence,
+                    now()
+                ],
+            )
+            .expect("insert next task");
+        }
+
+        let listary = db
+            .get_session("app-launcher")
+            .expect("load Listary session")
+            .expect("Listary session exists");
+        assert!(is_next_context_handoff_session(&listary));
+        let mut utools = listary.clone();
+        utools.evidence[0].value = "uTools.exe".into();
+        utools.summary = "uTools".into();
+        assert!(is_next_context_handoff_session(&utools));
+
+        assert_eq!(db.compact_sessions().expect("compact handoff"), 1);
+        assert!(db
+            .get_session("app-launcher")
+            .expect("load app launcher")
+            .is_none());
+        let next = db
+            .get_session("launcher-next-task")
+            .expect("load next task")
+            .expect("next task remains");
+        assert_eq!(next.started_at, fmt(base));
+        assert_eq!(next.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(next.task_id.as_deref(), Some(task.id.as_str()));
 
         drop(db);
         let _ = fs::remove_dir_all(data_dir);

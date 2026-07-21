@@ -287,6 +287,8 @@ impl CollectorAdapter for Arc<DesktopCollector> {
                     Some("windows-system-tray-overflow")
                 } else if is_windows_quick_settings(&event) {
                     Some("windows-quick-settings")
+                } else if is_app_launcher_handoff(&event) {
+                    Some("app-launcher-search")
                 } else if is_incomplete_chat_workspace_handoff(active.as_ref(), &event) {
                     Some("chat-workspace-loading")
                 } else {
@@ -759,6 +761,16 @@ fn is_windows_quick_settings(event: &RawActivityEvent) -> bool {
         && (matches!(title.as_str(), "快速设置" | "quick settings")
             || class_name.contains("quicksettings")
             || class_name.contains("controlcenterwindow"))
+}
+
+fn is_app_launcher_handoff(event: &RawActivityEvent) -> bool {
+    let app = event
+        .app
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    matches!(app.trim_end_matches(".exe"), "listary" | "utools")
 }
 
 fn is_incomplete_chat_workspace_handoff(
@@ -3945,6 +3957,32 @@ mod tests {
             ..event.clone()
         }));
         assert!(!is_windows_quick_settings(&RawActivityEvent {
+            app: Some("chrome.exe".into()),
+            ..event
+        }));
+    }
+
+    #[test]
+    fn app_launchers_are_assigned_to_the_next_context() {
+        let event = RawActivityEvent {
+            id: String::new(),
+            source: "test".into(),
+            timestamp: "2026-07-21T01:26:55Z".into(),
+            app: Some("Listary.exe".into()),
+            window_title: Some("LauncherSearchWindow".into()),
+            url: None,
+            file_path: None,
+            workspace: None,
+            input_stats: InputStats::default(),
+            metadata: json!({"nativeWindowTitle": "LauncherSearchWindow"}),
+        };
+        assert!(is_app_launcher_handoff(&event));
+        assert!(is_app_launcher_handoff(&RawActivityEvent {
+            app: Some("uTools.exe".into()),
+            window_title: Some("uTools".into()),
+            ..event.clone()
+        }));
+        assert!(!is_app_launcher_handoff(&RawActivityEvent {
             app: Some("chrome.exe".into()),
             ..event
         }));

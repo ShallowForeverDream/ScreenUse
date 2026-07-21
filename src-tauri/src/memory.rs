@@ -31,6 +31,9 @@ const GENERIC_LABELS: &[&str] = &[
     "图片查看器",
     "开启录音转写",
     "快速设置",
+    "launchersearchwindow",
+    "listary",
+    "utools",
     "录音机",
     "release",
 ];
@@ -2247,7 +2250,14 @@ mod tests {
 
     #[test]
     fn generic_shell_pages_are_not_discriminative_ai_evidence() {
-        for page in ["ChatGPT", "系统托盘溢出窗口。", "正在读取本地时间账本…"] {
+        for page in [
+            "ChatGPT",
+            "系统托盘溢出窗口。",
+            "正在读取本地时间账本…",
+            "LauncherSearchWindow",
+            "Listary",
+            "uTools",
+        ] {
             let features = build_features("explorer.exe", page, page, "", "", "");
             assert!(!is_discriminative(&features), "generic page: {page}");
         }
