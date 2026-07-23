@@ -143,7 +143,7 @@ pub(crate) fn calculate(
 }
 
 fn repay_oldest_first(debts: &mut Vec<FirstLayerDebt>, available: &mut f64) {
-    debts.sort_by_key(|debt| debt.origin);
+    debts.sort_by_key(|debt| (debt.origin, !debt.compounds_daily));
     for debt in debts.iter_mut() {
         if *available <= 0.0 {
             break;
@@ -223,6 +223,47 @@ mod tests {
         ]);
         let result = calculate(date("2026-07-20"), date("2026-07-23"), &sleep);
         assert_eq!(result.first_layer_seconds, 3 * 3_600);
+    }
+
+    #[test]
+    fn same_day_surplus_repays_compounding_shortfall_before_fixed_monday_debt() {
+        let monday = date("2026-07-20");
+        let mut debts = vec![
+            FirstLayerDebt {
+                origin: monday,
+                amount: 3.0 * 3_600.0,
+                compounds_daily: false,
+            },
+            FirstLayerDebt {
+                origin: monday,
+                amount: 4.0 * 3_600.0,
+                compounds_daily: true,
+            },
+        ];
+        let mut surplus = 2.0 * 3_600.0;
+
+        repay_oldest_first(&mut debts, &mut surplus);
+
+        assert_eq!(surplus, 0.0);
+        assert_eq!(debts.len(), 2);
+        assert_eq!(debts[0].amount, 2.0 * 3_600.0);
+        assert!(debts[0].compounds_daily);
+        assert_eq!(debts[1].amount, 3.0 * 3_600.0);
+        assert!(!debts[1].compounds_daily);
+    }
+
+    #[test]
+    fn fixed_monday_debt_stays_flat_while_remaining_shortfall_compounds() {
+        let sleep = sleep_days(&[
+            ("2026-07-20", 4.0),
+            ("2026-07-21", 10.0),
+            ("2026-07-22", 8.0),
+        ]);
+
+        let result = calculate(date("2026-07-20"), date("2026-07-22"), &sleep);
+
+        assert_eq!(result.first_layer_seconds, 9 * 3_600);
+        assert_eq!(result.second_layer_seconds, 0);
     }
 
     #[test]
