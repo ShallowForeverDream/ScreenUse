@@ -1149,43 +1149,36 @@ impl AppDb {
 
         let mut intervals_by_day = HashMap::<NaiveDate, Vec<SleepSessionSlice>>::new();
         for (session_id, task_title, started_at, ended_at) in rows {
-            let Ok(mut cursor) = DateTime::parse_from_rfc3339(&started_at)
-                .map(|value| value.with_timezone(&Utc))
+            let Ok(start) =
+                DateTime::parse_from_rfc3339(&started_at).map(|value| value.with_timezone(&Utc))
             else {
                 continue;
             };
-            let Ok(mut end) = DateTime::parse_from_rfc3339(&ended_at)
-                .map(|value| value.with_timezone(&Utc))
+            let Ok(end) =
+                DateTime::parse_from_rfc3339(&ended_at).map(|value| value.with_timezone(&Utc))
             else {
                 continue;
             };
-            cursor = cursor.max(range_start);
-            end = end.min(range_end);
-            if end <= cursor {
+            if end <= start {
                 continue;
             }
 
-            while cursor < end {
-                let date = cursor.with_timezone(&Local).date_naive();
-                let Some(next_date) = date.succ_opt() else {
-                    break;
-                };
-                let next_midnight = local_midnight_utc(next_date)?;
-                let segment_end = end.min(next_midnight);
-                intervals_by_day
-                    .entry(date)
-                    .or_default()
-                    .push(SleepSessionSlice {
-                        session_id: session_id.clone(),
-                        task_title: task_title.clone(),
-                        started_at: cursor,
-                        ended_at: segment_end,
-                    });
-                if segment_end <= cursor {
-                    break;
-                }
-                cursor = segment_end;
+            // A night's sleep belongs to the day on which the user wakes up. Splitting an
+            // overnight interval at midnight makes the dashboard omit the pre-midnight part
+            // from "today's sleep" and can create a false debt on both dates.
+            let sleep_date = end.with_timezone(&Local).date_naive();
+            if sleep_date < started_on || sleep_date > as_of {
+                continue;
             }
+            intervals_by_day
+                .entry(sleep_date)
+                .or_default()
+                .push(SleepSessionSlice {
+                    session_id,
+                    task_title,
+                    started_at: start,
+                    ended_at: end,
+                });
         }
 
         let sleep_seconds_by_day = intervals_by_day
@@ -6688,6 +6681,54 @@ mod tests {
         assert_eq!(today.periods[0].duration_seconds, 2 * 3_600);
         assert!(debt.first_layer_seconds >= 6 * 3_600);
         assert_eq!(debt.second_layer_seconds, 0);
+        drop(db);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn overnight_sleep_is_fully_attributed_to_the_wake_date() {
+        let data_dir =
+            std::env::temp_dir().join(format!("screenuse-overnight-sleep-test-{}", Uuid::new_v4()));
+        let db = AppDb::open_in(data_dir.clone()).expect("open test database");
+        let sleep_project = db
+            .list_projects()
+            .expect("list projects")
+            .into_iter()
+            .find(|project| project.source == sleep_debt::PROJECT_SOURCE)
+            .expect("sleep project");
+        let sleep_task = db
+            .list_tasks()
+            .expect("list tasks")
+            .into_iter()
+            .find(|task| task.source == sleep_debt::SLEEP_TASK_SOURCE)
+            .expect("sleep task");
+        let today = Local::now().date_naive();
+        let today_start = local_midnight_utc(today).expect("local midnight");
+        let started_at = today_start - Duration::hours(1) - Duration::minutes(5);
+        let ended_at = today_start + Duration::hours(9);
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO work_sessions VALUES ('overnight-sleep',?1,?2,?3,?4,'休息','睡觉',1.0,'[]',1,'manual-correction',?5)",
+                params![
+                    fmt(started_at),
+                    fmt(ended_at),
+                    sleep_project.id,
+                    sleep_task.id,
+                    now()
+                ],
+            )
+            .expect("insert overnight sleep");
+        }
+
+        let debt = db.dashboard(false).expect("dashboard").sleep_debt;
+        assert_eq!(debt.sleep_seconds_today, 10 * 3_600 + 5 * 60);
+        let today = debt.days.last().expect("today heatmap row");
+        assert_eq!(today.sleep_seconds, 10 * 3_600 + 5 * 60);
+        assert_eq!(today.periods.len(), 1);
+        assert_eq!(today.periods[0].duration_seconds, 10 * 3_600 + 5 * 60);
+        assert_eq!(today.periods[0].started_at, fmt(started_at));
+        assert_eq!(today.periods[0].ended_at, fmt(ended_at));
         drop(db);
         let _ = fs::remove_dir_all(data_dir);
     }
