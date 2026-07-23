@@ -32,6 +32,7 @@ import {
   HardDrive,
   Github,
   KeyRound,
+  Keyboard,
   Laptop,
   LayoutDashboard,
   ListFilter,
@@ -4775,6 +4776,13 @@ function SettingsView({
           title="会议和视频不计为离开"
           detail="前台会议、确认播放的网页视频和本地播放器即使没有键鼠输入也继续计时。"
         />
+        <div className="setting-callout compact">
+          <Keyboard size={19} />
+          <div>
+            <strong>手动离开快捷键 · <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Enter</kbd></strong>
+            <span>全局生效；触发后持续进行键盘或鼠标操作 5 秒即可自动恢复。</span>
+          </div>
+        </div>
         <Toggle
           checked={settings.autoMaintenance}
           onChange={(value) => update('autoMaintenance', value)}

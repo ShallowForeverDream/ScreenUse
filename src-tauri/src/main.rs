@@ -14,6 +14,7 @@ mod context_store;
 mod db;
 mod export;
 mod github_sync;
+mod hotkeys;
 mod integration_server;
 mod integrations;
 mod maintenance;
@@ -595,11 +596,12 @@ fn sync_tray_state<R: tauri::Runtime>(
         .start
         .set_enabled(!health.running || health.manual_away);
     let _ = items.pause.set_enabled(health.running);
-    let _ = items.away.set_text(if health.manual_away {
-        "离开中 · 操作 5 秒后恢复"
+    let away_text = if health.manual_away {
+        "离开中 · 操作 5 秒后恢复".to_string()
     } else {
-        "开始离开"
-    });
+        format!("开始离开（{}）", hotkeys::MANUAL_AWAY_SHORTCUT_LABEL)
+    };
+    let _ = items.away.set_text(away_text);
     let _ = items.away.set_enabled(!health.manual_away);
     let _ = items.enable_ai_review.set_enabled(!ai_review_enabled);
     let _ = items.disable_ai_review.set_enabled(ai_review_enabled);
@@ -625,7 +627,13 @@ fn setup_tray(
     let open = MenuItem::with_id(app, "tray-open", "打开 ScreenUse", true, None::<&str>)?;
     let start = MenuItem::with_id(app, "tray-start", "开始自动记录", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "tray-pause", "暂停自动记录", true, None::<&str>)?;
-    let away = MenuItem::with_id(app, "tray-away", "开始离开", true, None::<&str>)?;
+    let away = MenuItem::with_id(
+        app,
+        "tray-away",
+        format!("开始离开（{}）", hotkeys::MANUAL_AWAY_SHORTCUT_LABEL),
+        true,
+        None::<&str>,
+    )?;
     let enable_ai_review = MenuItem::with_id(
         app,
         "tray-enable-ai-review",
@@ -686,11 +694,7 @@ fn setup_tray(
                 }
             }
             Some(TrayAction::Away) => {
-                collector_for_tray.begin_manual_away();
-                if let Err(error) = collector_for_tray.start(db_for_tray.clone()) {
-                    collector_for_tray.cancel_manual_away();
-                    collector_for_tray.report_error(error);
-                }
+                hotkeys::begin_manual_away(&db_for_tray, &collector_for_tray);
             }
             Some(TrayAction::EnableAiReview) => {
                 if let Err(error) = set_ai_review_enabled(&db_for_tray, true) {
@@ -794,6 +798,11 @@ fn main() {
             maintenance::start_worker(db.clone());
             github_sync::start_worker(db.clone());
             setup_tray(app, db.clone(), collector.clone())?;
+            if let Err(error) =
+                hotkeys::register_manual_away_hotkey(db.clone(), collector.clone())
+            {
+                eprintln!("ScreenUse manual-away hotkey disabled: {error}");
+            }
 
             if settings.auto_start {
                 collector.start(db.clone()).map_err(tauri::Error::Anyhow)?;
