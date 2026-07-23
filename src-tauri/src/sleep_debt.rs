@@ -17,7 +17,7 @@ pub(crate) const SLEEP_TASK_TITLE: &str = "睡觉";
 
 const DAILY_TARGET_SECONDS: f64 = 8.0 * 60.0 * 60.0;
 const MONDAY_DEBT_SECONDS: f64 = 3.0 * 60.0 * 60.0;
-const FIRST_LAYER_GROWTH: f64 = 1.5;
+const FIRST_LAYER_DAILY_GROWTH_RATE: f64 = 0.5;
 const SECOND_LAYER_GROWTH: f64 = 2.0;
 const SECOND_LAYER_REPAYMENT_EFFECT: f64 = 1.0 / 3.0;
 const HEATMAP_HISTORY_DAYS: usize = 371;
@@ -26,7 +26,7 @@ const HEATMAP_HISTORY_DAYS: usize = 371;
 struct FirstLayerDebt {
     origin: NaiveDate,
     amount: f64,
-    compounds_daily: bool,
+    daily_growth: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -52,9 +52,7 @@ pub(crate) fn calculate(
     while day <= as_of {
         if day > started_on {
             for debt in &mut first_layer {
-                if debt.compounds_daily {
-                    debt.amount *= FIRST_LAYER_GROWTH;
-                }
+                debt.amount += debt.daily_growth;
             }
         }
 
@@ -82,7 +80,7 @@ pub(crate) fn calculate(
             first_layer.push(FirstLayerDebt {
                 origin: day,
                 amount: MONDAY_DEBT_SECONDS,
-                compounds_daily: false,
+                daily_growth: 0.0,
             });
             MONDAY_DEBT_SECONDS as u64
         } else {
@@ -91,10 +89,11 @@ pub(crate) fn calculate(
 
         let slept = sleep_seconds_by_day.get(&day).copied().unwrap_or_default() as f64;
         if slept < DAILY_TARGET_SECONDS {
+            let shortfall = DAILY_TARGET_SECONDS - slept;
             first_layer.push(FirstLayerDebt {
                 origin: day,
-                amount: DAILY_TARGET_SECONDS - slept,
-                compounds_daily: true,
+                amount: shortfall,
+                daily_growth: shortfall * FIRST_LAYER_DAILY_GROWTH_RATE,
             });
         } else if slept > DAILY_TARGET_SECONDS {
             let mut surplus = slept - DAILY_TARGET_SECONDS;
@@ -143,7 +142,7 @@ pub(crate) fn calculate(
 }
 
 fn repay_oldest_first(debts: &mut Vec<FirstLayerDebt>, available: &mut f64) {
-    debts.sort_by_key(|debt| (debt.origin, !debt.compounds_daily));
+    debts.sort_by_key(|debt| (debt.origin, debt.daily_growth <= 0.0));
     for debt in debts.iter_mut() {
         if *available <= 0.0 {
             break;
@@ -201,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_deficit_grows_by_half_each_day() {
+    fn daily_deficit_adds_half_of_the_original_shortfall_each_day() {
         let sleep = sleep_days(&[
             ("2026-07-21", 7.0),
             ("2026-07-22", 8.0),
@@ -209,12 +208,12 @@ mod tests {
             ("2026-07-24", 8.0),
         ]);
         let result = calculate(date("2026-07-21"), date("2026-07-24"), &sleep);
-        assert_eq!(result.first_layer_seconds, (3.375 * 3_600.0) as u64);
+        assert_eq!(result.first_layer_seconds, (2.5 * 3_600.0) as u64);
         assert_eq!(result.second_layer_seconds, 0);
     }
 
     #[test]
-    fn monday_debt_does_not_compound_daily() {
+    fn monday_debt_does_not_grow_daily() {
         let sleep = sleep_days(&[
             ("2026-07-20", 8.0),
             ("2026-07-21", 8.0),
@@ -226,18 +225,18 @@ mod tests {
     }
 
     #[test]
-    fn same_day_surplus_repays_compounding_shortfall_before_fixed_monday_debt() {
+    fn same_day_surplus_repays_growing_shortfall_before_fixed_monday_debt() {
         let monday = date("2026-07-20");
         let mut debts = vec![
             FirstLayerDebt {
                 origin: monday,
                 amount: 3.0 * 3_600.0,
-                compounds_daily: false,
+                daily_growth: 0.0,
             },
             FirstLayerDebt {
                 origin: monday,
                 amount: 4.0 * 3_600.0,
-                compounds_daily: true,
+                daily_growth: 2.0 * 3_600.0,
             },
         ];
         let mut surplus = 2.0 * 3_600.0;
@@ -247,13 +246,13 @@ mod tests {
         assert_eq!(surplus, 0.0);
         assert_eq!(debts.len(), 2);
         assert_eq!(debts[0].amount, 2.0 * 3_600.0);
-        assert!(debts[0].compounds_daily);
+        assert_eq!(debts[0].daily_growth, 2.0 * 3_600.0);
         assert_eq!(debts[1].amount, 3.0 * 3_600.0);
-        assert!(!debts[1].compounds_daily);
+        assert_eq!(debts[1].daily_growth, 0.0);
     }
 
     #[test]
-    fn fixed_monday_debt_stays_flat_while_remaining_shortfall_compounds() {
+    fn fixed_monday_debt_stays_flat_while_shortfall_grows_linearly() {
         let sleep = sleep_days(&[
             ("2026-07-20", 4.0),
             ("2026-07-21", 10.0),
@@ -288,7 +287,7 @@ mod tests {
         ]);
         let result = calculate(date("2026-07-21"), date("2026-07-28"), &sleep_days(&values));
         assert_eq!(result.first_layer_seconds, 3 * 3_600);
-        assert_eq!(result.second_layer_seconds, 45_309);
+        assert_eq!(result.second_layer_seconds, 5_400);
     }
 
     #[test]
@@ -318,7 +317,7 @@ mod tests {
             ("2026-08-04", 8.0),
         ]);
         let result = calculate(date("2026-07-21"), date("2026-08-04"), &sleep_days(&values));
-        assert_eq!(result.second_layer_seconds, 133_819);
+        assert_eq!(result.second_layer_seconds, 43_200);
         assert_eq!(result.first_layer_seconds, 3 * 3_600);
 
         let repayment = calculate(
@@ -338,6 +337,6 @@ mod tests {
             ]),
         );
         assert_eq!(repayment.first_layer_seconds, 0);
-        assert_eq!(repayment.second_layer_seconds, 57_909);
+        assert_eq!(repayment.second_layer_seconds, 12_600);
     }
 }
