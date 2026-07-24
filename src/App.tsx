@@ -989,6 +989,9 @@ export default function App() {
   }
 
   const currentTab = tabs.find((tab) => tab.id === activeTab) || tabs[0];
+  const selectedSleepDay = data.sleepDebt.days.find((day) => day.date === selectedDate);
+  const selectedSleepSeconds = selectedSleepDay?.sleepSeconds || 0;
+  const selectedDateIsToday = selectedDate === localDateKey(new Date());
   const manualDraftSession: WorkSession | null = manualDraft
     ? {
         id: `manual-draft:${manualDraft.startedAt}:${manualDraft.endedAt}`,
@@ -1201,8 +1204,8 @@ export default function App() {
             />
             <Kpi
               icon={Moon}
-              title="今日睡眠"
-              value={formatPreciseDuration(data.sleepDebt.sleepSecondsToday)}
+              title={selectedDateIsToday ? '今日睡眠' : '当日睡眠'}
+              value={formatPreciseDuration(selectedSleepSeconds)}
               hint="点击查看睡眠缺失与每日明细"
               onClick={() => setSleepDebtOpen(true)}
               showHint
@@ -1297,6 +1300,7 @@ export default function App() {
 
       {sleepDebtOpen && (
         <SleepDebtModal
+          initialDate={selectedDate}
           summary={data.sleepDebt}
           sessions={data.sessions}
           onClose={() => setSleepDebtOpen(false)}
@@ -6318,17 +6322,21 @@ function EditSessionModal({
 }
 
 function SleepDebtModal({
+  initialDate,
   summary,
   sessions,
   onClose,
   onEdit,
 }: {
+  initialDate: string;
   summary: SleepDebtSummary;
   sessions: WorkSession[];
   onClose: () => void;
   onEdit: (session: WorkSession) => void;
 }) {
-  const [selectedDate, setSelectedDate] = useState(summary.asOfDate);
+  const [selectedDate, setSelectedDate] = useState(
+    summary.days.some((day) => day.date === initialDate) ? initialDate : summary.asOfDate,
+  );
   const heatmapScrollRef = useRef<HTMLDivElement>(null);
   const dayMap = useMemo(
     () => new Map(summary.days.map((day) => [day.date, day])),
@@ -6401,7 +6409,7 @@ function SleepDebtModal({
           <div><span>当前合计</span><strong>{formatPreciseDuration(summary.totalSeconds)}</strong></div>
           <div><span>第一层</span><strong>{formatPreciseDuration(summary.firstLayerSeconds)}</strong></div>
           <div><span>第二层</span><strong>{formatPreciseDuration(summary.secondLayerSeconds)}</strong></div>
-          <div><span>今日睡眠</span><strong>{formatPreciseDuration(summary.sleepSecondsToday)}</strong></div>
+          <div><span>所选日睡眠</span><strong>{formatPreciseDuration(selectedDay?.sleepSeconds || 0)}</strong></div>
         </section>
 
         <section className="sleep-heatmap-panel">
