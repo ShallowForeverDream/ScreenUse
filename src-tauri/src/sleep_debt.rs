@@ -26,7 +26,7 @@ const HEATMAP_HISTORY_DAYS: usize = 371;
 struct FirstLayerDebt {
     origin: NaiveDate,
     amount: f64,
-    daily_growth: f64,
+    growth_principal: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ pub(crate) fn calculate(
     while day <= as_of {
         if day > started_on {
             for debt in &mut first_layer {
-                debt.amount += debt.daily_growth;
+                debt.amount += debt.growth_principal * FIRST_LAYER_DAILY_GROWTH_RATE;
             }
         }
 
@@ -80,7 +80,7 @@ pub(crate) fn calculate(
             first_layer.push(FirstLayerDebt {
                 origin: day,
                 amount: MONDAY_DEBT_SECONDS,
-                daily_growth: 0.0,
+                growth_principal: 0.0,
             });
             MONDAY_DEBT_SECONDS as u64
         } else {
@@ -93,11 +93,11 @@ pub(crate) fn calculate(
             first_layer.push(FirstLayerDebt {
                 origin: day,
                 amount: shortfall,
-                daily_growth: shortfall * FIRST_LAYER_DAILY_GROWTH_RATE,
+                growth_principal: shortfall,
             });
         } else if slept > DAILY_TARGET_SECONDS {
             let mut surplus = slept - DAILY_TARGET_SECONDS;
-            repay_oldest_first(&mut first_layer, &mut surplus);
+            repay_first_layer_growth_principal_first(&mut first_layer, &mut surplus);
             if first_layer.is_empty() && surplus > 0.0 {
                 let mut effective_repayment = surplus * SECOND_LAYER_REPAYMENT_EFFECT;
                 repay_oldest_second_layer(&mut second_layer, &mut effective_repayment);
@@ -141,15 +141,28 @@ pub(crate) fn calculate(
     }
 }
 
-fn repay_oldest_first(debts: &mut Vec<FirstLayerDebt>, available: &mut f64) {
-    debts.sort_by_key(|debt| (debt.origin, debt.daily_growth <= 0.0));
+fn repay_first_layer_growth_principal_first(debts: &mut Vec<FirstLayerDebt>, available: &mut f64) {
+    debts.sort_by_key(|debt| (debt.growth_principal <= 0.0, debt.origin));
     for debt in debts.iter_mut() {
         if *available <= 0.0 {
             break;
         }
-        let repaid = debt.amount.min(*available);
+        let repaid = debt.growth_principal.min(*available);
+        debt.growth_principal -= repaid;
         debt.amount -= repaid;
         *available -= repaid;
+    }
+
+    if *available > 0.0 {
+        debts.sort_by_key(|debt| debt.origin);
+        for debt in debts.iter_mut() {
+            if *available <= 0.0 {
+                break;
+            }
+            let repaid = debt.amount.min(*available);
+            debt.amount -= repaid;
+            *available -= repaid;
+        }
     }
     debts.retain(|debt| debt.amount >= 0.5);
 }
@@ -225,34 +238,35 @@ mod tests {
     }
 
     #[test]
-    fn same_day_surplus_repays_growing_shortfall_before_fixed_monday_debt() {
+    fn surplus_repays_newer_growth_principal_before_older_fixed_debt() {
         let monday = date("2026-07-20");
+        let tuesday = date("2026-07-21");
         let mut debts = vec![
             FirstLayerDebt {
                 origin: monday,
                 amount: 3.0 * 3_600.0,
-                daily_growth: 0.0,
+                growth_principal: 0.0,
             },
             FirstLayerDebt {
-                origin: monday,
+                origin: tuesday,
                 amount: 4.0 * 3_600.0,
-                daily_growth: 2.0 * 3_600.0,
+                growth_principal: 4.0 * 3_600.0,
             },
         ];
         let mut surplus = 2.0 * 3_600.0;
 
-        repay_oldest_first(&mut debts, &mut surplus);
+        repay_first_layer_growth_principal_first(&mut debts, &mut surplus);
 
         assert_eq!(surplus, 0.0);
         assert_eq!(debts.len(), 2);
         assert_eq!(debts[0].amount, 2.0 * 3_600.0);
-        assert_eq!(debts[0].daily_growth, 2.0 * 3_600.0);
+        assert_eq!(debts[0].growth_principal, 2.0 * 3_600.0);
         assert_eq!(debts[1].amount, 3.0 * 3_600.0);
-        assert_eq!(debts[1].daily_growth, 0.0);
+        assert_eq!(debts[1].growth_principal, 0.0);
     }
 
     #[test]
-    fn fixed_monday_debt_stays_flat_while_shortfall_grows_linearly() {
+    fn surplus_reduces_future_growth_while_monday_debt_stays_flat() {
         let sleep = sleep_days(&[
             ("2026-07-20", 4.0),
             ("2026-07-21", 10.0),
@@ -261,7 +275,7 @@ mod tests {
 
         let result = calculate(date("2026-07-20"), date("2026-07-22"), &sleep);
 
-        assert_eq!(result.first_layer_seconds, 9 * 3_600);
+        assert_eq!(result.first_layer_seconds, 8 * 3_600);
         assert_eq!(result.second_layer_seconds, 0);
     }
 
@@ -287,7 +301,7 @@ mod tests {
         ]);
         let result = calculate(date("2026-07-21"), date("2026-07-28"), &sleep_days(&values));
         assert_eq!(result.first_layer_seconds, 3 * 3_600);
-        assert_eq!(result.second_layer_seconds, 5_400);
+        assert_eq!(result.second_layer_seconds, 3_600);
     }
 
     #[test]

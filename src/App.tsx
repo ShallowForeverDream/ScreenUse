@@ -6398,7 +6398,7 @@ function SleepDebtModal({
         <div className="modal-head sleep-debt-head">
           <div>
             <h2>睡眠缺失</h2>
-            <p>每日 8 小时 · 欠缺按单利增长 · 跨午夜归到醒来日 · 记录始于 {summary.startedOn}</p>
+            <p>每日 8 小时 · 欠缺按单利增长 · 超额睡眠优先偿还增长本金 · 跨午夜归到醒来日 · 记录始于 {summary.startedOn}</p>
           </div>
           <button className="icon-button" onClick={onClose} type="button" aria-label="关闭">
             <X size={18} />
