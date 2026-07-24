@@ -2686,6 +2686,36 @@ function DayActivityTimeline({
       endedAt: string;
       untracked: boolean;
     };
+    const createGap = (startedAtMs: number, endedAtMs: number): TimelineGroup | null => {
+      const gapSeconds = Math.max(0, (endedAtMs - startedAtMs) / 1000);
+      if (gapSeconds <= MAX_TIMELINE_GAP_SNAP_SECONDS) return null;
+      const startedAt = new Date(startedAtMs).toISOString();
+      const endedAt = new Date(endedAtMs).toISOString();
+      const id = `timeline-gap:${startedAt}:${endedAt}`;
+      return {
+        id,
+        sessions: [{
+          id,
+          startedAt,
+          endedAt,
+          projectName: '采集状态',
+          category: '未记录',
+          summary: '未记录/采集暂停',
+          confidence: 1,
+          evidence: [{
+            kind: 'system',
+            label: '原因',
+            value: 'ScreenUse 未运行、正在重启或自动记录曾暂停',
+            weight: 1,
+          }],
+          userConfirmed: true,
+          source: 'timeline-gap',
+        }],
+        startedAt,
+        endedAt,
+        untracked: true,
+      };
+    };
     const result: TimelineGroup[] = [];
     for (const session of sorted) {
       const previous = result[result.length - 1];
@@ -2709,9 +2739,29 @@ function DayActivityTimeline({
       }
     }
     const continuous: TimelineGroup[] = [];
+    const selectedDayStart = dateFromKey(selectedDate);
+    const selectedDayEnd = new Date(
+      selectedDayStart.getFullYear(),
+      selectedDayStart.getMonth(),
+      selectedDayStart.getDate() + 1,
+    );
+    const now = new Date();
+    const availableEnd = selectedDate < localDateKey(now)
+      ? selectedDayEnd
+      : selectedDate === localDateKey(now)
+        ? new Date(Math.min(now.getTime(), selectedDayEnd.getTime()))
+        : selectedDayStart;
+    const firstGroupStart = result[0]
+      ? Math.min(
+          availableEnd.getTime(),
+          Math.max(selectedDayStart.getTime(), new Date(result[0].startedAt).getTime()),
+        )
+      : selectedDayStart.getTime();
+    const leadingGap = createGap(selectedDayStart.getTime(), firstGroupStart);
+    if (leadingGap) continuous.push(leadingGap);
     for (const group of result) {
       const previous = continuous[continuous.length - 1];
-      if (previous) {
+      if (previous && !previous.untracked) {
         const gapSeconds = Math.max(
           0,
           (new Date(group.startedAt).getTime() - new Date(previous.endedAt).getTime()) / 1000,
@@ -2719,36 +2769,23 @@ function DayActivityTimeline({
         if (gapSeconds > 0 && gapSeconds <= MAX_TIMELINE_GAP_SNAP_SECONDS) {
           previous.endedAt = group.startedAt;
         } else if (gapSeconds > MAX_TIMELINE_GAP_SNAP_SECONDS) {
-          const gapId = `timeline-gap:${previous.endedAt}:${group.startedAt}`;
-          continuous.push({
-            id: gapId,
-            sessions: [{
-              id: gapId,
-              startedAt: previous.endedAt,
-              endedAt: group.startedAt,
-              projectName: '采集状态',
-              category: '未记录',
-              summary: '未记录/采集暂停',
-              confidence: 1,
-              evidence: [{
-                kind: 'system',
-                label: '原因',
-                value: 'ScreenUse 未运行、正在重启或自动记录曾暂停',
-                weight: 1,
-              }],
-              userConfirmed: true,
-              source: 'timeline-gap',
-            }],
-            startedAt: previous.endedAt,
-            endedAt: group.startedAt,
-            untracked: true,
-          });
+          const gap = createGap(
+            new Date(previous.endedAt).getTime(),
+            new Date(group.startedAt).getTime(),
+          );
+          if (gap) continuous.push(gap);
         }
       }
       continuous.push(group);
     }
+    const trailingGapStart = result.reduce(
+      (latest, group) => Math.max(latest, new Date(group.endedAt).getTime()),
+      selectedDayStart.getTime(),
+    );
+    const trailingGap = createGap(trailingGapStart, availableEnd.getTime());
+    if (trailingGap) continuous.push(trailingGap);
     return continuous;
-  }, [detailed, sorted]);
+  }, [detailed, selectedDate, sorted]);
   const expandedSessions = expandedGroup
     ? sorted.filter((session) => expandedGroup.sessionIds.includes(session.id))
     : [];
@@ -2871,7 +2908,7 @@ function DayActivityTimeline({
     (_, index) => (firstTick + index) * scale.secondsPerGrid,
   );
 
-  if (!sessions.length) {
+  if (!groups.length) {
     return <EmptyState title="暂无活动" detail="应用切换后会自动生成可修正的时间段。" />;
   }
 
